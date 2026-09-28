@@ -1,0 +1,4 @@
+﻿openpyxl==3.1.5
+python-docx==1.2.0
+pywin32==312
+jsonschema==4.26.0

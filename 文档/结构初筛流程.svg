@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="740" viewBox="0 0 1120 740" role="img" aria-labelledby="title desc">
+<title id="title">结构初筛的运行逻辑</title>
+<desc id="desc">读取完整新工作簿，以旧小表索引筛选可能参照，按行列对齐，检查顺序、合并、缩进及上下文，输出候选差异和未匹配内容。确认语义留给后续通读。</desc>
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#456789"/></marker></defs>
+<style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#18334f}.title{font-size:28px;font-weight:700}.label{font-size:21px;font-weight:600}.note{font-size:17px;fill:#476177}.box{fill:white;stroke:#c6d5e4;stroke-width:2;rx:14}.flow{fill:none;stroke:#456789;stroke-width:2.5;marker-end:url(#arrow)}</style>
+<rect width="1120" height="740" rx="20" fill="#f3f7fb"/>
+<text x="40" y="51" class="title">结构初筛：先找到参照，再把差异讲清楚</text>
+<text x="40" y="83" class="note">只读输入 · 每次新建结果目录 · 不调用模型 · 不改业务数值</text>
+<rect x="40" y="119" width="230" height="100" class="box"/><text x="64" y="157" class="label">完整新 Excel</text><text x="64" y="190" class="note">不用圈小表、填坐标</text>
+<rect x="320" y="119" width="330" height="100" class="box"/><text x="345" y="157" class="label">读取工作簿结构</text><text x="345" y="190" class="note">文字、公式缓存、合并及隐藏内容</text>
+<rect x="715" y="119" width="360" height="100" class="box"/><text x="741" y="157" class="label">查找可能的旧小表</text><text x="741" y="190" class="note">识别性文字入口 ＋ 全部文字入口</text>
+<path d="M270 169H320 M650 169H715" class="flow"/>
+<rect x="40" y="294" width="300" height="108" class="box"/><text x="65" y="333" class="label">已登记的旧小表索引</text><text x="65" y="365" class="note">结构、语义引用、来源及版本</text>
+<path d="M340 348H680V205H715" class="flow"/>
+<rect x="715" y="294" width="360" height="108" class="box"/><text x="741" y="333" class="label">逐个位置按行列对齐</text><text x="741" y="365" class="note">允许增删；上下重复和左右并排保留</text>
+<path d="M895 219V294" class="flow"/>
+<rect x="715" y="463" width="360" height="112" class="box"/><text x="741" y="501" class="label">核对关系与覆盖</text><text x="741" y="532" class="note">顺序、缩进、合并、标题、共用表头</text><text x="741" y="557" class="note">未进入候选的内容另列未匹配范围</text>
+<path d="M895 402V463" class="flow"/>
+<rect x="40" y="463" width="595" height="112" class="box"/><text x="66" y="501" class="label">输出五件材料</text><text x="66" y="532" class="note">结构记录、完整结果、初筛报告、后续阅读说明、运行记录</text><text x="66" y="557" class="note">先通读整体，再细读仍有差异、歧义或缺依据的部分</text>
+<path d="M715 519H635" class="flow"/>
+<text x="40" y="650" class="label">候选只是线索，文字覆盖不是业务准确率。</text>
+<text x="40" y="683" class="note">没有参照时先查已有知识：新表式？维度新取值？新增维度？真正的新含义？不能直接新增指标。</text>
+</svg>

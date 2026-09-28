@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="800" viewBox="0 0 1120 800" role="img" aria-labelledby="title desc">
+<title id="title">附注自动更新系统的整体流程</title>
+<desc id="desc">原始Word提取附注Excel并保存位置关联。附注Excel和更新数据Excel各自进行语义识别，依据两份独立映射建立对应清单，生成新的Excel和Word。结构初筛是独立辅助工具，尚未自动接入语义识别。</desc>
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L10 4 L0 8Z" fill="#456789"/></marker></defs>
+<style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#18334f} .title{font-size:28px;font-weight:700}.label{font-size:20px;font-weight:600}.note{font-size:16px;fill:#476177}.box{fill:white;stroke:#c6d5e4;stroke-width:2;rx:14}.flow{fill:none;stroke:#456789;stroke-width:2.5;marker-end:url(#arrow)}</style>
+<rect width="1120" height="800" rx="20" fill="#f3f7fb"/>
+<text x="40" y="52" class="title">从文件到含义，再从含义到更新结果</text>
+<text x="40" y="84" class="note">开发版现有链路 · 对应依据与位置关联分别保存 · 结果写入新的文件</text>
+<rect x="40" y="118" width="200" height="78" class="box"/><text x="65" y="149" class="label">原始 Word 附注</text><text x="65" y="177" class="note">原件保留</text>
+<rect x="285" y="118" width="260" height="78" class="box"/><text x="310" y="149" class="label">提取附注表格</text><text x="310" y="177" class="note">当前窗口按指定章节提取</text>
+<rect x="600" y="118" width="210" height="78" class="box"/><text x="625" y="149" class="label">附注 Excel</text><text x="625" y="177" class="note">接收数值的一边</text>
+<rect x="865" y="118" width="210" height="78" class="box"/><text x="885" y="149" class="label">Word 位置关联</text><text x="885" y="177" class="note">记住原表位置</text>
+<path d="M240 157H285" class="flow"/><path d="M545 157H600" class="flow"/><path d="M545 136V105H970V118" class="flow"/>
+<rect x="40" y="270" width="245" height="98" class="box"/><text x="62" y="306" class="label">统一语义标准与旧表现</text><text x="62" y="335" class="note">含义、维度、依据与版本</text>
+<rect x="600" y="270" width="210" height="98" class="box"/><text x="625" y="306" class="label">识别附注语义</text><text x="625" y="335" class="note">保存独立映射与未决项</text>
+<rect x="350" y="422" width="210" height="98" class="box"/><text x="375" y="458" class="label">更新数据 Excel</text><text x="375" y="487" class="note">提供数值的一边</text>
+<rect x="600" y="422" width="210" height="98" class="box"/><text x="625" y="458" class="label">识别来源语义</text><text x="625" y="487" class="note">保存另一份独立映射</text>
+<path d="M705 196V270" class="flow"/><path d="M285 319H600" class="flow"/><path d="M560 471H600" class="flow"/><path d="M285 344H315V542H705V520" class="flow"/>
+<rect x="865" y="325" width="210" height="135" class="box"/><text x="889" y="364" class="label">建立单元格对应</text><text x="889" y="394" class="note">形成更新清单</text><text x="889" y="421" class="note">保留歧义和缺来源</text>
+<path d="M810 319H838V357H865" class="flow"/><path d="M810 471H838V428H865" class="flow"/>
+<rect x="865" y="563" width="210" height="110" class="box"/><text x="889" y="598" class="label">生成结果副本</text><text x="889" y="627" class="note">更新后 Excel</text><text x="885" y="652" class="note">有位置关联时回写 Word</text>
+<path d="M970 460V563" class="flow"/><path d="M1075 157H1095V618H1075" class="flow"/>
+<rect x="40" y="572" width="720" height="101" rx="14" fill="#e9f2ff" stroke="#9cbbe4" stroke-dasharray="6 4"/>
+<text x="63" y="607" class="label">独立辅助工具：结构初筛</text>
+<text x="63" y="636" class="note">完整新 Excel ＋ 旧小表索引 → 候选、差异、未匹配范围、后续阅读材料</text>
+<text x="63" y="659" class="note">不调用模型、不批准语义、不自动跳过主程序识别步骤</text>
+<text x="40" y="731" class="note">目前未完成整份真实报告的最终业务验收；全章节提取、人工回写等新方案仍有未收口部分。</text>
+<text x="40" y="758" class="note">结构相似、数值相同或测试通过，都不能直接替代财务含义和实际结果的核对。</text>
+</svg>

@@ -1,0 +1,13 @@
+*.py text eol=lf
+*.pyw text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.svg text eol=lf
+*.cs text eol=lf
+*.csproj text eol=lf
+# 下载压缩包也需要原始 Windows 换行，不能只依靠检出时转换。
+*.cmd -text
+LICENSE text eol=lf
+# 复用源码保留原始字节，使来源清单的指纹在下载后仍可核对。
+Word桥接/复用核心/*.cs -text
