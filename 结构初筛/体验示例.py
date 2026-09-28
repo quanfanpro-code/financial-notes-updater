@@ -16,6 +16,10 @@ def main():
     索引目录 = 输出 / '演示索引'
     索引目录.mkdir(parents=True, exist_ok=False)
     表 = 虚构参照()
+    表['上层语义'] = {'完整': True, '业务路径': [{'附注': '虚构货币资金', '表义': '虚构余额构成',
+        '映射依据': ['虚构演示依据，不是正式金标准']}],
+        '名称依据': [{'原文': '演示表', '来源': '虚构工作表名称'},
+                    {'原文': '演示货币资金', '来源': '虚构小表名称'}]}
     索引 = 内存索引(表)
     (索引目录 / '小表记录.jsonl').write_text(json.dumps(表, ensure_ascii=False)+'\n', encoding='utf-8-sig')
     (索引目录 / '文字查找.json').write_text(json.dumps({'正文': 索引['正文'], '别名': {}}, ensure_ascii=False), encoding='utf-8-sig')

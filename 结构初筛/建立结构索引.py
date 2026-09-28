@@ -16,7 +16,7 @@ import unicodedata
 from collections import defaultdict
 from pathlib import Path
 
-规则版本 = "结构初筛规则v3"  # v3：结构格原文存显示值（公式格取缓存），排版差异可比对；v2：共用表头移出正文节点
+规则版本 = "结构初筛规则v4"  # v4：保存原人工映射的上层业务路径及工作表、标题表达
 
 项目根 = Path(__file__).resolve().parents[1]
 机械读取模块路径 = 项目根 / "附注更新" / "表格.py"
@@ -386,11 +386,30 @@ def _提取小表(样式, 工作簿名, 工作表名, 名称, 记录们, 边界,
     上下文.reverse()
 
     业务坐标 = sorted(业务映射.keys(), key=lambda a: (range_boundaries(a)[1], range_boundaries(a)[0]))
+    业务路径 = defaultdict(list)
+    for r in 业务映射.values():
+        定义 = r.get("target_slot") or (表现按映射.get(r["mapping_id"], {}).get("上层业务") or {})
+        附注, 表义 = 定义.get("note"), 定义.get("table")
+        if isinstance(附注, str) and isinstance(表义, str) and 附注.strip() and 表义.strip():
+            业务路径[(规范文字(附注), 规范文字(表义))].append(r["mapping_id"])
+    名称依据 = [{"原文": 工作表名, "来源": "工作表名称"}, {"原文": 名称, "来源": "人工登记小表名称"}]
+    文字节点 = [n for n in 节点 if n.get("查找文字")]
+    左侧 = [n for n in 文字节点 if n["列"] == 左]
+    首标题行 = min((x["行"] for x in 左侧), default=0)
+    首行文字 = [n for n in 文字节点 if n["行"] == 首标题行]
+    for n in 文字节点:
+        if n["角色"] == "标题" or (len(首行文字) == 1 and n is 首行文字[0] and n["列"] == 左 and n["行"] < 首业务行):
+            名称依据.append({"原文": n["原文"], "来源": "表内标题", "坐标": n["坐标"]})
+    上层语义 = {"业务路径": [{"附注": a, "表义": b, "映射依据": sorted(ids)}
+                          for (a, b), ids in sorted(业务路径.items())],
+                "名称依据": 名称依据,
+                "完整": bool(业务映射) and sum(map(len, 业务路径.values())) == len(业务映射)}
     return {
         "小表编号": _小表编号(样式, 工作簿名, 工作表名, 名称, 业务坐标),
         "样式": 样式,
         "来源": {"工作簿": 工作簿名, "工作表": 工作表名, "映射文件": sorted({r["__文件"] for r in 记录们})},
         "小表名称": 名称,
+        "上层语义": 上层语义,
         "表区范围": {"范围": f"{_坐标(顶, 左)}:{_坐标(底, 右)}", "依据": 依据},
         "上下文": 上下文,
         "节点": 节点,
@@ -419,11 +438,17 @@ def 建立索引(输入清单: str, 输出目录: str, 旧索引目录: str | No
             表现按映射[p["source_locator"]["mapping_id"]] = p
 
     语义别名 = {}
+    语义上层 = {}
     for r in 读jsonl(按用途["统一成果:统一语义记录"]["路径"]):
+        含义 = r.get("meaning") or {}
+        语义上层[r["semantic_id"]] = {"note": 含义.get("业务对象"), "table": 含义.get("业务表")}
         别名 = ((r.get("meaning") or {}).get("原表达") or {}).get("aliases") or {}
         文字们 = [str(t) for t in 别名.get("row_labels", []) + 别名.get("column_labels", [])]
         if 文字们:
             语义别名[r["semantic_id"]] = 文字们
+    for 表现 in 表现按映射.values():
+        # 样式2只登记槽位编号；沿既有语义引用回查定义，不能由编号字面猜科目。
+        表现["上层业务"] = 语义上层.get(表现["semantic_id"], {})
 
     工作簿 = {i: 按用途[f"五样式原Excel:附注样式{i}.xlsx"] for i in range(1, 6)}
     映射文件 = defaultdict(list)

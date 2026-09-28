@@ -21,6 +21,9 @@ sys.path.insert(0, str(本批目录))
 默认成果库 = 本批目录.parent / "语义成果整理"
 默认五样式目录 = 本批目录.parent / "参考资料" / "附注样式示例"
 默认索引 = 本批目录 / "索引" / "首版"
+新版索引 = 本批目录 / "索引" / "工作表语义版_正式"
+if (新版索引 / "索引清单.json").is_file():
+    默认索引 = 新版索引
 运行结果根 = 本批目录 / "运行结果"
 
 
@@ -132,7 +135,7 @@ def main(argv=None):
     p.add_argument("--新表", required=True)
     p.add_argument("--索引目录", default=str(默认索引))
     p.add_argument("--输出", default=None, help="缺省在 运行结果\\运行_年月日_时分秒 新建")
-    p.add_argument("--基准对照", action="store_true", help="同时跑无预筛选基准并核对候选集合一致")
+    p.add_argument("--基准对照", action="store_true", help="相同上层语义规则下，关闭文字预筛选并核对候选集合一致")
     p.set_defaults(执行=命令比较)
 
     p = 子.add_parser("选择文件", help="弹出Windows选择窗口挑选新Excel后比较")
