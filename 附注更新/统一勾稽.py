@@ -650,8 +650,10 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
             _require(isinstance(missing,list),'未提供字段须逐格列明')
             for item in labels:a[item['sheet']][item['cell']]=item['value']
             for item in missing:
-                _require({'target','reason','source_evidence'}<=set(item)<={'target','reason','source_evidence','dimensions','dimension_evidence'},
+                _require({'target','reason','source_evidence'}<=set(item)<={'target','reason','source_evidence','dimensions','dimension_evidence','action'},
                          '未提供字段须有目标、原文范围及核查原因')
+                action=item.get('action','retain')
+                _require(action in ('retain','mark_missing'),'未提供字段只能保留或明确标注B未提供')
                 destination=item['target']
                 _require(destination in targets and destination not in bound and destination not in unprovided,'未提供字段与取数绑定重复或未识别')
                 _require(isinstance(item['reason'],str) and item['reason'].strip(),'未提供字段缺少原文核查结论')
@@ -681,9 +683,9 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
                     except ValueError:continue
                     _require(not same,'B已有相同语义来源，不能登记为未提供：'+destination)
                 # 没有B值不能把旧值改属新对象，也不能以维度变化为由清空。
-                _require(dimensions==old['dimensions'] or old['raw_value_state']=='blank',
+                _require(action=='mark_missing' or dimensions==old['dimensions'] or old['raw_value_state']=='blank',
                          'B未提供本字段，不能清空旧值或将旧值改属新维度；须补齐来源或保留原行及其语义：'+destination)
-                unprovided[destination]={'action':'retain','reason':item['reason'],'source_evidence':deepcopy(item['source_evidence'])}
+                unprovided[destination]={'action':action,'reason':item['reason'],'source_evidence':deepcopy(item['source_evidence'])}
                 old['dimensions']=dimensions;old['dimension_evidence']=checked['dimension_evidence']
                 old['owner_reference']=old['id'];view['owners'][old['owner_reference']]=deepcopy(dimensions)
             for destination,row in targets.items():
@@ -808,6 +810,11 @@ def build_fact_update_plan(target_mapping, source_mapping, standard, equivalence
         if missing:
             item={**issue,**deepcopy(missing),'old_value':target['raw_value'],'dimensions':deepcopy(target['dimensions'])}
             plan.setdefault('unprovided_fields',[]).append(item)
+            if missing['action']=='mark_missing':
+                # 经原文确认的缺项只写明状态，不能冒充B取数或沿用另一对象的旧金额。
+                plan['updates'].append({**issue,'value':'B未提供','old_value':target['raw_value'],
+                    'dimensions':deepcopy(target['dimensions']),'sources':[],'blank_sources':[],
+                    'unprovided_reason':missing['reason']})
             continue
         selected=target_mapping.get('_purpose_sources',{}).get(sheet+'!'+cell)
         try:

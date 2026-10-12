@@ -85,11 +85,22 @@ class 模板维度取数测试(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'不能清空'):
             build_fact_update_plan(a,b,case.standard,update_purpose=purpose)
         self.assertEqual(a['facts'][1]['raw_value'],12)
+        marked=copy.deepcopy(purpose);marked['unprovided'][0]['action']='mark_missing'
+        marked_plan=build_fact_update_plan(a,b,case.standard,update_purpose=marked)
+        self.assertEqual(marked_plan['unprovided_fields'][0]['action'],'mark_missing')
+        self.assertEqual([(x['cell'],x['value']) for x in marked_plan['updates']],[('B2',77),('C2','B未提供')])
+        from 附注更新.表格 import write_updated_workbook
+        marked_path=case.folder/'明确注明缺字段.xlsx'
+        write_updated_workbook(a['source_path'],marked_path,marked_plan)
+        actual=load_workbook(marked_path)
+        self.assertEqual([actual['明细'][c].value for c in ('A2','B2','C2')],['乙设备',77,'B未提供']);actual.close()
         supplied=case.make('新项目也有指定范围',[['项目','总体','指定范围'],['乙设备',77,88]],
                            [('B2','乙设备'),('C2','乙设备')])
         supplied['facts'][1]['dimensions']=copy.deepcopy(dims)
         supplied['owners'][supplied['facts'][1]['owner_reference']]=copy.deepcopy(dims)
         full=copy.deepcopy(purpose);full.pop('unprovided');full['bindings'].append({'target':'明细!C2','source':'明细!C2'})
+        with self.assertRaisesRegex(ValueError,'B已有相同语义来源'):
+            build_fact_update_plan(a,supplied,case.standard,update_purpose=marked)
         updated=build_fact_update_plan(a,supplied,case.standard,update_purpose=full)
         self.assertEqual([(x['cell'],x['value']) for x in updated['updates']],[('B2',77),('C2',88)])
         self.assertEqual(updated['labels'][0]['value'],'乙设备')
@@ -137,6 +148,16 @@ class 模板维度取数测试(unittest.TestCase):
         self.assertEqual(result['dimensions'],dims);self.assertIsNone(result['raw_value'])
         self.assertEqual(result['raw_value_state'],'blank')
         trace=load_workbook(written['files']['trace']);self.assertIn('B未提供字段',trace.sheetnames);trace.close()
+        marked_config={**config,'output_dir':str(case.folder/'缺字段标注正式入口'),'update_purpose':marked}
+        matched=run_step('match',marked_config);self.assertEqual(matched['status'],'complete',matched)
+        written=run_step('write',{**marked_config,'update_plan':matched['files']['update_plan']})
+        self.assertEqual(written['status'],'complete',written);self.assertEqual(written['updated_cells'],1)
+        saved=load_fact_mapping(written['files']['a_prime_mapping'],read_standard_v2(gold))
+        result=next(r for r in saved['facts'] if r['id']=='明细!C2')
+        self.assertEqual(result['dimensions'],dims);self.assertEqual(result['raw_value'],'B未提供')
+        trace=load_workbook(written['files']['trace'])
+        self.assertEqual(trace['更新记录'].max_row,2)
+        self.assertEqual(trace['B未提供字段']['D2'].value,'标注B未提供，未计为取数更新');trace.close()
 
     def test_同一名称可明确连接各区块的原文依据(self):
         from 测试 import 测试统一结构 as 结构夹具

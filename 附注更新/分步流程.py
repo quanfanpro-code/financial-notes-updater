@@ -844,7 +844,7 @@ def _prepare_update_v2(config,run,log,cancel,ap,bp):
     save_json(run/'待核实事项.json',plan['issues'])
     trace=run/'逐格对应与更新核对.xlsx';trace_workbook(trace,plan)
     matched=sum(bool(row['source_locations']) for row in plan.get('identity_matches',[]))
-    return {'status':'complete' if ready else 'partial','message':('局部验证：' if scope else '')+f"已按金标准身份证对应{matched}个A目标；对应表及更新清单已保存，拟更新{len(plan['updates'])}格，{len(plan['issues'])}项待处理。",
+    return {'status':'complete' if ready else 'partial','message':('局部验证：' if scope else '')+f"已按金标准身份证对应{matched}个A目标；对应表及更新清单已保存，拟取数更新{sum(not x.get('unprovided_reason') for x in plan['updates'])}格，{len(plan.get('unprovided_fields',[]))}格B未提供，{len(plan['issues'])}项待处理。",
             'files':{'update_plan':plan_path,'trace':str(trace),**structure_files},'usage':usage}
 
 
@@ -963,8 +963,10 @@ def _write_v2(config,run,log,cancel,path,plan):
     files['a_prime_mapping']=mapping_path
     trace=run/'本次更新核对.xlsx';trace_workbook(trace,fresh);files['trace']=str(trace)
     _verify_inputs(plan['inputs']);_check(path,plan_hash,'本次更新清单');check_cancel(cancel)
-    return {'status':'complete','message':f"已按金标准语义更新{len(fresh['updates'])}个业务格，保存更新后表格及其独立语义映射。",
-            'files':files,'updated_cells':len(fresh['updates']),'retained_blank_cells':len(fresh['retained_blanks'])}
+    updated=sum(not x.get('unprovided_reason') for x in fresh['updates'])
+    return {'status':'complete','message':f"已按金标准语义取数更新{updated}个业务格，{len(fresh.get('unprovided_fields',[]))}格B未提供且未计为取数更新；保存更新后表格及其独立语义映射。",
+            'files':files,'updated_cells':updated,'unprovided_cells':len(fresh.get('unprovided_fields',[])),
+            'retained_blank_cells':len(fresh['retained_blanks'])}
 
 
 def _write(config,run,log,cancel):

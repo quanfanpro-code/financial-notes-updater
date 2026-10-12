@@ -77,6 +77,7 @@ def trace_workbook(path,plan):
         book.active=0
     sheet.append(["目标工作表","目标单元格","金标准ID","业务含义","原数据","新数据","更新数据来源","维度"])
     for item in plan.get("updates",[]):
+        if item.get('unprovided_reason'):continue
         row=[item["sheet"],item["cell"],item.get("metric_id") or item.get("slot_id"),item.get("semantic_field"),
              item.get("old_value"),item.get("value"),
              json.dumps({"实际取数":item.get("sources",[]),"同义来源未填":item.get("blank_sources",[])},ensure_ascii=False,default=str),
@@ -92,7 +93,7 @@ def trace_workbook(path,plan):
         missing.append(['工作表','单元格','金标准槽位','处理','原值','核查原因','B原文范围','本次维度'])
         for item in plan['unprovided_fields']:
             missing.append([item['sheet'],item['cell'],item['metric_id'],
-                '对象或期间已变，清空旧值' if item['action']=='clear' else '保留原值，未更新',item['old_value'],item['reason'],
+                '标注B未提供，未计为取数更新' if item['action']=='mark_missing' else '保留原值，未更新',item['old_value'],item['reason'],
                 '\n'.join(item['source_evidence']),json.dumps(item['dimensions'],ensure_ascii=False)])
     from .同义复核 import append_review_sheet
     if plan.get('issues'):
