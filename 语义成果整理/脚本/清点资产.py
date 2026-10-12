@@ -4,6 +4,8 @@
 import hashlib
 import json
 import os
+import copy
+from pathlib import Path
 from collections import Counter
 from datetime import datetime
 
@@ -18,6 +20,61 @@ def sha256(路径):
         for 块 in iter(lambda: f.read(1 << 20), b""):
             h.update(块)
     return h.hexdigest()
+
+
+def 清点候选(来源根, 五样式索引, 输出路径, 纠错记录, 已有成果, 当前标准):
+    """从已固定旧成果继承标准及A端，只替换明确指定的修订输入。"""
+    旧清单 = Path(已有成果) / '资产清单.json'
+    data = json.loads(旧清单.read_text(encoding='utf-8-sig'))
+    data = copy.deepcopy(data)
+    fixed = data['固定输入']
+    if sha256(当前标准) != fixed['v2当前版本']['sha256']:
+        raise ValueError('当前标准与固定旧成果版本不符')
+    index = json.loads(Path(五样式索引).read_text(encoding='utf-8-sig'))
+    def entry(path): return {'路径': str(Path(path).resolve()), 'sha256': sha256(path)}
+    # 继承输入先按内容核对；维度规则改用中央备份中的固定副本。
+    for key in ('v1','v2当前版本','A端映射','A端外部复核记录'):
+        if sha256(fixed[key]['路径']) != fixed[key]['sha256']:
+            raise ValueError('继承输入版本变化：'+key)
+    fixed['维度规范规则'] = entry(Path(已有成果)/'对应/维度规范对应.json')
+    fixed['v2当前版本'] = entry(当前标准)
+    fixed['五样式索引'] = entry(五样式索引)
+    fixed['五样式原映射'] = []
+    for relative,digest in index['files'].items():
+        if not relative.startswith('work/'): continue
+        row = entry(Path(来源根)/relative)
+        if row['sha256'] != digest: raise ValueError('修订映射与示例版本不一致：'+relative)
+        fixed['五样式原映射'].append({'相对路径':relative, **row})
+    fixed['纠错记录'] = entry(纠错记录)
+    fixed['已有表现'] = entry(Path(已有成果)/'数据/表现记录.jsonl')
+    fixed['已有沿革'] = entry(Path(已有成果)/'对应/表现身份迁移.jsonl')
+    fixed['已有资产清单'] = entry(旧清单)
+    active = [v for v in fixed.values() if isinstance(v,dict) and '路径' in v and 'sha256' in v]
+    active += fixed['五样式原映射']
+    工作簿 = []
+    for style in range(1,6):
+        path = Path(来源根)/f'附注样式示例/附注样式{style}.xlsx'
+        row = entry(path)
+        expected = index['styles'][str(style)]['workbook_sha256']
+        inherited = [a for a in data['资产'] if a.get('角色')=='原始工作簿'
+                     and Path(a['路径']).name==path.name]
+        if row['sha256'] != expected or not any(a['sha256']==expected for a in inherited):
+            raise ValueError('工作簿与示例或固定旧版本不符：'+str(path))
+        工作簿.append({**row,'角色':'原始工作簿','纳入':'纳入','状态':'文件',
+                     '说明':'与固定旧成果及本批示例逐文件核对一致的副本'})
+    # 候选的有效资产与固定输入同源，旧清单本身作为完整历史登记。
+    data['资产'] = [{**v,'角色':'固定候选输入','纳入':'纳入','状态':'文件'} for v in active]
+    data['资产'].extend(工作簿)
+    data['来源根'] = str(Path(来源根).resolve())
+    data['生成时间'] = datetime.now().isoformat(timespec='seconds')
+    data['说明'] = '从固定旧成果继承v1/v2/A及规范规则，修订映射与语义示例同批登记；旧清单完整留存。'
+    data['统计口径']['五样式'].update(表现数=len(index['examples']),
+        各样式表现数=dict(Counter(str(e['style']) for e in index['examples'])),
+        引用旧ID=len(index['legacy_definitions']),files条目=len(index['files']),
+        直接指标表现数=sum(bool(e.get('metric_id')) for e in index['examples']))
+    Path(输出路径).parent.mkdir(parents=True,exist_ok=True)
+    with open(输出路径,'x',encoding='utf-8-sig') as f: json.dump(data,f,ensure_ascii=False,indent=1,sort_keys=True)
+    return data
 
 
 def main():
@@ -202,4 +259,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser=argparse.ArgumentParser(description='固定语义整理输入；候选清点必须显式传齐参数')
+    for arg in ('来源根','五样式索引','输出','纠错记录','已有成果','当前标准'):
+        parser.add_argument('--'+arg)
+    args=parser.parse_args()
+    if any(vars(args).values()):
+        if not all(vars(args).values()): parser.error('候选清点须同时提供来源根、五样式索引、输出、纠错记录、已有成果、当前标准')
+        result=清点候选(args.来源根,args.五样式索引,args.输出,args.纠错记录,args.已有成果,args.当前标准)
+        print('候选固定输入已保存：'+args.输出)
+    else:
+        main()

@@ -40,13 +40,17 @@ def _load(path,gold_path=None,ancestors=frozenset()):
 
 def export_review_template(mapping_path,output_path,gold_path=None,*,include_confirmed=False):
     record,snapshot,standard=_load(mapping_path,gold_path)
-    def item(row,confirmed=False):
+    def item(row,confirmed=False,slot=False):
         sheet,cell=row['source_reference']['location'].rpartition('!')[::2] if confirmed else (row['sheet'],row['cell'])
         known=row if confirmed else row.get('partial_semantics',{})
         evidence={k:[r[len(sheet)+1:] if r.startswith(sheet+'!') else r for r in refs] for k,refs in known.get('dimension_evidence',{}).items()}
         result={'sheet':sheet,'cell':cell,'metric_id':known.get('metric_id',''),
                 'dimensions':deepcopy(known.get('dimensions',{})),'dimension_evidence':evidence,'reason':''}
         if confirmed:result['replace_fact_hash']=definition_hash(row)
+        if slot:
+            result.update(kind='partial_metric_fact',missing_dimensions=deepcopy(known['missing_dimensions']),
+                          evidence_cells=[r[len(sheet)+1:] if r.startswith(sheet+'!') else r for r in known['evidence_cells']],
+                          replace_slot_hash=definition_hash(row))
         return result
     value={'schema':SCHEMA,'carrier':record['carrier'],'mapping_sha256':file_hash(mapping_path),
         'source_hash':record['source_hash'],'gold_hash':standard['sha256'],
@@ -59,6 +63,7 @@ def export_review_template(mapping_path,output_path,gold_path=None,*,include_con
             'metrics':list(standard['metric'].values()),'dimension_definitions':list(standard['dimension'].values()),'sheets':snapshot['sheets']}}
     if include_confirmed:
         value['confirmed_mapping_options']=[item(row,True) for row in record['facts'] if row['record_type']=='metric_fact']
+        value['confirmed_mapping_options'].extend(item(row,slot=True) for row in record.get('slot_bindings',[]))
         value['excluded_mapping_options']=[{**item(row),'replace_exclusion_hash':definition_hash(row)} for row in record['excluded']]
         value['instructions'].append('纠正误排除格时，将excluded_mapping_options中的对应项复制到items，保留replace_exclusion_hash，按原文填写槽位、维度及依据；不能按原值或符号直接改判。')
     return _save(Path(output_path).resolve(),value)
@@ -79,27 +84,45 @@ def _prepare_review(mapping_path,opinion_path,gold_path=None,*,ancestors=frozens
     pending={(r['sheet'],r['cell']):r for r in record['unresolved']}
     confirmed={tuple(r['source_reference']['location'].rpartition('!')[::2]):r for r in record['facts'] if r['record_type']=='metric_fact'}
     excluded={(r['sheet'],r['cell']):r for r in record['excluded']}
+    slots={(r['sheet'],r['cell']):r for r in record.get('slot_bindings',[])}
     sheets={s['name']:s for s in snapshot['sheets']};changes=[];seen=set()
     fields={'sheet','cell','metric_id','dimensions','dimension_evidence','reason'}
     for item in items:
-        _require(isinstance(item,dict) and fields<=set(item)<=fields|{'replace_fact_hash','replace_exclusion_hash'},'意见只能包含槽位、维度、原文依据及明确更正绑定，不能修改数值')
+        _require(isinstance(item,dict) and fields<=set(item)<=fields|{'replace_fact_hash','replace_exclusion_hash','replace_slot_hash','kind','missing_dimensions','evidence_cells'},'意见只能包含槽位、维度、原文依据及明确更正绑定，不能修改数值')
         pos=(item['sheet'],item['cell']);previous=confirmed.get(pos)
         previous_exclusion=excluded.get(pos)
-        _require(pos not in seen and (pos in pending or previous is not None or previous_exclusion is not None),'意见引用重复或不属于原映射的格')
+        previous_slot=slots.get(pos)
+        _require(pos not in seen and pos[0] in sheets and pos[1] in sheets[pos[0]]['cells'],'意见引用重复或不属于原工作簿的格')
         seen.add(pos)
         if previous is not None:_require(item.get('replace_fact_hash')==definition_hash(previous),'更正已确认语义须绑定原事实')
         else:_require('replace_fact_hash' not in item,'此格没有可更正的原事实')
         if previous_exclusion is not None:_require(item.get('replace_exclusion_hash')==definition_hash(previous_exclusion),'更正排除结论须绑定原排除记录')
         else:_require('replace_exclusion_hash' not in item,'此格没有可更正的原排除记录')
+        if previous_slot is not None:_require(item.get('replace_slot_hash')==definition_hash(previous_slot),'更正已确认槽位须绑定原记录')
+        else:_require('replace_slot_hash' not in item,'此格没有可更正的原槽位')
         sheet=sheets[pos[0]]
         packet={'source_path':record['source_path'],'source_hash':record['source_hash'],'sheet':pos[0],
                 'cells':sheet['cells'],'candidate_cells':[pos[1]],'document_context':record.get('source_context',[])}
-        response={'kind':'metric_fact',**{k:deepcopy(item[k]) for k in ('metric_id','dimensions','dimension_evidence','reason')}}
-        fact=validate_response({'cells':{pos[1]:response}},packet,standard)[pos[1]]['fact']
-        fact.update(id=fact['source_reference']['location'],owner_reference=definition_hash(fact['dimensions']),
-                    recognition_provenance={'method':METHOD,'record_id':definition_hash({'opinion_hash':opinion_hash,'reviewer':reviewer,'item':item})})
+        kind=item.get('kind','metric_fact')
+        _require(kind in {'metric_fact','partial_metric_fact'},'复核类型须为事实或已确认槽位')
+        response={'kind':kind,**{k:deepcopy(item[k]) for k in ('metric_id','dimensions','dimension_evidence','reason')}}
+        if kind=='partial_metric_fact':
+            _require({'missing_dimensions','evidence_cells'}<=set(item),'槽位须保留未提供取值及指标原文依据')
+            response.update(missing_dimensions=deepcopy(item['missing_dimensions']),evidence_cells=deepcopy(item['evidence_cells']))
+        else:_require(not {'missing_dimensions','evidence_cells'}&set(item),'完整事实不能混入未确定取值字段')
+        checked=validate_response({'cells':{pos[1]:response}},packet,standard)[pos[1]]
+        provenance={'method':METHOD,'record_id':definition_hash({'opinion_hash':opinion_hash,'reviewer':reviewer,'item':item})}
+        if kind=='partial_metric_fact':
+            cell=sheet['cells'][pos[1]]
+            fact={'record_type':kind,**deepcopy(checked['partial_semantics']),
+                  'source_reference':{'file_hash':record['source_hash'],'location':pos[0]+'!'+pos[1]},
+                  'raw_value':cell.get('formula') or cell['value'],'recognition_provenance':provenance}
+        else:
+            fact=checked['fact']
+            fact.update(id=fact['source_reference']['location'],owner_reference=definition_hash(fact['dimensions']),recognition_provenance=provenance)
         changes.append({'sheet':pos[0],'cell':pos[1],'mapping':fact,'previous_mapping':deepcopy(previous),
                         **({'previous_exclusion':deepcopy(previous_exclusion)} if previous_exclusion is not None else {}),
+                        **({'previous_slot':deepcopy(previous_slot)} if previous_slot is not None else {}),
                         'previous_reason':pending.get(pos,previous_exclusion or {}).get('reason','原已确认业务格'),'reason':item['reason']})
     _require(file_hash(mapping)==mapping_hash and file_hash(opinion_file)==opinion_hash,'预览期间输入发生变化')
     preview={'schema':PREVIEW_SCHEMA,'mapping_path':str(mapping),'mapping_sha256':mapping_hash,
@@ -116,11 +139,28 @@ def preview_external_review(mapping_path,opinion_path,gold_path=None):
 def _combine(parent,preview):
     result=deepcopy(parent);positions={(r['sheet'],r['cell']) for r in preview['changes']}
     result['facts']=[r for r in result['facts'] if r['record_type']!='metric_fact' or tuple(r['source_reference']['location'].rpartition('!')[::2]) not in positions]
-    result['facts'].extend(deepcopy(r['mapping']) for r in preview['changes'])
-    result['owners'].update({r['mapping']['owner_reference']:deepcopy(r['mapping']['dimensions']) for r in preview['changes']})
+    full=[r['mapping'] for r in preview['changes'] if r['mapping']['record_type']=='metric_fact']
+    partial=[r for r in preview['changes'] if r['mapping']['record_type']=='partial_metric_fact']
+    result['facts'].extend(deepcopy(full))
+    result['owners'].update({r['owner_reference']:deepcopy(r['dimensions']) for r in full})
+    if partial or 'slot_bindings' in result:
+        result['slot_bindings']=[r for r in result.get('slot_bindings',[]) if (r['sheet'],r['cell']) not in positions]
+        for row in partial:
+            known={k:deepcopy(row['mapping'][k]) for k in ('metric_id','dimensions','dimension_evidence','missing_dimensions','evidence_cells')}
+            result['slot_bindings'].append({'sheet':row['sheet'],'cell':row['cell'],'partial_semantics':known,
+                                          'recognition_provenance':deepcopy(row['mapping']['recognition_provenance'])})
+        result['slot_binding_version']=1
     result['unresolved']=[r for r in result['unresolved'] if (r['sheet'],r['cell']) not in positions]
     result['excluded']=[r for r in result['excluded'] if (r['sheet'],r['cell']) not in positions]
+    if partial or any('previous_slot' in r for r in preview['changes']):
+        for key in ('a_identity_coverage','b_identity_coverage'):
+            if key in result:result[key].update(financial_cells=sum(r['record_type']=='metric_fact' for r in result['facts'])+len(result.get('slot_bindings',[])),
+                unresolved_cells=len(result['unresolved']),unresolved=deepcopy(result['unresolved']),
+                complete=not result['unresolved'] and result.get('outline',{}).get('complete',True))
     result.update(gold_path=preview['gold_path'],gold_hash=preview['gold_hash'])
+    if result.get('recognition_scope',{}).get('mode')=='b_required':
+        from .表格编排 import required_coverage
+        result['recognition_scope']['coverage']=required_coverage(result,read_standard_v2(preview['gold_path']),historical=result.get('identity_version')!=1)
     for key in ('packet_mappings','request_receipts','reused_mapping','equivalence_proofs','classification_rounds','derivation',
                 'external_review_v2','_validated_standard_hash','mapping_path','mapping_hash','review_path','standard_review_path',
                 'calculation_evidence','formula_values','calculation_issues'):
@@ -137,8 +177,10 @@ def validate_external_mapping(mapping,standard,ancestors):
     for key in ('mapping_sha256','opinion_sha256','source_hash','gold_hash','reviewer','changes'):
         _require(receipt[key]==preview[key],'复核依据与实际原件及意见不一致：'+key)
     expected=_combine(parent,preview)
-    for key in ('facts','owners','unresolved','excluded','source_context','source_path','source_hash','gold_hash'):
+    for key in ('facts','owners','unresolved','excluded','source_context','source_path','source_hash','gold_hash',
+                'outline','recognition_scope','a_semantic_reading','semantic_reading'):
         _require(mapping.get(key)==expected.get(key),'复核后映射与实际采纳意见不一致：'+key)
+    _require(mapping.get('slot_bindings',[])==expected.get('slot_bindings',[]),'复核后槽位与实际采纳意见不一致')
     validate_facts(mapping['facts'],standard,mapping['owners'])
 
 
@@ -157,9 +199,7 @@ def apply_external_review(preview,output_dir,*,confirmed=False,confirm_method=''
     receipt_path=_save(run/'外部复核确认记录.json',receipt)
     result=_combine(parent,fresh);result['external_review_v2']={'path':receipt_path,'sha256':file_hash(receipt_path)}
     result['coverage']=workbook_coverage(result,snapshot);result['complete']=result['coverage']['complete']
-    from .统一勾稽 import load_fact_mapping,calculate_mapping_formulas
-    try:calculate_mapping_formulas(result,run/'公式计算依据')
-    except Exception as error:result['calculation_issues']=[{'reason':str(error)}]
+    from .统一勾稽 import load_fact_mapping
     prefix={'A':'附注表格','B':'更新数据'}[result['carrier']];key=result['carrier'].lower()
     mapping_path=run/(prefix+'语义映射.json');result['mapping_path']=str(mapping_path)
     review_path=run/(prefix+'语义识别核对.xlsx');result['review_path']=str(review_path)
@@ -174,6 +214,11 @@ def apply_external_review(preview,output_dir,*,confirmed=False,confirm_method=''
     sheet.append(['来源位置','识别结果','指标槽位','实际维度','原值或原公式','依据'])
     for row in result['facts']:
         if row['record_type']=='metric_fact':sheet.append([row['source_reference']['location'],'已识别',row['metric_id'],json.dumps(row['dimensions'],ensure_ascii=False),row['raw_value'],json.dumps(row['dimension_evidence'],ensure_ascii=False)])
+    cells={s['name']:s['cells'] for s in snapshot['sheets']}
+    for row in result.get('slot_bindings',[]):
+        known=row['partial_semantics'];cell=cells[row['sheet']][row['cell']]
+        sheet.append([row['sheet']+'!'+row['cell'],'槽位已确认',known['metric_id'],json.dumps(known['dimensions'],ensure_ascii=False),
+                      cell.get('formula') or cell['value'],json.dumps(known['dimension_evidence'],ensure_ascii=False)])
     for kind,label in [('excluded','标题或说明等'),('unresolved','待核实')]:
         for row in result[kind]:sheet.append([row['sheet']+'!'+row['cell'],label,None,None,None,row['reason']])
     for row in sheet:

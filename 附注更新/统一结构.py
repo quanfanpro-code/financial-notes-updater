@@ -32,7 +32,10 @@ def _text_evidence(book,references):
         sheet,row,column=_position(reference)
         _require(sheet in book,'结构依据工作表不存在')
         cell=book[sheet].cell(row,column)
-        _require(isinstance(cell.value,str) and cell.value.strip() and cell.data_type!='f','结构依据须为原表真实文字')
+        if cell.data_type=='f':
+            from .同义复核 import _referenced_text
+            _referenced_text(book,sheet,cell.coordinate)
+        else:_require(isinstance(cell.value,str) and cell.value.strip(),'结构依据须为原表真实文字')
 
 
 def _shape(book,proposal,target,source,source_book,standard):
@@ -79,6 +82,10 @@ def _shape(book,proposal,target,source,source_book,standard):
                 prior=(sheet.title,template,other) if axis==1 else (sheet.title,other,template)
                 after=(sheet.title,point,other) if axis==1 else (sheet.title,other,point)
                 new[after]={'template':reverse.get(prior),'range_name':operation['range_name']}
+            if axis==1:
+                # 插入整行也产生表格两侧的空位置；这些位置没有业务样式可继承。
+                for column in range(1,sheet.max_column+1):
+                    new.setdefault((sheet.title,point,column),{'template':None,'range_name':operation['range_name']})
             _require(any(row['template'] in target_facts for row in new.values()),'样式行列须包含已识别的原业务格')
         positions={location:shifted(position) for location,position in positions.items()}
         added={shifted(position):row for position,row in added.items()}

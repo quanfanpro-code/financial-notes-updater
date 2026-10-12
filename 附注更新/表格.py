@@ -5,11 +5,14 @@ import copy
 import datetime
 import hashlib
 import json
+import posixpath
 import re
 import unicodedata
 from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
+from zipfile import ZipFile
+from xml.etree import ElementTree as ET
 from openpyxl import load_workbook
 from openpyxl.workbook.properties import CalcProperties
 from openpyxl.cell.cell import MergedCell
@@ -114,6 +117,29 @@ def _word_table_ranges(context, workbook, names):
     return result
 
 
+def _empty_formula_cached_strings(path):
+    """openpyxl把已保存的空字符串缓存也读成None；只按原包的明确类型恢复。"""
+    ns='{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+    relns='{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+    result={}
+    with ZipFile(path) as archive:
+        relationships={r.get('Id'):r for r in ET.fromstring(archive.read('xl/_rels/workbook.xml.rels'))}
+        sheets=ET.fromstring(archive.read('xl/workbook.xml')).find(ns+'sheets')
+        for sheet in sheets:
+            relation=relationships[sheet.get(relns+'id')]
+            if not relation.get('Type','').endswith('/worksheet'):continue
+            target=relation.get('Target','')
+            member=target.lstrip('/') if target.startswith('/') else posixpath.normpath(posixpath.join('xl',target))
+            xml=ET.fromstring(archive.read(member))
+            addresses=set()
+            for cell in xml.iter(ns+'c'):
+                value=cell.find(ns+'v')
+                if cell.get('t')=='str' and cell.find(ns+'f') is not None and value is not None and value.text in (None,''):
+                    addresses.add(cell.get('r'))
+            result[sheet.get('name')]=addresses
+    return result
+
+
 def read_workbook(path,context=None):
     path=Path(path).resolve()
     before=file_hash(path)
@@ -123,6 +149,7 @@ def read_workbook(path,context=None):
     try:
         omissions_by_sheet=_word_omissions(out["context"],w)
         cache=load_workbook(path,data_only=True,keep_links=True)
+        empty_strings=_empty_formula_cached_strings(path)
         for d in _definitions(w):
             for sheet,address in _destinations(d):out["names"].setdefault(d.name,[]).append({"sheet":sheet,"range":address})
         word_ranges=_word_table_ranges(out["context"],w,out["names"])
@@ -158,6 +185,8 @@ def read_workbook(path,context=None):
                 if c.value is None and (not c.has_style or c.row>max_row or c.column>max_col):continue
                 formula=str(c.value) if c.data_type=="f" else None
                 cells[c.coordinate]={"row":c.row,"column":c.column,"value":c.value,"formula":formula,"cached_value":cache[s.title][c.coordinate].value if formula else c.value,"number_format":c.number_format,"style_id":c.style_id}
+                if formula and cells[c.coordinate]['cached_value'] is None and c.coordinate in empty_strings.get(s.title,set()):
+                    cells[c.coordinate]['cached_value']=''
             # 仅展开确定的表格范围，不按污染后的 worksheet.max_row 扫描。
             for left,top,right,bottom in boxes:
                 if (right-left+1)*(bottom-top+1)>500000:raise WorkbookError("命名业务区域超过50万格，请核实是否包含无用空白格式")
@@ -476,10 +505,43 @@ def _number_format_update(snapshot,target,mappings,target_cell,value):
         "sources":sources,"reason":"原空白金额格沿用同一已确认业务表、同列、同期间币种单位的原数值格唯一显示格式"}
 
 
+def _fractional_format(fmt,value):
+    """扩展Word提取生成的整数格式，小数和其他显示格式沿用原设置。"""
+    if isinstance(value,bool) or not isinstance(value,(int,float,Decimal)):return None
+    parts=fmt.split(';');positive=parts[0]
+    if not re.fullmatch(r'(?:#,##0|0)%?',positive) or parts not in ([positive],[positive,'('+positive+')']):return None
+    percent=positive.endswith('%');number=Decimal(str(value))*(100 if percent else 1)
+    places=max(0,-number.normalize().as_tuple().exponent)
+    if not places:return None
+    new=positive.rstrip('%')+'.'+'0'*places+('%' if percent else '')
+    return new if len(parts)==1 else new+';('+new+')'
+
+
+def complete_numeric_formats(mapping,plan):
+    """在计划里记录必要的小数显示调整，写入前仍独立重算核验。"""
+    book=load_workbook(mapping['source_path'],data_only=False)
+    try:
+        for operation in plan.get('operations',[]):_apply_operation(book,operation)
+        for entry in plan['updates']:
+            if entry.get('number_format_update'):continue
+            cell=book[entry['sheet']][entry['cell']];new=_fractional_format(cell.number_format,entry['value'])
+            if new:
+                entry['number_format_update']={'kind':'fractional_value','old_format':cell.number_format,
+                    'new_format':new,'source_a_hash':mapping['source_hash'],
+                    'reason':'新数值含小数，扩展原整数显示格式，避免Excel及Word隐藏小数'}
+    finally:_close_workbook(book)
+
+
 def _validate_number_format_update(workbook,entry,source_hash):
     proof=entry.get("number_format_update")
     if proof is None:return
     sheet,address=entry.get("sheet") or entry.get("worksheet"),entry["cell"]
+    if proof.get('kind')=='fractional_value':
+        cell=workbook[sheet][address]
+        expected=_fractional_format(cell.number_format,entry.get('value'))
+        if not expected or proof.get('source_a_hash')!=source_hash or proof.get('old_format')!=cell.number_format or proof.get('new_format')!=expected:
+            raise WorkbookError('小数显示调整与原格式及本次实际数值不符')
+        return
     try:
         target=proof["target_mapping"];cell=workbook[sheet][address];area=proof["table_range"]
         if proof["source_a_hash"]!=source_hash or _location(target)!=(sheet,address) or target.get("table_range")!=area:raise ValueError()
@@ -556,6 +618,15 @@ def build_update_plan(a,b,a_mappings,b_mappings):
     plan["unplaced_sources"]=[copy.deepcopy(m) for i,m in enumerate(b_mappings) if i not in consumed]
     return plan
 
+def same_excel_value(actual,wanted):
+    """按现有xlsx写入器的确定保存精度核验，不设置金额容差。"""
+    if isinstance(wanted,(int,float,Decimal)) and not isinstance(wanted,bool) and isinstance(actual,(int,float,Decimal)):
+        from openpyxl.compat.strings import safe_string
+        encoded=safe_string(wanted)
+        return bool(encoded) and actual==(float(encoded) if any(c in encoded for c in '.Ee') else int(encoded))
+    return actual==wanted or (wanted=="" and actual is None)
+
+
 def write_updated_workbook(source,output,plan):
     source,output=Path(source).resolve(),Path(output).resolve();_new_output(source,output)
     before=file_hash(source)
@@ -590,7 +661,7 @@ def write_updated_workbook(source,output,plan):
     check=load_workbook(output,data_only=False,keep_vba=output.suffix.lower()==".xlsm",keep_links=True)
     try:
         for sheet,address,value,style in expected:
-            c=check[sheet][address];equal=c.value==value or (value=="" and c.value is None)
+            c=check[sheet][address];equal=same_excel_value(c.value,value)
             same_style = (tuple(c._style) if c.has_style else None) == (tuple(style) if style is not None and any(style) else None)
             if not equal or not same_style or (isinstance(value,str) and c.data_type=="f"):raise WorkbookError(f"输出回读验证失败：{sheet}!{address}")
         if file_hash(source)!=before:raise WorkbookError("来源文件发生变化，输出不可视为通过验证")
@@ -660,8 +731,11 @@ def _apply_operation(w,op):
         affected=axis=="row" or (overlap_rows and not (m.max_col<pos or m.min_col>box[2]))
         if not affected:merges.append(str(m));continue
         if axis=="column" and (m.min_row<box[1] or m.max_row>box[3]):raise WorkbookError("局部插删列跨越合并区域")
-        if (action=="insert" and lo<pos<=hi) or (action=="delete" and not (hi<pos or lo>=pos+count)):raise WorkbookError("结构操作跨越或删除合并区域，未执行")
-        merges.append(_transform(str(m),s.title,s.title,op,box))
+        if (action=="insert" and lo<pos<=hi) or (action=="delete" and pos<=lo<pos+count):raise WorkbookError("结构操作跨越或删除合并区域主格，未执行")
+        # 删除合并区尾部时保留主格；缩为一个单元格后不再声明合并。
+        transformed=_transform(str(m),s.title,s.title,op,box)
+        left,top,right,bottom=range_boundaries(transformed)
+        if left!=right or top!=bottom:merges.append(transformed)
     formulas=[]
     for ws in w:
         for c in list(ws._cells.values()):

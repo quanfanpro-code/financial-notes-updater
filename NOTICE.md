@@ -2,7 +2,7 @@
 
 本项目原创程序以 GNU Affero General Public License 第三版发布，完整文本见 LICENSE。
 
-Word桥接复用了作者同一账号下 audit-notes-tool 项目的同步核心。为使本次开源源码可独立取得，所需六份核心文件随本项目一并发布；来源版本为 4856f9dce5fec743f8f0adb4e3ff3f16041f9b75，逐文件指纹见 Word桥接/复用核心/来源.json。本次发布不改变原仓库的访问状态，不包含其桌面窗口和无关功能。
+Word桥接复用了作者同一账号下 audit-notes-tool 项目的同步核心。为使本次开源源码可独立取得，所需十四份核心文件随本项目一并发布；来源版本为 4856f9dce5fec743f8f0adb4e3ff3f16041f9b75，逐文件指纹见 Word桥接/复用核心/来源.json。本次发布不改变原仓库的访问状态，不包含其桌面窗口和无关功能。
 
 本项目使用 openpyxl、python-docx、pywin32、jsonschema，以及 DocumentFormat.OpenXml、Newtonsoft.Json、ClosedXML。各组件保留各自的许可证；本仓库不将第三方组件重新授权为本项目许可证。Python 和 .NET 运行环境不随源码包分发。
 

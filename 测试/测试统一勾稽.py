@@ -1,4 +1,4 @@
-# coding: utf-8
+﻿# coding: utf-8
 """统一事实生成更新计划；位置变化、业务不符、冲突和空白的行为核验。"""
 import copy
 import importlib
@@ -107,12 +107,12 @@ class MatchTests(unittest.TestCase):
         root,gold,paths=self.file_fixture()
         from 附注更新.分步流程 import run_step
         result=run_step('match',{'output_dir':str(root/'正式入口'),'gold_path':str(gold),'a_mapping':str(paths[0]),'b_mapping':str(paths[1])})
-        self.assertEqual(result['status'],'partial',result['message'])
+        self.assertEqual(result['status'],'complete',result['message'])
         plan=json.loads(Path(result['files']['update_plan']).read_text(encoding='utf-8-sig'))
-        self.assertEqual(plan['updates'][0]['value'],900)
-        self.assertEqual(plan['updates'][0]['sources'][0]['cell'],'J3')
-        self.assertFalse(plan['complete'])
-        self.assertTrue(any(i['kind']=='coverage_not_verified' for i in plan['issues']))
+        self.assertNotIn('updates',plan)
+        self.assertEqual(plan['source_groups']['固定资产原值']['cells'][0]['cell'],'J3')
+        self.assertTrue(plan['complete'])
+        self.assertEqual(plan['issues'],[])
 
     def complete_fixture_mapping(self,path):
         from 附注更新.表格 import read_workbook,materialize_candidate_blanks

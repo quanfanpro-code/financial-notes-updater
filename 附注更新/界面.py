@@ -34,7 +34,7 @@ FILE_FIELDS = {
     "a_gold_changes": ("语义复核与金标准补充记录", "*.json"),
     "b_gold_changes": ("语义复核与金标准补充记录", "*.json"),
     "b_standard_review": ("待处理语义与金标准补充材料", "*.json"),
-    "update_plan": ("更新清单", "*.json"),
+    "update_plan": ("单元格对应清单", "*.json"),
     "structure_review": ("行列调整的语义依据与复核", "*.json"),
     "unused_source_review": ("本次未采用来源的语义依据", "*.json"),
     "adjusted_a": ("调整行列后的附注表格（待填数）", "*.xlsx *.xlsm"),
@@ -56,21 +56,21 @@ STEPS = {
     },
     "recognize_a": {
         "number": "02", "title": "识别附注表格语义", "short": "识别附注表格语义",
-        "description": "逐格识别指标槽位与实际维度，独立保存映射。新客户、新日期是维度取值，不因此新增槽位；真正缺少的指标经核实后补入金标准。",
+        "description": "先了解文件编排、科目和子表，再逐层理解行列及适用说明，确认全部待更新格的指标与实际维度；未确认内容保留具体原因。",
         "required": ("a_path",), "inputs": ("a_path",), "optional": ("a_link",),
         "outputs": ("a_mapping", "a_review", "a_gold_changes", "a_standard_review"), "button": "识别附注表格并保存映射",
         "hint": "已有完整语义映射可直接用于建立对应；部分成果可选择后继续识别，已确认格会先核验再复用。",
     },
     "recognize_b": {
         "number": "03", "title": "识别更新数据语义", "short": "识别更新数据语义",
-        "description": "按金标准独立识别完整更新数据，保存每格的指标槽位与实际维度。新客户、新日期是维度取值，不因此新增槽位；真正缺少的指标经核实后补入金标准。",
-        "required": ("b_path",), "inputs": ("b_path",), "optional": (),
+        "description": "先完整了解更新数据的全部科目及子表，再根据附注需要详看，仅确认必要候选格的完整语义。",
+        "required": ("b_path",), "inputs": ("b_path",), "optional": ("a_mapping",),
         "outputs": ("b_mapping", "b_review", "b_scope", "b_gold_changes", "b_standard_review"), "button": "识别更新数据并保存映射",
-        "hint": "每份更新数据表各自保存语义映射。已有这份数据的映射时，可直接选择复用。",
+        "hint": "未选择有效附注映射时只保存初识目录。附注需要变化后重新选表，已有合法更新数据身份保留并接续。",
     },
     "match": {
         "number": "04", "title": "建立单元格对应", "short": "建立单元格对应",
-        "description": "读取两个已保存的语义映射，勾稽相同含义的单元格，保存更新清单。",
+        "description": "读取两个已保存的语义映射，按相同金标准槽位建立对应，分别保留双方实际维度取值。",
         "required": ("a_mapping", "b_mapping"), "inputs": ("a_mapping", "b_mapping"),
         "optional": ("a_path", "b_path", "a_link"),
         "outputs": ("update_plan", "trace", "structure_review", "unused_source_review", "adjusted_a", "adjusted_a_mapping"), "button": "建立对应并保存清单",
@@ -149,7 +149,7 @@ def file_selection_updates(key, path, current):
     if path and key in {"a_mapping", "b_mapping"}:
         updates.update(_mapping_sources(path, "A" if key == "a_mapping" else "B"))
     if path and key == "update_plan":
-        record = _read_record(path, ("附注更新清单-v1","附注更新清单-v2"))
+        record = _read_record(path, ("附注更新清单-v1","附注更新清单-v2","附注语义对应-v2"))
         for mapping, carrier in (("a_mapping", "A"), ("b_mapping", "B")):
             bound = record.get(mapping)
             if not bound:
@@ -512,9 +512,28 @@ class Application:
             if type(record.get("complete", False)) is not bool or record.get("complete") and record["unresolved"]:
                 raise ValueError("映射的完整标记与待核实清单不一致")
             state = "完整成果" if record.get("complete") is True else "部分成果"
+            scope=record.get('recognition_scope',{})
+            if scope.get('mode')=='b_outline':
+                state='B初识目录（尚未按A需要确认身份）'
+            elif scope.get('mode')=='b_required':
+                needs=scope.get('coverage',{}).get('targets',[])
+                missing=sum(not row.get('standard_sources',row.get('exact_sources')) for row in needs)
+                corresponding=f'尚未确认槽位对应{missing}格' if scope.get('identity_coverage_version') in {2,3} else '槽位对应清单待更新'
+                state=f'B按需识别成果（A需要{len(needs)}格，{corresponding}）'
             business_count = sum(row.get('record_type') == 'metric_fact' for row in record['facts']) if business_key == 'facts' else len(record['mappings'])
+            if business_key=='facts':business_count+=len(record.get('slot_bindings',[]))
             text = state + "：" + "；".join(f"{name} {count} 格" for name, count in
                 (("已确认业务", business_count), ("非业务", len(record['excluded'])), ("待核实", len(record['unresolved']))))
+            if key!='b_mapping' and 'a_identity_coverage' in record:
+                state='A识别完成' if record.get('coverage',{}).get('complete') and not record.get('source_identities') else 'A识别未完成'
+                text=state+'：'+'；'.join(f'{name} {count} 格' for name,count in
+                    (('准确对应金标准',business_count),('待修正识别',len(record['unresolved']))))
+            elif key=='b_mapping' and 'b_identity_coverage' in record:
+                needs=scope.get('coverage',{}).get('targets',[])
+                missing=sum(not row.get('standard_sources',row.get('exact_sources')) for row in needs)
+                corresponding=f'尚未确认槽位对应 {missing} 格' if scope.get('identity_coverage_version') in {2,3} else '槽位对应清单待更新'
+                text=(f"B候选：准确对应金标准 {business_count} 格；待修正识别 {len(record['unresolved'])} 格；"
+                      f"A需要 {len(needs)} 格，{corresponding}")
             label.configure(text=text + "。执行时仍会核验来源与金标准。", fg=MUTED)
         except (OSError, ValueError, TypeError) as error:
             label.configure(text="不能读取映射成果：" + str(error), fg="#A65B05")
@@ -796,7 +815,7 @@ class Application:
             elif step == "recognize_b":
                 self.scope_prefilter.set(False)
                 definition = {**definition, 'outputs': tuple(key for key in definition['outputs'] if key != 'b_scope')}
-                self.label(inputs, "按新版金标准独立识别完整更新数据，保存每格的槽位、实际维度和依据；与附注表格建立对应在下一步进行。",
+                self.label(inputs, "完整初识所有科目和子表；只详看附注需要的内容，选中子表也不必逐格识别全部指标。没有有效附注映射时只保存初识。",
                     fg=MUTED, wraplength=760, justify="left", font=("Microsoft YaHei UI", 9)).grid(
                     row=row, column=0, columnspan=5, sticky="w", pady=(7, 3))
                 row += 1
@@ -1067,6 +1086,9 @@ class Application:
         return True
 
     def apply_values(self, updates):
+        if any(key in updates for key in ('a_mapping','a_path','a_context_text')):
+            self.step_states.pop('recognize_b',None)
+            self.step_messages['recognize_b']='附注需要已变化，须重新按需识别B；已有合法B成果保留。'
         for key, value in updates.items():
             if key in self.values:
                 self.values[key].set(str(value or ""))

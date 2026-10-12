@@ -41,7 +41,40 @@ def bridge(request,work_dir,cancel=None):
     return result
 
 def trace_workbook(path,plan):
+    if plan.get('schema')=='附注语义对应-v2':
+        book=Workbook();sheet=book.active;sheet.title='逐格槽位对应'
+        sheet.append(['A工作表','A单元格','金标准槽位','A实际维度取值','B同槽位位置组','不同B位置数'])
+        sources=book.create_sheet('B槽位位置');sources.append(['金标准槽位','B工作表','B单元格','B实际维度取值','原文依据'])
+        starts={}
+        for key,group in plan['source_groups'].items():
+            starts[key]=sources.max_row+1
+            for row in group['cells']:
+                sources.append([key,row['sheet'],row['cell'],json.dumps(row['dimensions'],ensure_ascii=False),
+                                json.dumps(row['dimension_evidence'],ensure_ascii=False)])
+        for row in plan['targets']:
+            group=row['source_group'];sheet.append([row['sheet'],row['cell'],row['metric_id'],
+                json.dumps(row['dimensions'],ensure_ascii=False),group,len(plan['source_groups'][group]['cells']) if group else 0])
+            if group:sheet.cell(sheet.max_row,5).hyperlink=f"#'B槽位位置'!A{starts[group]}"
+        if plan['issues']:
+            pending=book.create_sheet('待处理事项');pending.append(['事项','载体','工作表','单元格','依据'])
+            for row in plan['issues']:pending.append([row['kind'],row.get('carrier'),row.get('sheet'),row.get('cell'),row.get('reason')])
+        for ws in book:
+            ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
+            for row in ws:
+                for cell in row:
+                    if isinstance(cell.value,str):cell.data_type='s'
+            for col,width in {'A':30,'B':22,'C':38,'D':65,'E':65,'F':20}.items():ws.column_dimensions[col].width=width
+        with Path(path).open('xb') as handle:book.save(handle)
+        book.close();return
     book=Workbook();sheet=book.active;sheet.title="更新记录"
+    if 'identity_matches' in plan:
+        matches=book.create_sheet('身份证对应',0)
+        matches.append(['A工作表','A单元格','金标准指标','已绑定的业务维度','同身份证的B位置','对应格数'])
+        for item in plan['identity_matches']:
+            matches.append([item['sheet'],item['cell'],item['metric_id'],
+                json.dumps({k:v for k,v in item['dimensions'].items() if k not in {'entity','report_scope','unit_scale'}},ensure_ascii=False),
+                '\n'.join(item['source_locations']),len(item['source_locations'])])
+        book.active=0
     sheet.append(["目标工作表","目标单元格","金标准ID","业务含义","原数据","新数据","更新数据来源","维度"])
     for item in plan.get("updates",[]):
         row=[item["sheet"],item["cell"],item.get("metric_id") or item.get("slot_id"),item.get("semantic_field"),
@@ -54,7 +87,19 @@ def trace_workbook(path,plan):
         for item in plan.get(key,[]):
             extra.append([item.get("sheet"),item.get("cell"),item.get("slot_id") or item.get("semantic_key"),item.get("semantic_field"),item.get("reason"),
                 json.dumps(item.get("dimensions") or item.get("evidence") or {},ensure_ascii=False,default=str)])
+    if plan.get('unprovided_fields'):
+        missing=book.create_sheet('B未提供字段')
+        missing.append(['工作表','单元格','金标准槽位','处理','原值','核查原因','B原文范围','本次维度'])
+        for item in plan['unprovided_fields']:
+            missing.append([item['sheet'],item['cell'],item['metric_id'],
+                '对象或期间已变，清空旧值' if item['action']=='clear' else '保留原值，未更新',item['old_value'],item['reason'],
+                '\n'.join(item['source_evidence']),json.dumps(item['dimensions'],ensure_ascii=False)])
     from .同义复核 import append_review_sheet
+    if plan.get('issues'):
+        pending=book.create_sheet('待处理事项');pending.append(['事项','工作表','单元格','具体依据'])
+        for item in plan['issues']:
+            record=item.get('record',item)
+            pending.append([item['kind'],record.get('sheet'),record.get('cell'),record.get('reason')])
     append_review_sheet(book,plan.get('equivalence_proofs',[]))
     for ws in book:
         for row in ws:

@@ -13,13 +13,27 @@ import importlib.util
 import json
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
-规则版本 = "结构初筛规则v4"  # v4：保存原人工映射的上层业务路径及工作表、标题表达
+规则版本 = "结构初筛规则v12"  # v12：区分已缓存的空字符串与缺缓存，保留空结果公式内容。
 
 项目根 = Path(__file__).resolve().parents[1]
 机械读取模块路径 = 项目根 / "附注更新" / "表格.py"
+
+# 已逐函数核读，并用真实B比较全部读取字段；唯一变化是已有空字符串公式缓存由None还原为''。
+# 固定具体文件哈希，未来任何读取器改动均须另行核验，不能用开关一概放行。
+已核验读取器兼容 = {
+    ("65a030daf21b77718a1576d106249fc87fc50193cc38ba5f586181efa9db493b",
+     "d09bd3d3779fb3b8bf3f1ac6b9ea128e3fba0ea0a00befb7071d734f3f92a577"):
+    "公式缓存空字符串读取修正；原值、公式、非空缓存、位置、合并、隐藏及其他读取字段一致",
+    ("65a030daf21b77718a1576d106249fc87fc50193cc38ba5f586181efa9db493b",
+     "6bf5157b11ca2276014aecccc0f09d840ed7d6cc5e9ffca9fe7545c71f5b9ecb"):
+    "同一缓存修正；其后仅调整写入回读精度，读取器及其辅助函数语法树未改变",
+    ("d09bd3d3779fb3b8bf3f1ac6b9ea128e3fba0ea0a00befb7071d734f3f92a577",
+     "6bf5157b11ca2276014aecccc0f09d840ed7d6cc5e9ffca9fe7545c71f5b9ecb"):
+    "仅调整写入回读精度，读取器及其辅助函数语法树未改变"
+}
 
 
 def 文件指纹(路径):
@@ -44,6 +58,120 @@ def 装载机械读取模块(路径=None):
 def 读jsonl(路径):
     with open(路径, encoding="utf-8-sig") as f:
         return [json.loads(行) for 行 in f if 行.strip()]
+
+
+def 索引文件指纹(目录):
+    """清单在三个数据文件写完后登记指纹，不把清单自身纳入循环哈希。"""
+    return {名称: 文件指纹(Path(目录) / 名称)
+            for 名称 in ("小表记录.jsonl", "文字查找.json", "去向明细.jsonl")}
+
+
+def 校验索引目录(索引目录, 核对本机来源=True, 允许读取器版本变化=False):
+    """装载和增量共用校验。旧版没有文件指纹时明确证据限度，不伪造已验证结论。"""
+    目录 = Path(索引目录)
+    try:
+        清单 = json.loads((目录 / "索引清单.json").read_text(encoding="utf-8-sig"))
+        记录 = 读jsonl(目录 / "小表记录.jsonl")
+        查找 = json.loads((目录 / "文字查找.json").read_text(encoding="utf-8-sig"))
+        去向 = 读jsonl(目录 / "去向明细.jsonl")
+        版本 = 清单.get("规则版本")
+        if 版本 not in {f"结构初筛规则v{i}" for i in range(1, 13)} | {"虚构演示"}:
+            raise ValueError(f"不支持的索引规则版本：{版本}")
+        if 查找.get("规则版本") != 版本:
+            raise ValueError("文字查找与索引清单的规则版本不一致")
+        说明 = []
+        文件指纹们 = 清单.get("生成物指纹")
+        if 文件指纹们 is not None:
+            if 文件指纹们 != 索引文件指纹(目录):
+                raise ValueError("索引生成物指纹不符，可能被截断、修改或混入其他版本")
+            说明.append("三个索引数据文件与生成时登记指纹一致")
+        elif 版本 in {f"结构初筛规则v{i}" for i in range(5, 13)} | {"虚构演示"}:
+            raise ValueError("当前索引格式缺少生成物指纹")
+        else:
+            说明.append("旧版没有生成物指纹：已检查数量和内部引用，不能仅凭这些检查证明语义未被修改")
+        if 清单.get("小表数") != len(记录):
+            raise ValueError("小表记录数量与索引清单不一致")
+        按样式 = dict(Counter(str(r["样式"]) for r in 记录))
+        if {str(k): v for k, v in 清单.get("按样式", {}).items() if v} != 按样式:
+            raise ValueError("各样式小表数量与索引清单不一致")
+        if dict(Counter(d["去向"] for d in 去向)) != 清单.get("映射去向", {}):
+            raise ValueError("映射去向数量与索引清单不一致")
+        去向身份 = [(d["样式"], d["mapping_id"]) for d in 去向]
+        if len(去向身份) != len(set(去向身份)):
+            raise ValueError("去向明细存在重复映射身份")
+        小表 = {r["小表编号"]: r for r in 记录}
+        if len(小表) != len(记录):
+            raise ValueError("小表编号重复")
+        业务身份 = []
+        原引用 = []
+        应有文字 = defaultdict(list)
+        表内语义 = defaultdict(set)
+        for r in 记录:
+            if len({n["坐标"] for n in r["节点"]}) != len(r["节点"]):
+                raise ValueError(f"小表节点坐标重复：{r['小表编号']}")
+            for n in r["节点"]:
+                if n.get("查找文字") and n["角色"] in ("标题", "表头", "项目", "说明", "检验", "结构排除"):
+                    应有文字[n["查找文字"]].append({"小表编号": r["小表编号"], "样式": r["样式"],
+                                                  "工作表": r["来源"]["工作表"], "坐标": n["坐标"], "角色": n["角色"]})
+                if n["角色"] == "业务数值":
+                    q = n.get("语义引用") or {}
+                    if not all(q.get(k) for k in ("mapping_id", "representation_id", "semantic_id")):
+                        raise ValueError(f"业务格语义引用不完整：{r['小表编号']}!{n['坐标']}")
+                    业务身份.append((r["样式"], q["mapping_id"]))
+                    表内语义[r["小表编号"]].add(q["semantic_id"])
+                    原引用.append(q)
+        登记业务 = [(d["样式"], d["mapping_id"]) for d in 去向 if d["去向"] == "业务格进入索引"]
+        if Counter(业务身份) != Counter(登记业务) or len(业务身份) != len(set(业务身份)):
+            raise ValueError("业务节点与去向明细的逐条映射身份不一致")
+        def 规范目录(d):
+            return {k: sorted(json.dumps(e, sort_keys=True, ensure_ascii=False) for e in v) for k, v in d.items()}
+        if 规范目录(查找.get("正文", {})) != 规范目录(应有文字):
+            raise ValueError("文字查找与小表原文节点的逐项对应不一致")
+        for 项们 in 查找.get("别名", {}).values():
+            for 项 in 项们:
+                if 项.get("semantic_id") not in 表内语义.get(项.get("小表编号"), set()):
+                    raise ValueError("别名目录指向不存在的小表语义")
+        # 私有资料可用时据固定版本核对；便携索引不强制依赖原作者电脑的绝对路径。
+        输入路径 = Path(清单.get("输入清单") or "（无输入清单）")
+        if 核对本机来源 and 输入路径.is_file() and 清单.get("输入指纹"):
+            输入 = json.loads(输入路径.read_text(encoding="utf-8-sig"))
+            登记 = {e["用途"]: e for e in 输入.get("条目", [])}
+            可用 = {}
+            for 用途, 指纹 in 清单["输入指纹"].items():
+                e = 登记.get(用途)
+                if e is None or e.get("sha256") != 指纹:
+                    raise ValueError(f"本机输入清单与索引记录版本不一致：{用途}")
+                p = Path(e["路径"])
+                if p.is_file():
+                    实际指纹 = 文件指纹(p)
+                    if 实际指纹 != 指纹:
+                        if 允许读取器版本变化 and 用途 == "复用代码:机械读取模块":
+                            兼容依据 = 已核验读取器兼容.get((指纹, 实际指纹))
+                            if 兼容依据 is None:
+                                raise ValueError(f"读取器版本未经兼容核验：{指纹} → {实际指纹}")
+                            说明.append(f"已核验读取器兼容：{指纹} → {实际指纹}；{兼容依据}。保留旧索引版本。")
+                            continue
+                        raise ValueError(f"本机索引来源指纹不符：{用途} {p}")
+                    可用[用途] = p
+            if "统一成果:表现记录" in 可用:
+                表现 = {p["representation_id"]: p for p in 读jsonl(可用["统一成果:表现记录"])}
+                for q in 原引用:
+                    p = 表现.get(q["representation_id"])
+                    if (p is None or p.get("semantic_id") != q["semantic_id"]
+                            or p.get("source_locator", {}).get("mapping_id") != q["mapping_id"]
+                            or p.get("规范维度值") != q.get("维度")
+                            or p.get("确认依据") != q.get("确认依据")):
+                        raise ValueError(f"索引语义引用与固定版本统一成果不符：{q['mapping_id']}")
+                说明.append("语义、维度和确认依据已逐条与本机固定版本表现记录核对")
+            if len(可用) < len(清单["输入指纹"]):
+                说明.append("部分原始来源在本机不可用；仅核对可用来源，未声称重新审定全部原始语义")
+        else:
+            说明.append("未提供本机可用的固定来源；校验覆盖索引自身完整性，不代表重新审定原语义")
+        return {"目录": str(目录), "记录": 记录, "小表": 小表, "正文": 查找["正文"],
+                "别名": 查找.get("别名", {}), "规则版本": 版本, "索引清单": 清单,
+                "去向明细": 去向, "校验说明": 说明}
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as e:
+        raise ValueError(f"索引文件缺失、损坏或字段不完整：{目录}；{e}") from e
 
 
 def 规范文字(值):
@@ -153,7 +281,7 @@ _表格模块缓存 = {}
 
 
 def 表格模块(路径=None):
-    键 = str(路径 or 机械读取模块路径)
+    键 = (str(路径 or 机械读取模块路径), 文件指纹(路径 or 机械读取模块路径))
     if 键 not in _表格模块缓存:
         _表格模块缓存[键] = 装载机械读取模块(路径)
     return _表格模块缓存[键]
@@ -253,13 +381,48 @@ def _取显示文字(格):
     return 格.get("value")
 
 
+def _已知数值公式(公式, 单元格, 业务坐标, 已查=None):
+    """仅确认受支持的数值运算依赖，不求值；未知函数或文本依赖保留缺口。"""
+    from openpyxl.formula import Tokenizer
+    已查 = set(已查 or ())
+    try:
+        tokens = Tokenizer(公式).items
+    except Exception:
+        return False
+    有计算 = False
+    for t in tokens:
+        if t.type == 'FUNC' and t.subtype == 'OPEN':
+            if t.value.upper() not in ('SUM(', 'ROUND(', 'IFERROR(', 'ABS(', 'MIN(', 'MAX('): return False
+            有计算 = True
+        elif t.type.startswith('OPERATOR'):
+            if t.value not in ('+', '-', '*', '/', '^', '%'): return False
+            有计算 = True
+        elif t.type == 'OPERAND':
+            if t.subtype == 'NUMBER' or (t.subtype == 'TEXT' and t.value == '""'): continue
+            if t.subtype != 'RANGE' or not re.fullmatch(r'\$?[A-Z]+\$?\d+(?::\$?[A-Z]+\$?\d+)?',t.value): return False
+            left,top,right,bottom=range_boundaries(t.value.replace('$',''))
+            if (right-left+1)*(bottom-top+1)>10000: return False
+            for row in range(top,bottom+1):
+                for col in range(left,right+1):
+                    address=_坐标(row,col);cell=单元格.get(address,{})
+                    if address in 业务坐标: continue
+                    value=cell.get('cached_value') if cell.get('formula') else cell.get('value')
+                    if isinstance(value,(int,float)) and not isinstance(value,bool): continue
+                    if cell.get('formula') and address not in 已查 and _已知数值公式(
+                            cell['formula'],单元格,业务坐标,已查|{address}): continue
+                    return False
+        elif t.type not in ('FUNC','PAREN','SEP','WHITE-SPACE'):
+            return False
+    return 有计算
+
+
 def _提取小表(样式, 工作簿名, 工作表名, 名称, 记录们, 边界, 依据, 工作表记录,
               表现按映射, 项目列字母, 缺口, 去向):
     左, 顶, 右, 底 = 边界
     业务映射 = {}
     结构格 = {}
     for r in 记录们:
-        if r.get("target_slot_id"):
+        if r.get('target_slot_id') or r.get('target_metric_id'):
             业务映射[r["cell"]] = r
         else:
             结构格[r["cell"]] = r
@@ -279,6 +442,7 @@ def _提取小表(样式, 工作簿名, 工作表名, 名称, 记录们, 边界,
         ml, mt, mr, mb = range_boundaries(m)
         if ml <= 右 and mr >= 左 and mt <= 底 and mb >= 顶:
             合并覆盖[_坐标(mt, ml)] = m
+    合并盒 = [range_boundaries(m) for m in 合并覆盖.values()]
 
     节点 = []
     空白位置 = []
@@ -286,6 +450,10 @@ def _提取小表(样式, 工作簿名, 工作表名, 名称, 记录们, 边界,
         for 列 in range(左, 右 + 1):
             坐标 = _坐标(行, 列)
             格 = _单元格(工作表记录, 行, 列)
+            if 坐标 not in 业务映射 and 坐标 not in 结构格 and any(
+                    ml <= 列 <= mr and mt <= 行 <= mb and (列, 行) != (ml, mt)
+                    for ml, mt, mr, mb in 合并盒):
+                continue  # 合并延续位置不属于真实空白业务格。
             if 坐标 in 业务映射:
                 r = 业务映射[坐标]
                 表现 = 表现按映射.get(r["mapping_id"])
@@ -307,6 +475,21 @@ def _提取小表(样式, 工作簿名, 工作表名, 名称, 记录们, 边界,
                                      "确认依据": 表现.get("确认依据")}})
                 去向.append({"mapping_id": r["mapping_id"], "去向": "业务格进入索引"})
                 continue
+            if 格 and 格.get("formula") and 格.get("cached_value") is None:
+                覆盖左, _, 覆盖右, _ = range_boundaries(合并覆盖.get(坐标, 坐标))
+                数值运算 = 行 >= 首业务行 and _已知数值公式(格['formula'],工作表记录['cells'],业务映射)
+                节点.append({"坐标": 坐标, "角色": "表头" if 行 < 首业务行 else "说明", "行": 行, "列": 列,
+                           "原文": 格.get("value"), "查找文字": None, "公式": 格["formula"],
+                           "缓存": None, "隐藏": 格.get("hidden", False), "依据": "公式缺少缓存显示，不猜原文"})
+                缺口.append({"小表": 名称, "坐标": 坐标, "问题": "公式结构格缺少缓存显示",
+                           "影响业务格": [a for a in 业务映射 if not 数值运算
+                                      and 行 < range_boundaries(a)[1] and 覆盖左 <= range_boundaries(a)[0] <= 覆盖右],
+                           "影响依据": "首业务行上方的公式表头及实际合并覆盖" if 行 < 首业务行 else
+                                       ("已核对数值运算和依赖；原公式仍未映射，不作为其他格表头" if 数值运算 else
+                                        "业务区公式显示未知，保留对同覆盖列后续业务格的限制")})
+                if 坐标 in 结构格:
+                    去向.append({"mapping_id": 结构格[坐标]["mapping_id"], "去向": "结构格记录"})
+                continue
             if 坐标 in 结构格:
                 r = 结构格[坐标]
                 语义 = f"{r.get('row_semantics') or ''}{r.get('column_semantics') or ''}"
@@ -322,6 +505,10 @@ def _提取小表(样式, 工作簿名, 工作表名, 名称, 记录们, 边界,
                 continue
             显示 = _取显示文字(格)
             if 显示 is None or (isinstance(显示, str) and not 规范文字(显示)):
+                if 格 and 格.get('formula'):
+                    节点.append({'坐标':坐标,'角色':'说明','行':行,'列':列,'原文':格.get('value'),
+                               '查找文字':None,'公式':格['formula'],'缓存':格.get('cached_value'),
+                               '隐藏':格.get('hidden',False),'依据':'公式显示为空，原式及缓存保留为未映射内容'})
                 if 格 is None or (格.get("value") is None and not 格.get("formula")):
                     空白位置.append(坐标)
                 continue
@@ -332,14 +519,16 @@ def _提取小表(样式, 工作簿名, 工作表名, 名称, 记录们, 边界,
                 continue
             if 文字 == 规范文字(名称):
                 角色, 角色依据 = "标题", "与小表名称一致"
-            elif 文字 in 列语义文字:
-                角色, 角色依据 = "表头", "与映射列语义文字一致"
-            elif 文字 in 行语义文字:
-                角色, 角色依据 = "项目", "与映射行语义文字一致"
+            elif 行 < 首业务行 and (列 in 业务列 or any(
+                    ml <= 列 <= mr and mt <= 行 <= mb and any(ml <= c <= mr for c in 业务列)
+                    for ml, mt, mr, mb in 合并盒)):
+                角色, 角色依据 = "表头", "位于首业务行上方，按业务列及原Excel合并覆盖保存（位置事实）"
+            elif 文字 in 列语义文字 and 列 in 业务列:
+                角色, 角色依据 = "表头", "与本业务列映射文字一致"
+            elif 文字 in 行语义文字 and 列 == 项目列 and 行 in 业务行:
+                角色, 角色依据 = "项目", "位于项目列并与该业务行映射文字一致"
             elif 项目列 is not None and 列 == 项目列 and 行 in 业务行:
                 角色, 角色依据 = "项目", "位于项目列且与业务格同行（补充结构依据）"
-            elif 行 < 首业务行 and 列 in 业务列:
-                角色, 角色依据 = "表头", "位于业务列首业务行上方（位置事实）"
             else:
                 角色, 角色依据 = "说明", "表区内其他文字"
             节点.append({"坐标": 坐标, "角色": 角色, "行": 行, "列": 列,
@@ -356,20 +545,42 @@ def _提取小表(样式, 工作簿名, 工作表名, 名称, 记录们, 边界,
         条目 = {"坐标": n["坐标"], "原文": 原文, "行": n["行"], "缩进": 缩进,
               "是否合计": 规范文字(原文).startswith("合计"), "上级": None}
         if 是其中 or 缩进 > 0:
-            条目["上级"] = 上级
-        elif not 条目["是否合计"]:
+            子格 = sorted((a for a in 业务映射 if range_boundaries(a)[1] == n['行']), key=range_boundaries)
+            归属 = []
+            for address in 子格:
+                child=表现按映射[业务映射[address]['mapping_id']]
+                parent=child.get('父项语义ID')
+                父格=[x for x in 节点 if parent and x.get('语义引用',{}).get('semantic_id')==parent
+                    and x['列']==range_boundaries(address)[0]]
+                if len(父格)!=1: break
+                父项目=[x for x in 节点 if x['角色']=='项目' and x['行']==父格[0]['行']]
+                if len(父项目)!=1 or 父项目[0]['行']==n['行']: break
+                归属.append({'业务格':address,'子语义':child['semantic_id'],'父语义':parent,
+                             '父业务格':父格[0]['坐标'],'父项目格':父项目[0]['坐标']})
+            if 子格 and len(归属)==len(子格) and {x['父项目格'] for x in 归属}=={上级}:
+                条目.update({'上级':归属[0]['父项目格'],'上级依据':'固定统一语义的明确父项声明，逐列在本表唯一落地',
+                            '上级依据明细':归属,'待确认':False})
+            else:
+                条目.update({"候选上级": 上级, "上级依据": "只有其中或缩进及位置线索，尚无确认所属关系的证据", "待确认": True})
+                缺口.append({"小表": 名称, "坐标": n["坐标"], "问题": "项目上级归属只有位置或排版线索，尚未确认",
+                           "影响业务格": 子格})
+        else:
             上级 = n["坐标"]
         项目顺序.append(条目)
 
     表头 = []
     for 列 in sorted(业务列):
-        覆盖 = [n for n in 节点 if n["角色"] == "表头" and n["列"] == 列 and n["行"] < 首业务行]
+        覆盖 = [n for n in 节点 if n["角色"] == "表头" and n["行"] < 首业务行
+                and (n["列"] == 列 or (n["坐标"] in 合并覆盖
+                     and range_boundaries(合并覆盖[n["坐标"]])[0] <= 列 <= range_boundaries(合并覆盖[n["坐标"]])[2]))]
         if 覆盖:
             for n in 覆盖:
                 表头.append({"坐标": n["坐标"], "原文": n.get("原文"), "查找文字": n.get("查找文字"),
-                           "覆盖列": get_column_letter(列), "依据": n.get("依据")})
+                           "覆盖列": get_column_letter(列), "依据": n.get("依据"),
+                           "合并范围": 合并覆盖.get(n["坐标"])})
         else:
-            缺口.append({"小表": 名称, "坐标": f"{get_column_letter(列)}列", "问题": "该业务列缺表头归属依据"})
+            缺口.append({"小表": 名称, "坐标": f"{get_column_letter(列)}列", "问题": "该业务列缺表头归属依据",
+                       "影响业务格": [a for a in 业务映射 if range_boundaries(a)[0] == 列]})
 
     上下文 = []
     上一小表底 = 顶
@@ -381,11 +592,26 @@ def _提取小表(样式, 工作簿名, 工作表名, 名称, 记录们, 边界,
         for 列, 格 in 行文字:
             上下文.append({"坐标": _坐标(行, 列), "原文": _取显示文字(格),
                          "查找文字": 规范文字(_取显示文字(格)), "角色": "上级标题" if 行 >= 顶 - 1 else "前置说明",
+                         "隐藏": 格.get("hidden", False),
                          "依据": "表区上方相邻文字（位置事实）"})
         上一小表底 = 行
     上下文.reverse()
 
     业务坐标 = sorted(业务映射.keys(), key=lambda a: (range_boundaries(a)[1], range_boundaries(a)[0]))
+    # 纠正错分格不另造小表；原坐标仅承接身份，不回填业务节点或覆盖分母。
+    身份坐标 = set(业务坐标)
+    for r in 结构格.values():
+        history = r.get('correction_history')
+        if not history: continue
+        old = history.get('原映射完整记录', {})
+        digest = hashlib.sha256(json.dumps(old,ensure_ascii=False,sort_keys=True,
+                                          separators=(',',':')).encode('utf-8')).hexdigest()
+        if (r.get('status') != '结构格排除' or not (r.get('confirmation') or {}).get('纠错ID')
+            or not (old.get('target_slot_id') or old.get('target_metric_id'))
+            or history.get('原记录摘要') != digest
+            or any(old.get(k) != r.get(k) for k in ('mapping_id','worksheet','cell'))):
+            raise ValueError('排除格承接原小表身份的历史证据不完整或位置冲突')
+        身份坐标.add(r['cell'])
     业务路径 = defaultdict(list)
     for r in 业务映射.values():
         定义 = r.get("target_slot") or (表现按映射.get(r["mapping_id"], {}).get("上层业务") or {})
@@ -405,7 +631,7 @@ def _提取小表(样式, 工作簿名, 工作表名, 名称, 记录们, 边界,
                 "名称依据": 名称依据,
                 "完整": bool(业务映射) and sum(map(len, 业务路径.values())) == len(业务映射)}
     return {
-        "小表编号": _小表编号(样式, 工作簿名, 工作表名, 名称, 业务坐标),
+        "小表编号": _小表编号(样式, 工作簿名, 工作表名, 名称, 身份坐标),
         "样式": 样式,
         "来源": {"工作簿": 工作簿名, "工作表": 工作表名, "映射文件": sorted({r["__文件"] for r in 记录们})},
         "小表名称": 名称,
@@ -439,9 +665,11 @@ def 建立索引(输入清单: str, 输出目录: str, 旧索引目录: str | No
 
     语义别名 = {}
     语义上层 = {}
+    语义父项 = {}
     for r in 读jsonl(按用途["统一成果:统一语义记录"]["路径"]):
         含义 = r.get("meaning") or {}
         语义上层[r["semantic_id"]] = {"note": 含义.get("业务对象"), "table": 含义.get("业务表")}
+        语义父项[r['semantic_id']] = (含义.get('汇总关系') or {}).get('parent_slot_id')
         别名 = ((r.get("meaning") or {}).get("原表达") or {}).get("aliases") or {}
         文字们 = [str(t) for t in 别名.get("row_labels", []) + 别名.get("column_labels", [])]
         if 文字们:
@@ -449,6 +677,7 @@ def 建立索引(输入清单: str, 输出目录: str, 旧索引目录: str | No
     for 表现 in 表现按映射.values():
         # 样式2只登记槽位编号；沿既有语义引用回查定义，不能由编号字面猜科目。
         表现["上层业务"] = 语义上层.get(表现["semantic_id"], {})
+        表现['父项语义ID'] = 语义父项.get(表现['semantic_id'])
 
     工作簿 = {i: 按用途[f"五样式原Excel:附注样式{i}.xlsx"] for i in range(1, 6)}
     映射文件 = defaultdict(list)
@@ -463,11 +692,13 @@ def 建立索引(输入清单: str, 输出目录: str, 旧索引目录: str | No
     沿革 = []
     if 旧索引目录:
         旧索引目录 = Path(旧索引目录)
-        旧清单 = json.loads((旧索引目录 / "索引清单.json").read_text(encoding="utf-8-sig"))
+        # 旧来源本身允许已变化；新输入已单独核验，缓存内容须先通过内部/生成物校验。
+        旧索引 = 校验索引目录(旧索引目录, 核对本机来源=False)
+        旧清单 = 旧索引["索引清单"]
         旧指纹 = 旧清单.get("样式指纹", {})
-        for r in 读小表记录文件(旧索引目录 / "小表记录.jsonl"):
+        for r in 旧索引["记录"]:
             旧记录.setdefault(r["样式"], []).append(r)
-        旧去向 = 读jsonl(旧索引目录 / "去向明细.jsonl")
+        旧去向 = 旧索引["去向明细"]
         旧缺口 = 旧清单.get("缺口", [])
 
     全部记录 = []
@@ -478,7 +709,8 @@ def 建立索引(输入清单: str, 输出目录: str, 旧索引目录: str | No
         来源材料 = "|".join([工作簿[样式]["sha256"],
                           *[e["sha256"] for e in sorted(取("五样式原映射:"), key=lambda e: e["用途"]) if f"style{样式}-" in e["用途"]],
                           (按用途.get(f"复核文档:样式{样式}逐表复核记录") or 按用途.get("复核文档:样式1逐格分类清单") or {"sha256": ""})["sha256"] if 样式 != 2 else "",
-                          按用途["统一成果:表现记录"]["sha256"], 按用途["统一成果:统一语义记录"]["sha256"], 规则版本])
+                          按用途["统一成果:表现记录"]["sha256"], 按用途["统一成果:统一语义记录"]["sha256"],
+                          按用途["复用代码:机械读取模块"]["sha256"], 规则版本])
         指纹 = hashlib.sha256(来源材料.encode("utf-8")).hexdigest()
         样式指纹[str(样式)] = 指纹
         if 旧指纹.get(str(样式)) == 指纹 and 样式 in 旧记录:
@@ -489,7 +721,8 @@ def 建立索引(输入清单: str, 输出目录: str, 旧索引目录: str | No
             continue
         if 旧索引目录:
             沿革.append({"样式": 样式, "动作": "重新提取", "原因": "来源内容或规则版本变化"})
-        记录们, 去向们, 缺口们 = _提取样式(样式, 工作簿[样式]["路径"], 映射文件[样式], 按用途, 表现按映射)
+        记录们, 去向们, 缺口们 = _提取样式(样式, 工作簿[样式]["路径"], 映射文件[样式], 按用途, 表现按映射,
+                                     机械读取路径=按用途["复用代码:机械读取模块"]["路径"])
         全部记录.extend(记录们)
         去向.extend(去向们)
         缺口.extend(缺口们)
@@ -551,6 +784,7 @@ def 建立索引(输入清单: str, 输出目录: str, 旧索引目录: str | No
         "映射去向": dict(去向计数),
         "缺口": 缺口,
         "沿革": 沿革,
+        "生成物指纹": 索引文件指纹(输出目录),
     }
     with open(输出目录 / "索引清单.json", "w", encoding="utf-8-sig", newline="\n") as f:
         json.dump(索引清单, f, ensure_ascii=False, indent=1, sort_keys=True, default=_json默认)
@@ -561,8 +795,8 @@ def 读小表记录文件(路径):
     return 读jsonl(路径)
 
 
-def _提取样式(样式, 工作簿路径, 映射路径们, 按用途, 表现按映射):
-    工作簿记录 = 读取工作簿(工作簿路径)
+def _提取样式(样式, 工作簿路径, 映射路径们, 按用途, 表现按映射, 机械读取路径=None):
+    工作簿记录 = 表格模块(机械读取路径).read_workbook(str(工作簿路径))
     记录们 = []
     for 路径 in 映射路径们:
         for r in 读jsonl(路径):
@@ -629,6 +863,9 @@ def _提取样式(样式, 工作簿路径, 映射路径们, 按用途, 表现按
                     # 它到小表正文之间的整段距离不是小表正文，不参与查找定位、覆盖分母与候选范围
                     记录["表头"].extend(共用)
                     记录["缺口_共用表头"] = "表头为全表共用行，E、F列（2023/2022年度）未纳入原映射"
+                    已有依据列 = {h["覆盖列"] + "列" for h in 共用 if h.get("查找文字")}
+                    缺口[:] = [g for g in 缺口 if not (g.get("小表") == 名称
+                        and g.get("问题") == "该业务列缺表头归属依据" and g.get("坐标") in 已有依据列)]
     elif 样式 == 3:
         复核 = _解析样式3复核(按用途["复核文档:样式3逐表复核记录"]["路径"])
         分组 = defaultdict(list)

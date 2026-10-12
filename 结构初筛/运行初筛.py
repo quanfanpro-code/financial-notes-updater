@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -55,7 +56,7 @@ def 命令建库(参数):
 
 def 执行比较(输入路径, 索引目录, 输出=None, 基准对照=False):
     from 建立结构索引 import 读取工作簿
-    from 比较新表 import 载入索引, 比较工作簿, 写出交接材料
+    from 比较新表 import 载入索引, 比较工作簿, 写出交接材料, 比较完整事实, 生成版本
     输入路径 = Path(输入路径)
     if not 输入路径.is_file():
         print(f"输入文件不存在：{输入路径}", file=sys.stderr)
@@ -64,10 +65,14 @@ def 执行比较(输入路径, 索引目录, 输出=None, 基准对照=False):
     t0 = time.perf_counter()
     记录 = 读取工作簿(str(输入路径))
     读取秒 = time.perf_counter() - t0
+    t载 = time.perf_counter()
     索引 = 载入索引(str(索引目录))
+    版本 = 生成版本(输入路径, 索引目录)
+    装载秒 = time.perf_counter() - t载
     t1 = time.perf_counter()
     结果 = 比较工作簿(记录, 索引)
     比较秒 = time.perf_counter() - t1
+    结果['生成版本'] = 版本
     if 基准对照:
         基准 = 比较工作簿(记录, 索引, 预筛选=False)
         快速集合 = {(c["旧表编号"], c["新工作表"], c["新表范围"]) for c in 结果["候选"]}
@@ -77,11 +82,18 @@ def 执行比较(输入路径, 索引目录, 输出=None, 基准对照=False):
         结果["基准对照"] = {"基准候选数": len(基准集合), "快速候选数": len(快速集合),
                        "基准比较小表数": 基准["运行统计"]["比较的小表数"],
                        "遗漏": sorted(遗漏), "多出": sorted(多出),
-                       "结论": "一致" if 快速集合 == 基准集合 else "候选不一致"}
-    结果["运行统计"].update({"读取秒": round(读取秒, 3), "比较秒": round(比较秒, 3)})
+                       "结论": "一致" if 比较完整事实(结果) == 比较完整事实(基准) else "完整事实不一致"}
+    if 版本 != 生成版本(输入路径, 索引目录):
+        raise ValueError('比较期间输入、索引或代码变化，拒绝保存成功结果')
+    结果["运行统计"].update({"读取秒": round(读取秒, 3), "装载与校验秒": round(装载秒, 3), "比较秒": round(比较秒, 3)})
     t2 = time.perf_counter()
     写出交接材料(记录, 结果, str(目录))
     输出秒 = time.perf_counter() - t2
+    with (目录 / '全流程耗时.json').open('x', encoding='utf-8-sig') as f:
+        json.dump({'总秒': round(time.perf_counter() - t0, 3), '含基准对照': 基准对照,
+                   '读取秒': round(读取秒, 3), '装载与校验秒': round(装载秒, 3),
+                   '比较秒': round(比较秒, 3), '输出秒': round(输出秒, 3),
+                   '比较分阶段': 结果['运行统计']['阶段耗时']}, f, ensure_ascii=False, indent=2)
     统计 = 结果["运行统计"]
     print(f"比较完成：候选{统计['候选数']}个，比较小表{统计['比较的小表数']}张，"
           f"读取{统计['读取秒']}秒、比较{统计['比较秒']}秒、输出{输出秒:.3f}秒")

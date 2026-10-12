@@ -10,12 +10,16 @@ from datetime import datetime
 根 = Path(__file__).resolve().parent
 sys.path.insert(0, str(根))
 sys.path.insert(0, str(根 / '结构初筛'))
+sys.path.insert(0, str(根 / '测试'))
 目录 = 根 / '测试结果' / ('公开版离线检查_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
 目录.mkdir(parents=True, exist_ok=False)
 tempfile.tempdir = str(目录)
 # 测试样本留存；不以自动化清理绕过用户的删除确认。
 shutil.rmtree = lambda *args, **kwargs: None
-模块 = ['测试收尾', '测试.测试设置', '测试.测试语义', '测试.测试模型传输收尾', '测试.测试表格', '测试.测试统一语义']
+模块 = ['测试收尾', '测试独立复核比较', '测试独立复核索引',
+        '测试修复核验','测试逐格核验','测试运行版本','测试公式依赖','测试父项依据','测试基准事实范围','测试补充复核','测试对应内容',
+        '测试.测试候选示例','测试.测试指标示例','测试.测试指标参照读取',
+        '测试.测试设置', '测试.测试语义', '测试.测试模型传输收尾', '测试.测试表格', '测试.测试统一语义']
 套件 = unittest.defaultTestLoader.loadTestsFromNames(模块)
 日志 = 目录 / '测试日志.txt'
 with 日志.open('x', encoding='utf-8-sig') as f:

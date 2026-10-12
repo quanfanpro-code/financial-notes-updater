@@ -350,8 +350,13 @@ internal static class Program
             }
             if (action == "insert" && ((r < index && index < end) || (r <= template && template < end)))
                 throw new InvalidDataException("新增行切入纵向合并，或样式来源属于纵向合并，无法直接复制。");
-            if (action == "delete" && r < index + count && end > index && (r < index || end > index + count))
-                throw new InvalidDataException("删除行切入纵向合并单元格，无法保持原表结构。");
+            if (action == "delete" && r < index + count && end > index)
+            {
+                if (r >= index) throw new InvalidDataException("删除行涉及纵向合并主格，无法保持原表内容。");
+                // 主格保留，续接行随明细缩减；仅剩主格时解除纵向合并。
+                if (end - r - (Math.Min(end, index + count) - index) == 1)
+                    cell.Node.Element(Wns + "tcPr")!.Element(Wns + "vMerge")!.Remove();
+            }
         }
     }
 

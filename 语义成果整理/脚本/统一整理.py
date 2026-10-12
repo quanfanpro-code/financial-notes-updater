@@ -19,19 +19,21 @@ from collections import Counter, defaultdict
 
 
 def 解析参数(argv):
-    位置, 输入清单, 已有成果 = [], None, None
+    位置, 输入清单, 已有成果, 纠错记录 = [], None, None, None
     i = 0
     while i < len(argv):
         if argv[i] == "--输入清单" and i + 1 < len(argv):
             输入清单 = argv[i + 1]; i += 2
         elif argv[i] == "--已有成果" and i + 1 < len(argv):
             已有成果 = argv[i + 1]; i += 2
+        elif argv[i] == '--纠错记录' and i + 1 < len(argv):
+            纠错记录 = argv[i + 1]; i += 2
         else:
             位置.append(argv[i]); i += 1
-    return (位置[0] if 位置 else None), 输入清单, 已有成果
+    return (位置[0] if 位置 else None), 输入清单, 已有成果, 纠错记录
 
 
-输出根, 输入清单路径, 已有成果路径 = 解析参数(sys.argv[1:])
+输出根, 输入清单路径, 已有成果路径, 纠错记录路径 = 解析参数(sys.argv[1:])
 输出根 = 输出根 or os.path.join(项目, "语义成果整理")
 V1路径 = os.path.join(项目, "金标准", "财务报表附注语义金标准-v1.jsonl")
 V2路径 = os.path.join(项目, "金标准", "版本", "财务报表附注语义金标准_20260922_132731_236607_5547978f.jsonl")
@@ -94,6 +96,102 @@ def 表现身份(表现):
                 "规范维度": 表现.get("规范维度值", {}), "占位与缺失": 表现.get("占位与缺失", [])})
 
 
+def 结构排除证据(记录):
+    位置 = {'来源':记录['mapping_file'],'sheet':记录['worksheet'],
+            'cell':记录['cell'],'mapping_id':记录['mapping_id']}
+    return {**记录, '来源位置':位置, '排除证据ID':'excluded:'+稳定摘要(位置)}
+
+
+def 承接表现沿革(旧表现, 新表现, 旧链, 纠错, 排除证据=()):
+    新按位置 = defaultdict(list)
+    for p in 新表现:
+        新按位置[稳定摘要(来源位置(p))].append(p)
+    排除按位置 = {}
+    for e in 排除证据:
+        if e != 结构排除证据(e): raise ValueError('排除证据身份或位置不符')
+        key = 稳定摘要(e['来源位置'])
+        if key in 排除按位置 or key in 新按位置: raise ValueError('同一位置存在多个业务或排除去向')
+        排除按位置[key] = e
+    排除编号 = {e['排除证据ID'] for e in 排除证据}
+    凭证 = defaultdict(list)
+    for e in 纠错:
+        凭证[稳定摘要(e['来源位置'])].append(e)
+    迁移, 去向 = [], {p['representation_id']:p['representation_id'] for p in 新表现}
+    去向.update({i:i for i in 排除编号})
+    for old in 旧表现:
+        key = 稳定摘要(来源位置(old))
+        candidates = 新按位置.get(key, [])
+        if key in 排除按位置:
+            excluded = 排除按位置[key]
+            proofs = 凭证.get(key, [])
+            if len(proofs) != 1: raise ValueError('业务格排除缺少唯一纠错依据')
+            evidence = proofs[0]
+            if (evidence.get('纠错类型') != '业务格改为结构格排除'
+                or evidence.get('结论') != '已确认' or not evidence.get('依据')
+                or evidence.get('旧表现摘要') != 稳定摘要(old)
+                or evidence.get('新排除证据摘要') != 稳定摘要(excluded)
+                or excluded.get('status') != '结构格排除'
+                or excluded.get('target_slot_id') or excluded.get('target_metric_id')):
+                raise ValueError('排除纠错版本、状态或完整证据与凭证不符')
+            迁移.append({'旧表现ID':old['representation_id'],'新表现ID':None,
+                         '新排除证据ID':excluded['排除证据ID'],'旧记录':old,
+                         '核对':'有据纠正为结构格排除','纠错引用':evidence['纠错ID']})
+            去向[old['representation_id']] = excluded['排除证据ID']
+            continue
+        # 同一位置合法的多种旧定义按未变含义消歧；纠错仍必须唯一。
+        same = [p for p in candidates if p['representation_id'] == old['representation_id']]
+        if same:
+            if len(same) != 1: raise ValueError('表现身份重复')
+            if any(old.get(k) != same[0].get(k) for k in ('semantic_id','dimension_values','规范维度值','占位与缺失')):
+                raise ValueError('同一表现ID的完整含义发生变化')
+            continue
+        if len(candidates) != 1: raise ValueError('旧表现无法唯一定位纠错目标：'+old['representation_id'])
+        new = candidates[0]
+        changed = any(old.get(k) != new.get(k) for k in ('semantic_id','dimension_values','规范维度值','占位与缺失'))
+        evidence = None
+        if changed:
+            proofs = 凭证.get(key, [])
+            if len(proofs) != 1: raise ValueError('含义变化缺少唯一纠错依据：'+old['representation_id'])
+            evidence = proofs[0]
+            if (evidence.get('结论') != '已确认' or not evidence.get('依据')
+                or evidence.get('旧表现摘要') != 稳定摘要(old)
+                or evidence.get('新semantic_id') != new['semantic_id']
+                or evidence.get('新业务维度') != new.get('dimension_values')
+                or evidence.get('新规范维度') != new.get('规范维度值')):
+                raise ValueError('纠错版本、目标或完整维度与凭证不符：'+old['representation_id'])
+        row = {'旧表现ID':old['representation_id'],'新表现ID':new['representation_id'],
+               '旧记录':old,'核对':'有据语义纠错' if changed else '完整业务含义一致的身份规范化'}
+        if evidence: row['纠错引用'] = evidence['纠错ID']
+        迁移.append(row);去向[old['representation_id']] = new['representation_id']
+    if len({r['旧表现ID'] for r in 旧链}) != len(旧链): raise ValueError('旧迁移链存在冲突')
+    def 沿革目标(row):
+        if bool(row.get('新表现ID')) == bool(row.get('新排除证据ID')):
+            raise ValueError('沿革必须有唯一业务或排除目标')
+        return row.get('新表现ID') or row['新排除证据ID']
+    旧链去向 = {r['旧表现ID']:沿革目标(r) for r in 旧链}
+    已迁移 = {r['旧表现ID'] for r in 迁移}
+    for row in 旧链:
+        target = 沿革目标(row); seen = set()
+        while target not in 去向:
+            if target in seen: raise ValueError('旧迁移链有循环')
+            seen.add(target)
+            if target not in 旧链去向: raise ValueError('早期沿革断开：'+row['旧表现ID'])
+            target = 旧链去向[target]
+        target = 去向[target]
+        if row['旧表现ID'] in 去向 and 去向[row['旧表现ID']] != target:
+            raise ValueError('早期沿革与本次纠错冲突')
+        if row['旧表现ID'] not in 已迁移:
+            if target == 沿革目标(row):
+                迁移.append(row)
+            else:
+                updated = {**row,'新表现ID':None if target in 排除编号 else target,'沿革来源记录':row}
+                if target in 排除编号: updated['新排除证据ID'] = target
+                else: updated.pop('新排除证据ID',None)
+                迁移.append(updated)
+            已迁移.add(row['旧表现ID'])
+    return sorted(迁移, key=lambda r:r['旧表现ID'])
+
+
 def main():
     # ---------- 固定输入清单并校验哈希 ----------
     if os.path.exists(os.path.join(输出根, "数据", "表现记录.jsonl")):
@@ -108,6 +206,14 @@ def main():
         映射文件表 = [(e["相对路径"], e["路径"]) for e in 固["五样式原映射"]]
         期望清单 = {固[k]["路径"]: 固[k]["sha256"] for k in ("v1", "v2当前版本", "五样式索引", "A端映射", "A端外部复核记录")}
         期望清单.update({e["路径"]: e["sha256"] for e in 固["五样式原映射"]})
+        for k in ('纠错记录','已有表现','已有沿革','已有资产清单'):
+            if k in 固: 期望清单[固[k]['路径']] = 固[k]['sha256']
+        if ('已有表现' in 固 and not 已有成果路径) or ('纠错记录' in 固 and not 纠错记录路径):
+            raise SystemExit('清单已固定迁移来源及纠错记录，CLI不得省略相应参数')
+        for arg,k in ((纠错记录路径,'纠错记录'),
+                      (os.path.join(已有成果路径,'数据','表现记录.jsonl') if 已有成果路径 else None,'已有表现')):
+            if arg and (k not in 固 or os.path.abspath(arg) != os.path.abspath(固[k]['路径'])):
+                raise SystemExit('CLI与固定输入不符：'+k)
         for p, 期望 in 期望清单.items():
             if not os.path.exists(p):
                 raise SystemExit(f"输入缺失：{p}")
@@ -163,8 +269,8 @@ def main():
     排除证据 = []
     for 相对路径, 全路径 in 映射文件表:
         for r in 读jsonl(全路径):
-            if r.get("status") == "结构格排除" or "target_slot_id" not in r:
-                排除证据.append({"mapping_file": 相对路径, **r})
+            if r.get("status") == "结构格排除" or not (r.get('target_slot_id') or r.get('target_metric_id')):
+                排除证据.append(结构排除证据({"mapping_file": 相对路径, **r}))
             else:
                 原映射[(相对路径, r["mapping_id"])] = r
 
@@ -304,7 +410,7 @@ def main():
 
     旧新 = []
     对应表 = {}  # 对应ID -> 本次规范对应（当前版本条目的，供表现引用）
-    五样式引用 = Counter(e["legacy_slot_id"] for e in 索引["examples"])
+    五样式引用 = Counter(e['legacy_slot_id'] for e in 索引['examples'] if e.get('legacy_slot_id'))
 
     # 当前版本：v1全部记录逐条（含非active的历史保留）
     for 旧ID, r in v1.items():
@@ -533,10 +639,18 @@ def main():
 
     表现按身份 = {}
     重复证据 = []
+    # 原映射JSON键次序不构成业务含义；相同完整内容保留既有占位记录次序和身份。
+    旧占位次序 = {}
+    if 已有成果路径:
+        for p in 读jsonl(os.path.join(已有成果路径,'数据','表现记录.jsonl')):
+            排序 = sorted(p.get('占位与缺失', []), key=稳定摘要)
+            旧占位次序[表现身份({**p,'占位与缺失':排序})] = p.get('占位与缺失', [])
 
     def 挂表现(语义ID, 表现):
         assert 语义ID in 语义们, f"表现指向不存在的语义: {语义ID}"
         表现["semantic_id"] = 语义ID
+        排序 = sorted(表现.get('占位与缺失', []), key=稳定摘要)
+        表现['占位与缺失'] = 旧占位次序.get(表现身份({**表现,'占位与缺失':排序}), 排序)
         表现["representation_id"] = 表现身份(表现)
         pid = 表现["representation_id"]
         if pid in 表现按身份:
@@ -593,13 +707,34 @@ def main():
             挂表现(旧ID, 表现)
 
     未匹配原映射 = []
+    指标模板标准 = None
+    if any(e.get('metric_id') for e in 索引['examples']):
+        sys.path.insert(0, 项目)
+        from 附注更新.人工映射复用 import metric_template
+        from 附注更新.统一语义 import validate_records
+        指标模板标准 = validate_records(读jsonl(V2路径))
     for e in 索引["examples"]:
-        旧ID = e["legacy_slot_id"]
+        旧ID = e.get('legacy_slot_id')
         o = e["origin"]
         键 = (o["mapping_file"], o["mapping_id"])
         原 = 原映射.get(键)
         if 原 is None:
             未匹配原映射.append(str(键))
+        if e.get('metric_id'):
+            partial = metric_template(原, 指标模板标准, 清单[V2路径])
+            if any(e.get(k) != v for k,v in partial.items()):
+                raise SystemExit('直接指标示例与修订原映射不一致：'+str(键))
+            挂表现(e['metric_id'], {'record_type':'representation','source_kind':'five_style',
+                'representation_id':'fs:'+内容哈希('five_style',o['mapping_id'],e['metric_id']),
+                'table_form':{k:e.get(k) for k in ('row_semantics','column_semantics','table_semantics')},
+                'dimension_values':e['dimensions'],
+                '规范维度值':{**e['dimensions'],'period_role':e['template_period_role']},
+                '占位与缺失':[{'dimension':k,'处理':'模板缺少实际取值'} for k in e['missing_dimensions']],
+                'dimension_evidence':e['dimension_evidence'],
+                'source_locator':dict(o),'raw_state':{k:原.get(k) for k in ('is_formula','raw_blank','raw_value','cached_value')},
+                '证据引用':[f"原映射:{o['mapping_file']}#{o['mapping_id']}"],
+                '确认依据':e['confirmation'],'问题引用':[], '标准版本':e['standard_sha256']})
+            continue
         业务维度, 追踪, 占位们 = {}, {}, []
         for k, v in e.get("legacy_dimensions", {}).items():
             if k in 追踪字段:
@@ -630,7 +765,7 @@ def main():
                            "raw_value": 原.get("raw_value"), "cached_value": 原.get("cached_value")}
                           if 原 else "未回读到原映射"),
             "证据引用": [f"五样式索引:{o['mapping_id']}", f"原映射:{o['mapping_file']}#{o['mapping_id']}"],
-            "确认依据": {"方法": "五样式人工逐格映射"},
+            "确认依据": e.get('confirmation') or {"方法": "五样式人工逐格映射"},
             "问题引用": (["样式2应收票据raw_blank历史标志误为false，原表实际为空"]
                        if o["mapping_file"].endswith("004-应收票据-样式2-人工映射.jsonl")
                        and o.get("cell") in ("C47", "D47", "C48", "D48") else []),
@@ -865,7 +1000,8 @@ def main():
         "A端来源上下文": A映射.get("source_context"),
         "A端补充上下文": A映射.get("additional_context"),
         "A端归属记录": A映射.get("owners"),
-        "样式2结构格排除记录": 排除证据,
+        "五样式结构格排除记录": 排除证据,
+        "样式2结构格排除记录": [e for e in 排除证据 if 'style2' in e['mapping_file']],
         "其他样式排除计数": {"样式1非业务格": 3119, "样式3排除": 258,
                           "样式4可见非空结构或检查格": 5997, "样式5可见非空结构或检查格": 8539},
     }
@@ -873,44 +1009,9 @@ def main():
     # ---------- 旧表现ID一次性迁移（--已有成果；此后重跑不得再换ID） ----------
     迁移 = []
     if 已有成果路径:
-        旧表现路径 = os.path.join(已有成果路径, "数据", "表现记录.jsonl")
-        if os.path.exists(旧表现路径):
-            新按位置 = defaultdict(list)
-            for p in 表现们:
-                新按位置[(稳定摘要(来源位置(p)), p["semantic_id"])].append(p["representation_id"])
-            沿革路径 = os.path.join(已有成果路径, "对应", "表现身份迁移.jsonl")
-            旧资料 = 读jsonl(旧表现路径)
-            if os.path.exists(沿革路径):
-                for 旧迁移 in 读jsonl(沿革路径):
-                    if 旧迁移.get("旧记录"):
-                        旧资料.append(旧迁移["旧记录"])
-            已迁 = set()
-            for op in 旧资料:
-                if op["representation_id"] in 已迁:
-                    continue
-                已迁.add(op["representation_id"])
-                候选 = 新按位置.get((稳定摘要(来源位置(op)), op["semantic_id"]), [])
-                if len(候选) != 1:
-                    raise SystemExit(f"旧表现迁移无法唯一定位：{op['representation_id']}，候选{len(候选)}")
-                if op["representation_id"] == 候选[0]:
-                    continue
-                迁移.append({"旧表现ID": op["representation_id"], "新表现ID": 候选[0],
-                            "核对": "逻辑来源、位置及原语义一致；完整结构维度见新记录",
-                            "旧记录": op})
-
-            # 旧成果本身还有更早的迁移记录时，沿链更新到本批ID，不遗失早期别名。
-            到本批 = {x["旧表现ID"]: x["新表现ID"] for x in 迁移}
-            到本批.update({p["representation_id"]: p["representation_id"] for p in 表现们})
-            if os.path.exists(沿革路径):
-                for old in 读jsonl(沿革路径):
-                    if old["旧表现ID"] in 到本批:
-                        continue
-                    new = 到本批.get(old["新表现ID"])
-                    if new is None:
-                        raise SystemExit("更早的表现迁移链无法承接：" + old["旧表现ID"])
-                    迁移.append({"旧表现ID": old["旧表现ID"], "新表现ID": new,
-                                 "沿革来源记录": old, "核对":"从既有迁移记录沿链承接，未重造语义"})
-                    到本批[old["旧表现ID"]] = new
+        迁移 = 承接表现沿革(读jsonl(os.path.join(已有成果路径,'数据','表现记录.jsonl')),
+                           表现们, 读jsonl(os.path.join(已有成果路径,'对应','表现身份迁移.jsonl')),
+                           读jsonl(纠错记录路径) if 纠错记录路径 else [], 排除证据)
 
     # ---------- 写出前重核输入哈希（读取后输入变化则本批不发布） ----------
     for p, 期望 in 清单.items():
@@ -918,6 +1019,10 @@ def main():
             raise SystemExit(f"读取后输入发生变化，本批不发布，保留诊断：{p}")
 
     # ---------- 写出 ----------
+    if 输入清单路径:
+        import shutil
+        os.makedirs(输出根, exist_ok=True)
+        shutil.copyfile(输入清单路径, os.path.join(输出根,'资产清单.json'))
     规则输出 = os.path.join(输出根, "对应", "维度规范对应.json")
     os.makedirs(os.path.dirname(规则输出), exist_ok=True)
     if os.path.abspath(规则输出) != os.path.abspath(规则路径):

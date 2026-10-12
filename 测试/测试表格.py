@@ -9,6 +9,47 @@ ROOT=Path(__file__).resolve().parents[1]
 WORK=ROOT/"测试结果"/("表格_"+uuid.uuid4().hex[:8])
 WORK.mkdir(parents=True,exist_ok=True)
 class WorkbookTests(unittest.TestCase):
+    def test_formula_empty_string_cache_is_not_missing_result(self):
+        import zipfile
+        from xml.etree import ElementTree as ET
+        api=self.api();w=Workbook();s=w.active;s.title='空字符串'
+        for i in range(1,7):s.cell(i,1,'=""')
+        w.create_sheet('第二张')['A1']='=""'
+        original=WORK/'空缓存原结构.xlsx';path=WORK/'空缓存明确类型.xlsx';w.save(original);w.close()
+        ns='{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+        with zipfile.ZipFile(original) as source,zipfile.ZipFile(path,'x') as target:
+            for info in source.infolist():
+                data=source.read(info.filename);filename=info.filename
+                if info.filename=='xl/worksheets/sheet1.xml':
+                    tree=ET.fromstring(data);cells={c.get('r'):c for c in tree.iter(ns+'c')}
+                    cells['A1'].set('t','str')
+                    cells['A1'].find(ns+'f').attrib.update(t='shared',si='0',ref='A1:A6')
+                    cells['A6'].set('t','str');cells['A6'].find(ns+'f').attrib.update(t='shared',si='0')
+                    cells['A6'].find(ns+'f').text=None
+                    cells['A2'].set('t','str');cells['A2'].remove(cells['A2'].find(ns+'v'))
+                    cells['A4'].find(ns+'v').text='0'
+                    cells['A5'].set('t','str');cells['A5'].find(ns+'v').text='期末余额'
+                    data=ET.tostring(tree,encoding='utf-8')
+                elif info.filename=='xl/worksheets/sheet2.xml':
+                    tree=ET.fromstring(data);next(tree.iter(ns+'c')).set('t','str');data=ET.tostring(tree,encoding='utf-8')
+                    filename='xl/worksheets/cache-part.xml'
+                elif info.filename=='xl/_rels/workbook.xml.rels':
+                    data=data.replace(b'sheet2.xml',b'cache-part.xml')
+                elif info.filename=='[Content_Types].xml':
+                    data=data.replace(b'sheet2.xml',b'cache-part.xml')
+                target.writestr(filename,data)
+        before=api.file_hash(path);snapshot=api.read_workbook(path)
+        first=snapshot['sheets'][0]['cells']
+        self.assertEqual(first['A1']['cached_value'],'')
+        self.assertIsNone(first['A2']['cached_value'])
+        self.assertIsNone(first['A3']['cached_value'])
+        self.assertEqual(first['A4']['cached_value'],0)
+        self.assertEqual(first['A5']['cached_value'],'期末余额')
+        self.assertEqual(first['A6']['cached_value'],'')
+        self.assertEqual(snapshot['sheets'][1]['cells']['A1']['cached_value'],'')
+        self.assertEqual(first['A1']['formula'],'=""')
+        self.assertEqual(api.file_hash(path),before)
+
     def api(self):
         try: return importlib.import_module("附注更新.表格")
         except ImportError: self.fail("尚未实现真实Excel读取与语义勾稽")
@@ -402,6 +443,23 @@ class WorkbookTests(unittest.TestCase):
         got=load_workbook(out);self.assertEqual(got.active["B2"].value,8);self.assertEqual(list(got.defined_names["TA_001"].destinations),[("附注","$A$1:$B$2")])
         w.active.merge_cells("A2:A3");merged=WORK/"合并输入.xlsx";w.save(merged)
         with self.assertRaises(ValueError):api.write_updated_workbook(merged,WORK/"拒绝合并.xlsx",{"operations":[{"range_name":"TA_001","axis":"row","action":"insert","index":2,"template_index":0}]})
+    def test_delete_merge_tail_preserves_anchor_and_rejects_anchor_deletion(self):
+        api=self.api()
+        for axis,merged,index in [('row','B2:B4',3),('column','B2:D2',3)]:
+            with self.subTest(axis=axis):
+                w=Workbook();s=w.active;s.title='附注';s['B2']='共同理由';s['B2'].font=Font(name='宋体',bold=True)
+                s.merge_cells(merged);w.defined_names.add(DefinedName('TA_001',attr_text="'附注'!$A$1:$D$4"))
+                op={'range_name':'TA_001','axis':axis,'action':'delete','index':index,'template_index':0}
+                api._apply_operation(w,op)
+                self.assertEqual(str(next(iter(s.merged_cells.ranges))),'B2:B3' if axis=='row' else 'B2:C2')
+                api._apply_operation(w,{**op,'index':2})
+                self.assertEqual(list(s.merged_cells.ranges),[]);self.assertEqual(s['B2'].value,'共同理由');self.assertTrue(s['B2'].font.bold)
+                w.close()
+                w=Workbook();s=w.active;s.title='附注';s.merge_cells(merged)
+                w.defined_names.add(DefinedName('TA_001',attr_text="'附注'!$A$1:$D$4"))
+                with self.assertRaises(ValueError):api._apply_operation(w,{**op,'index':1})
+                self.assertIn(merged,{str(m) for m in s.merged_cells.ranges});w.close()
+
     def test_missing_source_has_distinct_issue_kind(self):
         api=self.api();a=self.make("缺来源A.xlsx",4);b=self.make("缺来源B.xlsx",8)
         plan=api.build_update_plan(api.read_workbook(a),api.read_workbook(b),[self.mapping(counterparty="甲")],[self.mapping(counterparty="乙")])

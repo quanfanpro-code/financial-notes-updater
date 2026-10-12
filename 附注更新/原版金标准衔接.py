@@ -12,21 +12,39 @@ def _manual_corpus(path, stamp, size):
     corpus=json.loads(Path(path).read_text(encoding='utf-8-sig'))
     forms={}
     for item in corpus['examples']:
+        if item.get('metric_id'):
+            continue  # 直接指标表现没有旧槽位，不伪造成旧定义转换。
         form={key:item[key] for key in ('row_semantics','column_semantics','table_semantics','legacy_dimensions')}
         form['legacy_dimensions']={key:value for key,value in form['legacy_dimensions'].items() if key not in TRACE_KEYS}
         forms.setdefault(item['legacy_slot_id'],{})[definition_hash(form)]=form
     return corpus,forms
 
 
-def recognition_expressions(standard):
+def recognition_expressions(standard, corpus_path=None):
     """编译已审定的新旧表达关系，不检索、不裁剪当前指标，也不生成当前表格事实。"""
     approved=[row for row in standard['legacy_conversion'].values() if row['status']=='approved'
               and row['target']['record_type']=='metric_fact']
-    if not approved:
-        return {'expressions':[], 'rules':{}}
-    path=Path(__file__).resolve().parents[1]/'金标准/五种样式人工映射/语义示例索引.json'
+    path=Path(corpus_path) if corpus_path else Path(__file__).resolve().parents[1]/'金标准/五种样式人工映射/语义示例索引.json'
     info=path.stat();corpus,forms=_manual_corpus(str(path),info.st_mtime_ns,info.st_size)
-    expressions=[];rules={};rule_ids={}
+    expressions=[];rules={};rule_ids={};templates=[]
+    if any(e.get('metric_id') for e in corpus['examples']):
+        from .人工映射复用 import load_corpus, _standard_snapshot
+        checked,_,_ = load_corpus(path)
+        snapshot_path=path.parent/'语义金标准/当前指标标准.jsonl'
+        info=snapshot_path.stat()
+        _,snapshot = _standard_snapshot(str(snapshot_path),info.st_mtime_ns,info.st_size)
+        for e in checked['examples']:
+            identifier=e.get('metric_id')
+            if not identifier: continue
+            metric=standard['metric'].get(identifier)
+            if metric is None or metric['status']!='active': continue
+            original=snapshot['metric'][identifier]
+            keys=('definition','dimension_refs')
+            if any(metric[k]!=original[k] for k in keys) or any(
+                standard['dimension'].get(d['id']) != snapshot['dimension'][d['id']]
+                for d in original['dimension_refs']):
+                raise ValueError('直接指标参照与当前完整定义不一致：'+identifier)
+            templates.append(copy.deepcopy(e))
     for conversion in approved:
         if conversion['source_gold_hash']!=corpus['source_gold_sha256']:
             continue
@@ -57,11 +75,14 @@ def recognition_expressions(standard):
                 rule['shared_bindings']=metric_id
                 rule['dimension_bindings']={key:value for key,value in rule['dimension_bindings'].items() if key not in common}
     return {'source_gold_sha256':corpus['source_gold_sha256'],'expressions':expressions,'rules':rules,'shared_bindings':shared,
+        'metric_templates':templates,
         'instructions':'这是已审核的旧金标准表达及其到当前指标、维度的转换关系，manual_forms保留人工确认过的不同表式表达。'
         '依据完整上下文理解，不能只见同名词就套用。rule引用rules中的指标和维度取值规则；规则中的shared_bindings引用顶层同名目录，'
         '与该规则dimension_bindings合并才是完整维度规则，不能忽略共用部分。constant是旧定义明确的语义限定，'
         '仅当当前原文表达同一完整含义时适用；context和dimension必须从当前原文及其适用说明重新取证。'
         'manual_forms中的旧维度字段是历史表达，不是当前维度协议，不能照搬成新的槽位或维度。'
+        'metric_templates是直接引用当前已有指标的已确认模板；保留完整类别、期间角色和缺失维度。'
+        '模板期间角色不是实际日期，缺失维度须从当前原文取证。'
         '历史表式不提供本次财务值、主体或日期；不能用转换编号、历史实例作为当前格的原文证据。'
         '输出仍使用当前指标和实际维度，并引用当前标题、表头、项目及适用说明。'
         '未出现在本清单不表示不在金标准范围内，仍须核对全部当前指标和维度。'}

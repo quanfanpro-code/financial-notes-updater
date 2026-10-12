@@ -100,8 +100,12 @@ class 收尾回归(unittest.TestCase):
                     '分段': [{'范围': 'A1:C5', '坐标数': len(cells), '坐标清单': cells, '原文摘录': []}]})
             return r
         输出 = self.目录 / '交接材料'
+        索引目录 = self.目录 / '固定索引版本'
+        索引目录.mkdir()
+        for name in ('索引清单.json','小表记录.jsonl','去向明细.jsonl','文字查找.json'):
+            (索引目录/name).write_text('{}',encoding='utf-8-sig')
         with patch('比较新表.载入索引', return_value=self.索引), patch('比较新表.比较工作簿', side_effect=故障注入):
-            码 = 运行初筛.执行比较(p, '虚构', 输出, True)
+            码 = 运行初筛.执行比较(p, 索引目录, 输出, True)
         r = json.loads((输出 / '初筛结果.json').read_text(encoding='utf-8-sig'))
         self.assertNotEqual(码, 0)
         self.assertEqual(r['基准对照']['基准候选数'], 2)

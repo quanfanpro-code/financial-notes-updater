@@ -172,14 +172,15 @@ public static class TableSynchronizer
         XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         if (cell.Descendants(w + "txbxContent").Any())
             throw new InvalidDataException("取数目标格包含文本框，不能把正文金额写入框内文字。");
-        if (cell.Descendants().Any(e => e.Name == w + "fldChar" || e.Name == w + "fldSimple" || e.Name == w + "instrText"))
-            throw new InvalidDataException("取数目标格含Word域，不能把域结果当作普通文字覆盖。");
         value = value.Replace("\r\n", "\n").Replace('\r', '\n');
         var paragraphs = cell.Elements(w + "p").ToArray();
         var original = string.Join("\n", paragraphs.Select(p => string.Concat(p.Descendants().Select(e =>
             e.Name == w + "t" ? e.Value : e.Name == w + "br" || e.Name == w + "cr" ? "\n" : e.Name == w + "tab" ? "\t" : ""))));
-        // 没有数值变化时保留整个原单元格，尤其不能给原空段落补造文字节点。
+        // 原样提取或回写不改域及其显示结果；空段落也不补造文字节点。
         if (original == value) return;
+        if (cell.Descendants().Any(e => e.Name == w + "fldChar" || e.Name == w + "fldSimple" || e.Name == w + "instrText")
+            && !CanUpdateSumField(cell, original, value))
+            throw new InvalidDataException("取数目标格含Word域，不能把域结果当作普通文字覆盖。");
         var texts = cell.Descendants(w + "t").ToArray();
         if (texts.Length == 0)
         {
@@ -248,6 +249,37 @@ public static class TableSynchronizer
         }
         paragraphs[0].AddBeforeSelf(newParagraphs);
         foreach (var paragraph in paragraphs) paragraph.Remove();
+    }
+
+    private static bool CanUpdateSumField(XElement cell, string original, string value)
+    {
+        XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        bool Numeric(string text) => decimal.TryParse(text, System.Globalization.NumberStyles.Number,
+            System.Globalization.CultureInfo.InvariantCulture, out _);
+        if (cell.Descendants(w + "p").Count() != 1 || !Numeric(original) || !Numeric(value)
+            || cell.Descendants().Any(e => e.Name == w + "br" || e.Name == w + "cr" || e.Name == w + "tab")) return false;
+        var simple = cell.Descendants(w + "fldSimple").ToArray();
+        var tokens = cell.Descendants().Where(e => e.Name == w + "fldChar" || e.Name == w + "instrText" || e.Name == w + "t").ToArray();
+        string instruction;
+        if (simple.Length == 1)
+        {
+            if (tokens.Any(e => e.Name != w + "t" || !e.Ancestors().Contains(simple[0]))) return false;
+            instruction = (string?)simple[0].Attribute(w + "instr") ?? "";
+        }
+        else
+        {
+            var boundaries = tokens.Where(e => e.Name == w + "fldChar").ToArray();
+            if (simple.Length != 0 || boundaries.Length != 3
+                || !boundaries.Select(e => (string?)e.Attribute(w + "fldCharType")).SequenceEqual(new[] { "begin", "separate", "end" })
+                || tokens.FirstOrDefault() != boundaries[0] || tokens.LastOrDefault() != boundaries[2]) return false;
+            var separator = Array.IndexOf(tokens, boundaries[1]);
+            if (separator < 2 || tokens.Skip(1).Take(separator - 1).Any(e => e.Name != w + "instrText")
+                || tokens.Skip(separator + 1).Take(tokens.Length - separator - 2).Any(e => e.Name != w + "t")) return false;
+            instruction = string.Concat(tokens.Where(e => e.Name == w + "instrText").Select(e => e.Value));
+        }
+        // 保留求和指令及边界，仅替换已存在的数字显示结果；其他域不能按金额处理。
+        return System.Text.RegularExpressions.Regex.IsMatch(instruction,
+            @"^\s*=\s*SUM\s*\(\s*(ABOVE|BELOW|LEFT|RIGHT)\s*\)\s*$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
     }
 
     private static IEnumerable<XElement> TextNodes(string value, XNamespace w, XElement source)

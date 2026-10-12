@@ -20,11 +20,84 @@ sys.path.insert(0, str(本批目录))
 from openpyxl.utils import range_boundaries
 
 from 建立结构索引 import 文件指纹, 读取工作簿, 建立索引, 核对输入清单
-from 比较新表 import 载入索引, 比较工作簿, 写出交接材料
+from 比较新表 import 载入索引, 比较工作簿, 写出交接材料, 比较完整事实, 核对生成版本, 完整性检查
+
+
+def 核验逐格(结果, 预期):
+    """检查事先固定的关系和完整引用；正确候选不能掩盖其他错误落点。"""
+    if not 预期:
+        raise ValueError('逐格业务预期为空，不能据此验收')
+    明细 = []
+    for e in 预期:
+        required = {'mapping_id', 'representation_id', 'semantic_id', '维度', '确认依据'}
+        ref = e.get('语义引用', {})
+        if not required <= ref.keys() or not ref['确认依据']:
+            raise ValueError('固定业务预期缺少完整语义引用或确认依据')
+        目标 = (e['新工作表'], e['新坐标'])
+        允许 = {tuple(p) for p in e.get('允许其他落点', [])} | {目标}
+        找到, 问题, 落点 = False, [], set()
+        for c in 结果.get('候选', []):
+            if c.get('旧表编号') != e['旧表编号'] or c.get('样式来源') != e['样式']:
+                continue
+            items = [d for d in c.get('结构对应', []) if (d.get('旧工作表'), d.get('旧坐标')) ==
+                     (e['旧工作表'], e['旧坐标'])]
+            if len(items) > 1:
+                问题.append('同一候选中旧格重复或冲突')
+            for d in items:
+                pos = (d.get('新工作表'), d.get('新坐标'))
+                落点.add(pos)
+                if c.get('新工作表') != pos[0] or pos not in 允许:
+                    问题.append('错误工作表或预期外落点：' + str(pos))
+                if d.get('角色') != '业务数值' or d.get('待通读确认') is not True:
+                    问题.append('业务角色或待通读确认标记缺失')
+                if d.get('语义引用') != ref:
+                    问题.append('目标、完整维度、表现版本或确认依据不符')
+                if pos != 目标 and not any(any(x.get('旧坐标') == e['旧坐标']
+                        for x in a.get('不同对应', [])) for a in c.get('歧义', [])):
+                    问题.append('其他落点没有登记本格歧义')
+                找到 |= pos == 目标
+        if not 找到:
+            问题.append('遗漏必需业务对应')
+        明细.append({'旧表编号': e['旧表编号'], '旧坐标': e['旧坐标'], '预期新位置': 目标,
+                     '实际落点': sorted(落点), '唯一落点': 落点 == {目标},
+                     '结论': '失败' if 问题 else '通过', '原因': 问题,
+                     '说明': '仅核验结构候选和已确认来源传递，仍待通读确认'})
+    return 明细
 
 
 def 指纹表(路径们):
     return {str(p): 文件指纹(p) for p in 路径们}
+
+
+def 核验已有运行(清单, 运行清单, 索引目录, 输出):
+    """只读实际入口产物；缺少任一样式、固定预期或生成版本均拒绝。"""
+    样本们 = 清单['五样式原样查回'] + [{**清单['真实A端'], '样本名': '真实A端'}]
+    runs = 运行清单['五样式原样查回'] + [{**运行清单['真实A端'], '样本名': '真实A端'}]
+    按名 = {r['样本名']: r for r in runs}
+    if len(按名) != len(runs) or set(按名) != {s['样本名'] for s in 样本们}:
+        raise ValueError('已有运行清单缺少样式、名称冲突或存在未知样本')
+    结论 = []
+    for s in 样本们:
+        目录 = Path(按名[s['样本名']]['结果目录'])
+        result = json.loads((目录/'初筛结果.json').read_text(encoding='utf-8-sig'))
+        核对生成版本(result, s['文件'], 索引目录)
+        if result['输入版本']['sha256'] != s['sha256']:
+            raise ValueError('运行结果输入版本不是预先固定样本')
+        points = s.get('逐格预期')
+        if not points:
+            raise ValueError('样本缺少事先固定的逐格预期：' + s['样本名'])
+        try:
+            完整性检查(读取工作簿(s['文件']), result,
+                     必需业务位置={(e['新工作表'],e['新坐标']) for e in points})
+        except AssertionError as error:
+            结论.append({'样本':s['样本名'],'核对项':'内容去向完整性','结论':'失败','原因':[str(error)]})
+        结论.extend({'样本':s['样本名'], **r} for r in 核验逐格(result, points))
+    汇总 = {'模式':'核验实际入口已有产物，未重新比较', '核对项数':len(结论),
+            '失败':sum(r['结论']=='失败' for r in 结论), '明细':结论}
+    with (输出/'核验结论.json').open('x',encoding='utf-8-sig') as f:
+        json.dump(汇总,f,ensure_ascii=False,indent=2)
+    print(f"逐格核验：{len(结论)}项，失败{汇总['失败']}")
+    return int(bool(汇总['失败']))
 
 
 def 范围相交(范围a, 范围b):
@@ -37,6 +110,9 @@ def 核验原样查回(样本, 索引, 输出根, 结论):
     """完整文件入口：原样文件应把逐项核对小表恒等查回自身。"""
     记录 = 读取工作簿(样本["文件"])
     结果 = 比较工作簿(记录, 索引)
+    逐格 = 核验逐格(结果, 样本.get('逐格预期'))
+    完整性检查(记录, 结果, {(e['新工作表'],e['新坐标']) for e in 样本['逐格预期']})
+    结论.extend({'样本':样本['样本名'], **e} for e in 逐格)
     目录 = 输出根 / 样本["样本名"]
     写出交接材料(记录, 结果, str(目录))
     for 核对 in 样本["逐项核对小表"]:
@@ -50,7 +126,7 @@ def 核验原样查回(样本, 索引, 输出根, 结论):
             非恒等 = [d for d in c["结构对应"]
                    if d["旧工作表"] != d["新工作表"] or d["旧坐标"] != d["新坐标"]]
             覆盖 = c["覆盖计算"]["旧表文字覆盖"]
-            if not 非恒等 and 覆盖["分子"] == 覆盖["分母"]:
+            if c['结构对应'] and not 非恒等 and 覆盖["分母"] > 0 and 覆盖["分子"] == 覆盖["分母"]:
                 恒等.append(c)
         条目["候选数"] = len(候选)
         条目["并存候选"] = [f"{c['新工作表']}!{c['新表范围']} 覆盖{c['覆盖计算']['旧表文字覆盖']['分子']}/{c['覆盖计算']['旧表文字覆盖']['分母']}"
@@ -71,13 +147,16 @@ def 核验原样查回(样本, 索引, 输出根, 结论):
 def 核验真实A端(a端, 索引, 输出根, 结论):
     记录 = 读取工作簿(a端["文件"])
     结果 = 比较工作簿(记录, 索引)
+    逐格 = 核验逐格(结果, a端.get('逐格预期'))
+    完整性检查(记录, 结果, {(e['新工作表'],e['新坐标']) for e in a端['逐格预期']})
+    结论.extend({'样本':'真实A端', **e} for e in 逐格)
     目录 = 输出根 / "真实A端"
     写出交接材料(记录, 结果, str(目录))
     for 区域 in a端["共同表达代表区域"]:
-        范围 = 区域["范围"].split("!")[-1]
+        工作表, 范围 = 区域["范围"].rsplit("!", 1)
         命中 = [c for c in 结果["候选"]
               if any(c["样式来源"] == r["样式"] and c["小表名称"] == r["小表名称"] for r in 区域["应找到参照"])
-              and 范围相交(c["新表范围"], 范围)]
+              and c['新工作表'] == 工作表 and c['结构对应'] and 范围相交(c["新表范围"], 范围)]
         结论.append({"样本": "真实A端", "区域": 区域["区域名"], "范围": 区域["范围"],
                    "依据": 区域["共有文字依据"],
                    "结论": "通过" if 命中 else "失败",
@@ -96,6 +175,7 @@ def main(argv=None):
     解析.add_argument("--样本清单", required=True)
     解析.add_argument("--输出", required=True)
     解析.add_argument("--输入清单", default=str(本批目录 / "输入清单.json"))
+    解析.add_argument('--已有运行清单', help='核验实际默认入口产物，不重新执行比较')
     参数 = 解析.parse_args(argv)
 
     输出 = Path(参数.输出)
@@ -114,6 +194,10 @@ def main(argv=None):
     if 文件指纹(清单["真实A端"]["文件"]) != 清单["真实A端"]["sha256"]:
         print("真实A端文件指纹不符", file=sys.stderr)
         return 2
+
+    if 参数.已有运行清单:
+        return 核验已有运行(清单, json.loads(Path(参数.已有运行清单).read_text(encoding='utf-8-sig')),
+                          参数.索引目录, 输出)
 
     输入清单 = json.loads(Path(参数.输入清单).read_text(encoding="utf-8-sig"))
     # 先核对包含复用代码在内的全部输入，避免长时间比较后才在冷建库时发现旧指纹。
@@ -162,6 +246,7 @@ def main(argv=None):
     快速集合 = {(c["旧表编号"], c["新工作表"], c["新表范围"]) for c in a端结果["候选"]}
     基准集合 = {(c["旧表编号"], c["新工作表"], c["新表范围"]) for c in 基准["候选"]}
     遗漏 = 基准集合 - 快速集合
+    事实一致 = 比较完整事实(a端结果) == 比较完整事实(基准)
 
     中位 = sorted(r["比较秒"] for r in 重复)[1]
     性能 = {
@@ -170,7 +255,7 @@ def main(argv=None):
         "比较秒中位": 中位,
         "基准对照": {"基准耗时秒": 基准秒, "基准比较小表数": 基准["运行统计"]["比较的小表数"],
                   "基准候选数": len(基准集合), "快速候选数": len(快速集合),
-                  "候选遗漏": sorted(遗漏), "结论": "一致" if not 遗漏 else "快速筛选漏候选"},
+                  "候选遗漏": sorted(遗漏), "结论": "一致" if 事实一致 else "完整事实不一致"},
         "数据规模": {"索引小表数": len(索引["记录"]),
                   "新表工作表数": len(a端记录["sheets"]),
                   "新表内容格数": sum(len(s["cells"]) for s in a端记录["sheets"])},
@@ -197,7 +282,7 @@ def main(argv=None):
     print(f"冷建库{冷建秒}秒；重复比较中位{中位}秒；基准对照：{性能['基准对照']['结论']}")
     print(f"原件不一致：{len(改动)}个")
     print(f"结果目录：{输出}")
-    return 1 if 失败 or 改动 or 遗漏 else 0
+    return 1 if 失败 or 改动 or not 事实一致 else 0
 
 
 if __name__ == "__main__":

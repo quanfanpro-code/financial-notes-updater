@@ -83,6 +83,108 @@ class WordBridgeTests(unittest.TestCase):
         book.save(changed)
         return changed
 
+    def test_integer_template_keeps_incoming_fraction_in_excel_and_word(self):
+        from 附注更新.表格 import write_updated_workbook,complete_numeric_formats,file_hash
+        doc=Document(self.word);doc.tables[0].cell(1,1).text='100';doc.save(self.word)
+        excel,linked,_=self.extract()
+        plan={'source_a_hash':file_hash(excel),'updates':[{'sheet':'sheet1','cell':'C3','value':100.5}],'operations':[]}
+        complete_numeric_formats({'source_path':str(excel),'source_hash':file_hash(excel)},plan)
+        prime=self.folder/'精度更新.xlsx';write_updated_workbook(excel,prime,plan)
+        book=load_workbook(prime);self.assertEqual(book['sheet1']['C3'].value,100.5)
+        self.assertEqual(book['sheet1']['C3'].number_format,'0.0');book.close()
+        output=self.folder/'精度更新.docx';result=self.call('update',word=linked,excel=prime,output=output)
+        self.assertTrue(result['output_verified'])
+        self.assertEqual(Document(output).tables[0].cell(1,1).text,'100.5')
+
+    def test_sum_field_updates_preserve_instructions_and_format(self):
+        """求和域仅更新显示值；未知域及混合正文仍拒绝覆盖。"""
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        doc = Document(self.word)
+        for column, simple, value in [(1, False, "300.00"), (2, True, "270.00")]:
+            cell = doc.tables[0].cell(3, column)
+            cell.text = ""
+            paragraph = cell.paragraphs[0]
+            if simple:
+                field = OxmlElement("w:fldSimple")
+                field.set(qn("w:instr"), " =SUM(ABOVE) ")
+                run = OxmlElement("w:r")
+                text = OxmlElement("w:t")
+                text.text = value
+                run.append(text)
+                field.append(run)
+                paragraph._p.append(field)
+            else:
+                for kind, content in [("fldChar", "begin"), ("instrText", " =SUM(ABOVE) "),
+                                      ("fldChar", "separate"), ("t", value), ("fldChar", "end")]:
+                    node = OxmlElement("w:" + kind)
+                    if kind == "fldChar":
+                        node.set(qn("w:fldCharType"), content)
+                    else:
+                        node.text = content
+                    paragraph.add_run()._r.append(node)
+        # 新文件保留setUp产生的原始小表，不覆盖既有测试输入。
+        self.word = self.folder / "含自动求和域.docx"
+        doc.save(self.word)
+        before = self.word.read_bytes()
+        def field_cells(path, hide_result=False):
+            with zipfile.ZipFile(path) as package:
+                root = ET.fromstring(package.read("word/document.xml"))
+            if hide_result:
+                for text in root.iter(W + "t"):
+                    text.text = "数值"
+            return [self.xml_signature(cell) for cell in root.iter(W + "tc")
+                    if any(n.tag in {W + "fldSimple", W + "fldChar"} for n in cell.iter())]
+        expected = field_cells(self.word)
+        self.assertEqual(len(expected), 2)
+        excel, linked, _ = self.extract()
+        book = load_workbook(excel)
+        self.assertEqual([book["sheet1"][a].value for a in ("C5", "D5")], [300, 270])
+        book.close()
+        self.assertEqual(field_cells(linked), expected)
+        unchanged = self.folder / "原样回写.docx"
+        result = self.call("update", word=linked, excel=excel, output=unchanged)
+        self.assertTrue(result["output_verified"])
+        self.assertEqual(field_cells(unchanged), expected)
+        for address in ("C5", "D5"):
+            with self.subTest(address=address):
+                changed = self.folder / ("改变域结果_" + address + ".xlsx")
+                book = load_workbook(excel)
+                book["sheet1"][address] = 999
+                book.save(changed)
+                book.close()
+                updated = self.folder / ("更新域结果_" + address + ".docx")
+                result = self.call("update", word=linked, excel=changed, output=updated)
+                self.assertTrue(result["output_verified"])
+                self.assertEqual(field_cells(updated, True), field_cells(linked, True))
+                with zipfile.ZipFile(updated) as package:
+                    root = ET.fromstring(package.read("word/document.xml"))
+                results = [''.join(t.text or '' for t in cell.iter(W + "t")) for cell in root.iter(W + "tc")
+                           if any(n.tag in {W + "fldSimple", W + "fldChar"} for n in cell.iter())]
+                self.assertEqual(results, ["999.00", "270.00"] if address == "C5" else ["300.00", "999.00"])
+        for case in ("未知域", "域外正文"):
+            source = self.folder / (case + ".docx")
+            doc = Document(self.word)
+            paragraph = doc.tables[0].cell(3, 1).paragraphs[0]
+            if case == "未知域":
+                next(paragraph._p.iter(qn("w:instrText"))).text = " REF 金额书签 "
+            else:
+                paragraph.add_run(" 附加说明")
+            doc.save(source)
+            incoming, connected = self.folder / (case + ".xlsx"), self.folder / (case + "连接.docx")
+            self.call("extract", word=source, excel=incoming, linked_word=connected,
+                      context=self.folder / (case + "上下文.json"))
+            book = load_workbook(incoming)
+            book["sheet1"]["C5"] = 999
+            changed = self.folder / (case + "新值.xlsx")
+            book.save(changed); book.close()
+            rejected = self.folder / (case + "不得覆盖.docx")
+            failure = self.call("update", success=False, word=connected, excel=changed, output=rejected)
+            self.assertIn("含Word域", failure["error"])
+            self.assertFalse(rejected.exists())
+        self.assertEqual(self.word.read_bytes(), before)
+        self.assertEqual(field_cells(linked), expected)
+
     def test_chapter_scope_limits_read_extract_update_and_preserves_other_parts(self):
         from docx.oxml import OxmlElement
         from docx.oxml.ns import qn
@@ -417,6 +519,22 @@ class WordBridgeTests(unittest.TestCase):
         result = Document(output)
         self.assertEqual(result.tables[0].cell(1,1).text, '888.50')
         self.assertEqual(result.tables[0].cell(0,1)._tc, result.tables[0].cell(0,2)._tc)
+
+    def test_delete_vertical_merge_tail_preserves_anchor(self):
+        from 附注更新.表格 import write_updated_workbook
+        doc=Document(self.word);table=doc.tables[0]
+        table.cell(1,0).merge(table.cell(2,0));table.cell(1,0).text='共同理由'
+        table.cell(1,0).paragraphs[0].runs[0].bold=True
+        merged=self.folder/'共同理由合并.docx';doc.save(merged);before=merged.read_bytes()
+        excel,linked,context=(self.folder/n for n in ['合并A.xlsx','合并连接.docx','合并上下文.json'])
+        self.call('extract',word=merged,excel=excel,linked_word=linked,context=context)
+        operations=[dict(range_name='TA_001',axis='row',action='delete',index=2,count=1,template_index=0)]
+        changed=self.folder/'缩减A.xlsx';write_updated_workbook(excel,changed,{'operations':operations})
+        output=self.folder/'缩减Word.docx';self.call('update',word=linked,excel=changed,output=output,operations=operations)
+        result=Document(output);self.assertEqual(len(result.tables[0].rows),3)
+        anchor=result.tables[0].cell(1,0);self.assertEqual(anchor.text,'共同理由');self.assertTrue(anchor.paragraphs[0].runs[0].bold)
+        self.assertEqual(len(anchor._tc.xpath('./w:tcPr/w:vMerge')),0)
+        self.assertEqual(result.paragraphs[-1].text,'表后说明必须保留。');self.assertEqual(merged.read_bytes(),before)
 
     def test_rejects_vertical_merge_cut_and_dimension_mismatch(self):
         doc = Document(self.word)

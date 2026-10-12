@@ -172,7 +172,7 @@ def main():
     表现按pid = {p["representation_id"]: p for p in 表现}
     mf来源 = Counter(表现按pid[i]["source_kind"] for i in mf if i in 表现按pid)
     S001来源数 = len(v1["C-N087-T001-S001"].get("sources", []))
-    S001五样式数 = sum(1 for e in 五样式索引["examples"] if e["legacy_slot_id"] == "C-N087-T001-S001")
+    S001五样式数 = sum(1 for e in 五样式索引["examples"] if e.get("legacy_slot_id") == "C-N087-T001-S001")
     检查("查询货币资金余额指标汇集v1来源、五样式与A端三来源",
          mf来源.get("v1_source", 0) >= S001来源数
          and mf来源.get("five_style", 0) >= S001五样式数

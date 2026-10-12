@@ -247,7 +247,7 @@ def _unified_classify(payload):
     branches=[]
     for metric in payload['metrics']:
         fields={ref['id']:dimension_refs[ref['id']] for ref in metric['dimension_refs']}
-        required=[ref['id'] for ref in metric['dimension_refs'] if ref['required']]
+        required=[ref['id'] for ref in metric['dimension_refs'] if ref['required'] and ref['id']!='report_scope']
         if compact:
             refs={'type':'array','items':{'type':'integer','minimum':0},'uniqueItems':True}
             branches.append(_object({'kind':_enum(['metric_fact']),'metric_id':_enum([metric['id']]),
@@ -457,7 +457,25 @@ def normalize_response(payload,result):
 def response_format(payload):
     """只返回HTTP格式参数；输入对象和现有成功任务的身份保持不变。"""
     task=payload.get("task") if isinstance(payload,dict) else None
-    if task in {"source_scope","source_scope_batch"} and _fixed_scope_mode(payload):
+    if task=="workbook_outline":
+        ranges=_array(_object({"sheet":_enum(s["sheet"] for s in payload["sheets"]),"range":_text()}))
+        evidence=_ids(s['sheet']+'!'+cell[0] for s in payload['sheets'] for row in s.get('title_clues',[]) for cell in row['cells'])
+        schema=_object({"subjects":_array(_text()),"subtables":_array(_object({
+            "id":_text(),"subject":_text(),"purpose":_text(),"ranges":ranges,"evidence":evidence})),
+            "unlocated_ranges":ranges,"context_ranges":ranges})
+    elif task=="select_subtables":
+        targets=[t["id"] for t in payload["targets"]]
+        evidence=_ids(e for t in payload['outline']['subtables'] for e in t['evidence'])
+        schema=_object({"subtables":_array(_object({"id":_enum(t["id"] for t in payload["outline"]["subtables"]),
+            "decision":_enum(["needed","unneeded","uncertain"]),"target_ids":_ids(targets),"reason":_text(),"evidence":evidence})),
+            "unresolved_targets":_array(_object({"id":_enum(targets),"reason":_text()}))})
+    elif task=="subtable_detail":
+        evidence=_ids(name+'!'+cell[0] for name,rows in payload['source_text'].items() for row in rows for cell in row['cells'])
+        candidates=_ids(name+'!'+address for name,addresses in payload['positions'].items() for address in addresses)
+        schema=_object({"allowed_metrics":_ids(m["id"] for m in payload["metrics"]),"structure":_text(),
+            "evidence":evidence,"targets":_array(_object({"id":_enum(t["id"] for t in payload["targets"]),
+            "candidates":candidates,"reason":_text()}),count=len(payload["targets"]))})
+    elif task in {"source_scope","source_scope_batch"} and _fixed_scope_mode(payload):
         schema=_fixed_scope_schema(payload)
     elif task=="source_scope":
         schema=_object({"areas":_areas(_evidence(payload),refinement="refinement" in payload)})
@@ -487,6 +505,12 @@ def response_format(payload):
         schema=_layout(payload)
     elif task=="classify":
         schema=_classify(payload)
+    elif task=="unified_identity_review":
+        candidates=_ids(payload['candidate_cells'])
+        evidence=[a for a,c in payload['cells'].items() if isinstance(c.get('value'),str) and c['value'].strip() and not c.get('formula')]
+        evidence.extend(payload.get('context_evidence',{}))
+        schema=_object({'checked_cells':candidates,'issues':_array(_object({
+            'cells':candidates,'reason':_text(),'evidence_cells':_ids(evidence)}))})
     elif task=="unified_classify":
         schema=_unified_classify(payload)
     else:

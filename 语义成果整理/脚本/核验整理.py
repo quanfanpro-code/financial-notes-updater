@@ -62,8 +62,10 @@ def 定义哈希(r):
 
 class 输入:
     def __init__(self, 清单路径):
+        self.固定输入 = {}
         if 清单路径:
             固 = json.load(open(清单路径, encoding="utf-8-sig"))["固定输入"]
+            self.固定输入 = 固
             self.V1 = 固["v1"]["路径"]; self.V2 = 固["v2当前版本"]["路径"]
             self.索引 = 固["五样式索引"]["路径"]; self.A = 固["A端映射"]["路径"]
         else:
@@ -113,6 +115,37 @@ class 输出:
         return self._缓存[名]
 
 
+def 核验纠错结果(凭证, 表现, 沿革, 排除证据=()):
+    按位置 = {(p['source_locator'].get('mapping_file'),p['source_locator'].get('mapping_id')):p
+             for p in 表现 if p.get('source_locator',{}).get('mapping_id')}
+    去向 = {r['旧表现ID']:r for r in 沿革}
+    错误 = []
+    for e in 凭证:
+        loc=e['来源位置'];p=按位置.get((loc['来源'],loc['mapping_id']))
+        chain=去向.get(e['旧表现']['representation_id'],{})
+        if e.get('纠错类型') == '业务格改为结构格排除':
+            contexts=[c for c in 排除证据 if c.get('来源位置')==loc]
+            if len(contexts)!=1:
+                错误.append(e['纠错ID']);continue
+            c=contexts[0]
+            digest=hashlib.sha256(json.dumps(c,ensure_ascii=False,sort_keys=True,
+                                 separators=(',',':')).encode('utf-8')).hexdigest()
+            if (p is not None or c.get('status')!='结构格排除'
+                or c.get('target_slot_id') or c.get('target_metric_id')
+                or digest!=e['新排除证据摘要'] or c.get('confirmation')!=e['新映射']['confirmation']
+                or chain.get('新表现ID') is not None or chain.get('新排除证据ID')!=c['排除证据ID']
+                or chain.get('纠错引用')!=e['纠错ID']):
+                错误.append(e['纠错ID'])
+            continue
+        if p is None or any((p.get('semantic_id')!=e['新semantic_id'],
+                p.get('dimension_values')!=e['新业务维度'],p.get('规范维度值')!=e['新规范维度'],
+                p.get('确认依据')!=e['新映射']['confirmation'],
+                p['source_locator'].get('sheet')!=loc['sheet'],p['source_locator'].get('cell')!=loc['cell'],
+                chain.get('新表现ID')!=p['representation_id'],chain.get('纠错引用')!=e['纠错ID'])):
+            错误.append(e['纠错ID'])
+    return 错误
+
+
 def 静态检查(原, 出, 只要=None):
     """返回 {检查名: (通过, 详情)}。只要=检查名集合时只跑这些。"""
     结果 = {}
@@ -141,6 +174,29 @@ def 静态检查(原, 出, 只要=None):
 
     fs = [p for p in 表现 if p["source_kind"] == "five_style"]
     检查("五样式表现全数整理", len(fs) == len(原.五样式["examples"]), f"{len(fs)}")
+    按来源 = {(p['source_locator']['mapping_file'],p['source_locator']['mapping_id']):p for p in fs}
+    错示例 = []
+    for e in 原.五样式['examples']:
+        loc=e['origin'];p=按来源.get((loc['mapping_file'],loc['mapping_id']))
+        if p is None or p['semantic_id'] != (e.get('metric_id') or e.get('legacy_slot_id')):
+            错示例.append(loc['mapping_id']);continue
+        if e.get('metric_id') and (p['dimension_values']!=e['dimensions'] or
+                p['规范维度值']!={**e['dimensions'],'period_role':e['template_period_role']} or
+                p.get('dimension_evidence')!=e['dimension_evidence'] or p.get('确认依据')!=e['confirmation']):
+            错示例.append(loc['mapping_id'])
+    检查('五样式逐条目标及直接指标完整维度保留',not 错示例,str(错示例[:10]))
+    if 原.固定输入.get('纠错记录'):
+        凭证=读jsonl(原.固定输入['纠错记录']['路径'])
+        沿革=读jsonl(os.path.join(出.根,'对应','表现身份迁移.jsonl'))
+        排除=出.取('上下文').get('五样式结构格排除记录',[])
+        错=核验纠错结果(凭证,fs,沿革,排除)
+        检查('固定纠错逐条目标维度确认及沿革一致',not 错,str(错[:10]))
+        旧链=读jsonl(原.固定输入['已有沿革']['路径'])
+        检查('全部早期表现编号保留且去向有效',
+            {r['旧表现ID'] for r in 旧链}<={r['旧表现ID'] for r in 沿革}
+            and all(bool(r.get('新表现ID')) != bool(r.get('新排除证据ID')) for r in 沿革)
+            and {r['新表现ID'] for r in 沿革 if r.get('新表现ID')}<={p['representation_id'] for p in 表现}
+            and {r['新排除证据ID'] for r in 沿革 if r.get('新排除证据ID')}<={e['排除证据ID'] for e in 排除})
     A表 = [p for p in 表现 if p["source_kind"] == "a_fact"]
     检查("A端全数收录且方法分布519/282/23",
          len(A表) == len(原.A映射["facts"])
@@ -260,7 +316,7 @@ def 静态检查(原, 出, 只要=None):
     mf = 索引.get("by_semantic", {}).get("metric.monetary_funds.balance", {}).get("表现", [])
     mf来源 = Counter(表现按pid[i]["source_kind"] for i in mf if i in 表现按pid)
     S001n = len(原.v1["C-N087-T001-S001"].get("sources", []))
-    S001五 = sum(1 for e in 原.五样式["examples"] if e["legacy_slot_id"] == "C-N087-T001-S001")
+    S001五 = sum(1 for e in 原.五样式["examples"] if e.get("legacy_slot_id") == "C-N087-T001-S001")
     S001表现 = {p["representation_id"] for p in 表现
               if p.get("定义旧ID") == "C-N087-T001-S001" and p.get("source_kind") == "v1_source"}
     检查("货币资金指标汇集三来源",
@@ -309,6 +365,12 @@ def 静态检查(原, 出, 只要=None):
 
 
 def 跑脚本(名, *参数):
+    if 名=='统一整理.py' and '--输入清单' in 参数 and '--已有成果' not in 参数:
+        fixed=json.load(open(参数[参数.index('--输入清单')+1],encoding='utf-8-sig'))['固定输入']
+        if fixed.get('已有表现'):
+            参数=(*参数,'--已有成果',os.path.dirname(os.path.dirname(fixed['已有表现']['路径'])))
+        if fixed.get('纠错记录'):
+            参数=(*参数,'--纠错记录',fixed['纠错记录']['路径'])
     r = subprocess.run([运行器, "-B", "-X", "utf8", os.path.join(脚本目录, 名), *参数],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     return r.returncode, (r.stdout or "") + (r.stderr or "")
@@ -345,7 +407,7 @@ def main():
         记("二次复核:" + r["名称"], r["通过"], "原始输入逐条对照", "无遗漏、无错误关联", r["详情"])
 
     输出文件们 = ["数据/统一语义记录.jsonl", "数据/表现记录.jsonl", "数据/维度字典.jsonl",
-               "对应/旧新对应.jsonl", "对应/来源示例.jsonl", "问题/问题清单.json", "数据/上下文证据.json", "对应/维度规范对应.json", "索引/查找索引.json"]
+               "对应/旧新对应.jsonl", "对应/来源示例.jsonl", "对应/表现身份迁移.jsonl", "问题/问题清单.json", "数据/上下文证据.json", "对应/维度规范对应.json", "索引/查找索引.json"]
 
     临时 = tempfile.mkdtemp(prefix="核验留存_", dir=输出根)
     报告["验证留存目录"] = 临时
@@ -368,6 +430,16 @@ def main():
         print("== 增量稳定性 ==")
         原表现IDs = {p["representation_id"] for p in 出.取("表现")}
         固 = json.load(open(输入清单路径, encoding="utf-8-sig"))
+        if 固['固定输入'].get('纠错记录'):
+            from 清点资产 import 清点候选
+            新清单=os.path.join(临时,'以本次成果为旧成果的清单.json')
+            清点候选(固['来源根'],固['固定输入']['五样式索引']['路径'],新清单,
+                固['固定输入']['纠错记录']['路径'],输出根,固['固定输入']['v2当前版本']['路径'])
+            再跑=os.path.join(临时,'承接本次成果')
+            code,log=跑脚本('统一整理.py',再跑,'--输入清单',新清单)
+            重点=['数据/表现记录.jsonl','对应/表现身份迁移.jsonl']
+            一致=code==0 and all(sha256文件(os.path.join(再跑,f))==sha256文件(os.path.join(输出根,f)) for f in 重点)
+            记('幂等:承接修订成果不重复改号或增加迁移',一致,'新清单固定本次成果','表现及沿革字节一致',log[-250:])
         v1行 = open(原.V1, encoding="utf-8-sig").read().splitlines()
         证据增量 = []
         for 行 in v1行:

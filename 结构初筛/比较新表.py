@@ -9,26 +9,40 @@
 from __future__ import annotations
 
 import json
+import datetime
+import re
 import time
 from collections import defaultdict
 from pathlib import Path
 
 from openpyxl.utils import get_column_letter, range_boundaries
 
-from 建立结构索引 import 规范文字, 读jsonl, _json默认
+if __package__:
+    from .建立结构索引 import (规范文字, _json默认, 校验索引目录, 文件指纹,
+                        索引文件指纹, 规则版本, 机械读取模块路径)
+else:
+    from 建立结构索引 import (规范文字, _json默认, 校验索引目录, 文件指纹,
+                       索引文件指纹, 规则版本, 机械读取模块路径)
 
 通用词频上限 = 10  # 索引中超过此数小表共有的文字区分作用弱，不能单独作候选依据
-比较规则版本 = "结构比较规则v5"
+比较规则版本 = "结构比较规则v15"
 
 
-def 载入索引(索引目录: str) -> dict:
-    目录 = Path(索引目录)
-    记录 = 读jsonl(目录 / "小表记录.jsonl")
-    查找 = json.loads((目录 / "文字查找.json").read_text(encoding="utf-8-sig"))
-    清单 = json.loads((目录 / "索引清单.json").read_text(encoding="utf-8-sig"))
-    return {"目录": str(目录), "记录": 记录, "小表": {r["小表编号"]: r for r in 记录},
-            "正文": 查找["正文"], "别名": 查找.get("别名", {}),
-            "规则版本": 清单.get("规则版本"), "索引清单": 清单}
+def 生成版本(输入路径, 索引目录):
+    根 = Path(__file__).resolve().parent
+    return {'输入sha256': 文件指纹(输入路径), '索引清单sha256': 文件指纹(Path(索引目录) / '索引清单.json'),
+            '索引生成物': 索引文件指纹(索引目录), '比较规则': 比较规则版本, '建库规则': 规则版本,
+            '代码': {p.name: 文件指纹(p) for p in
+                     [根 / '比较新表.py', 根 / '建立结构索引.py', 根 / '运行初筛.py', 机械读取模块路径]}}
+
+
+def 核对生成版本(结果, 输入路径, 索引目录):
+    if 结果.get('生成版本') != 生成版本(输入路径, 索引目录):
+        raise ValueError('结果生成版本与当前输入、索引或代码版本不符')
+
+
+def 载入索引(索引目录: str, 允许读取器版本变化=False) -> dict:
+    return 校验索引目录(索引目录, 允许读取器版本变化=允许读取器版本变化)
 
 
 def _工作表数据(工作表记录):
@@ -100,7 +114,7 @@ def _提候选范围(小表, 表数据):
 索引正文计数 = {}
 
 
-def _对齐候选(小表, 工作表名, 表数据, 种子, 弱候选收集=None):
+def _对齐候选(小表, 工作表名, 表数据, 种子, 弱候选收集=None, 旧缺口=()):
     """以一个种子偏移为起点做允许插入/缺失的顺序对齐，返回候选dict或None。"""
     dr, dc, _ = 种子
     旧行们 = _旧行序列(小表)
@@ -127,7 +141,8 @@ def _对齐候选(小表, 工作表名, 表数据, 种子, 弱候选收集=None)
         键 = tuple((列, 文字) for 列, 文字, _, _ in 期望)
         强位置 = tuple((列, 文字) for 列, 文字, 角色, _ in 期望
                      if 表内词频[文字] == 1 and 角色 in ("标题", "项目", "表头", "说明"))
-        缓存键 = ("锚", 键, 强位置) if 只查锚 else 键
+        换列表头 = all(角色 == '表头' for _, _, 角色, _ in 期望) and len({文字 for _, 文字 in 键}) == len(键) > 1
+        缓存键 = (("锚", 键, 强位置) if 只查锚 else 键, 换列表头)
         缓存 = 表数据["行查找缓存"]
         if 缓存键 not in 缓存:
             行集 = [set(表数据["文字列行"].get((文字, 列), ())) for 列, 文字 in 键]
@@ -138,6 +153,14 @@ def _对齐候选(小表, 工作表名, 表数据, 种子, 弱候选收集=None)
                                                    for r in 表数据["文字列行"].get((文字, 列), ())}
             else:
                 匹配行 = set.union(*行集)
+            # 一行全是不同的表头时，整组文字仍在同一行也可证明行归属，
+            # 不要求换列后的文字先出现在旧列，否则后续列票没有机会纠正。
+            if 换列表头:
+                左界, 右界 = min(c for c, _ in 键), max(c for c, _ in 键)
+                换列行集 = [{range_boundaries(p)[1] for p in 表数据['文字位置'].get(文字, [])
+                              if 左界 <= range_boundaries(p)[0] <= 右界}
+                            for _, 文字 in 键]
+                匹配行 |= set.intersection(*换列行集)
             缓存[缓存键] = sorted(匹配行)
         from bisect import bisect_left, bisect_right
         行们 = 缓存[缓存键]
@@ -207,15 +230,66 @@ def _对齐候选(小表, 工作表名, 表数据, 种子, 弱候选收集=None)
     # 列映射：由已对齐行上的文字投票
     列票 = defaultdict(lambda: defaultdict(int))
     差异 = []
+    合并组表头 = {h['坐标'] for h in 小表.get('表头', [])
+                  for m in 小表.get('合并', [])
+                  if (b := range_boundaries(m))[0] < b[2]
+                  and h['坐标'] == f'{get_column_letter(b[0])}{b[1]}'}
+    # 跨列的组标题不能把首列锁在原位置；有下层独立表头时由其确定业务列。
+    下层可定列 = {h['坐标'] for h in 小表.get('表头', [])
+                  if h['坐标'] in 合并组表头 and any(
+                      q['坐标'] not in 合并组表头 and q.get('覆盖列') == h.get('覆盖列')
+                      and range_boundaries(q['坐标'])[1] > range_boundaries(h['坐标'])[1]
+                      for q in 小表.get('表头', []))}
+    # 组标题确定期间块，下层表头确定块内列；不能跨到同名的另一期间块。
+    列组范围 = {}
+    # 同行重复的项目列标题标出并排独立表；组标题和业务列必须留在种子所指的那张表内。
+    行内范围 = {}
+    for r, 文字组 in 旧行们:
+        组列 = [c for c, _, _, p in 文字组 if p in 合并组表头]
+        标签 = [(c, t) for c, t, role, _ in 文字组 if 组列 and c < min(组列) and role != '标题']
+        if r not in 行映射 or not 标签:
+            continue
+        c, t = max(标签)
+        标签列 = sorted(range_boundaries(p)[0] for p in 表数据['文字位置'].get(t, [])
+                      if range_boundaries(p)[1] == 行映射[r])
+        if len(标签列) > 1 and c + dc in 标签列:
+            行内范围[r] = (c + dc + 1, next((q - 1 for q in 标签列 if q > c + dc), 表数据['记录']['max_column']))
+    for 坐标 in 合并组表头:
+        h = next(h for h in 小表['表头'] if h['坐标'] == 坐标)
+        _, r, _, _ = range_boundaries(坐标)
+        if r not in 行映射:
+            continue
+        左界, 右界 = 行内范围.get(r, (1, 表数据['记录']['max_column']))
+        for q in 小表['表头']:
+            if q['坐标'] == 坐标:
+                col = range_boundaries(q.get('覆盖列', get_column_letter(range_boundaries(坐标)[0])) + '1')[0]
+                left, right = 列组范围.get(col, (1, 表数据['记录']['max_column']))
+                列组范围[col] = (max(left, 左界), min(right, 右界))
+        命中 = [range_boundaries(p) for p in 表数据['文字位置'].get(h.get('查找文字'), [])
+                if range_boundaries(p)[1] == 行映射[r] and 左界 <= range_boundaries(p)[0] <= 右界]
+        if len(命中) != 1:
+            continue
+        c, r, _, _ = 命中[0]
+        新组 = [b for b in 表数据['合并'] if b[0] == c and b[1] == r and b[0] < b[2]]
+        if len(新组) != 1:
+            continue
+        for q in 小表['表头']:
+            if q['坐标'] == 坐标:
+                col = range_boundaries(q.get('覆盖列', get_column_letter(range_boundaries(坐标)[0])) + '1')[0]
+                left, right = 列组范围.get(col, (1, 表数据['记录']['max_column']))
+                列组范围[col] = (max(left, 新组[0][0]), min(right, 新组[0][2]))
     for 旧行, 文字组 in 旧行们:
         if 旧行 not in 行映射:
             continue
         新行 = 行映射[旧行]
         for 列, 文字, 角色, 旧坐标 in 文字组:
-            if 新文字(新行, 列 + dc) == 文字:
+            if 旧坐标 in 下层可定列:
+                continue
+            左界, 右界 = 列组范围.get(列, (1, 表数据['记录']['max_column']))
+            if 左界 <= 列 + dc <= 右界 and 新文字(新行, 列 + dc) == 文字:
                 列票[列][列 + dc] += 1
             else:
-                别处 = [c for c in range(1, 表数据["记录"]["max_column"] + 1) if 新文字(新行, c) == 文字]
+                别处 = [c for c in range(左界, 右界 + 1) if 新文字(新行, c) == 文字]
                 if 别处:
                     列票[列][别处[0]] += 1
                     差异.append({"旧坐标": 旧坐标, "查找文字": 文字, "类型": "列位置变化",
@@ -224,6 +298,33 @@ def _对齐候选(小表, 工作表名, 表数据, 种子, 弱候选收集=None)
                     原位 = 新文字(新行, 列 + dc)
                     差异.append({"旧坐标": 旧坐标, "查找文字": 文字, "类型": "文字缺失或改写",
                                "说明": f"新表对应行未找到'{文字}'" + (f"，原位置现为'{原位}'" if 原位 else "")})
+    # 共用表头是正文外的已登记列依据：用于对应列，不把它与正文之间的空行纳入小表。
+    共用表头核对 = {"一致": [], "冲突": [], "缺依据": [], "对应": []}
+    for h in 小表.get("表头", []):
+        if not h.get("共用"):
+            continue
+        c, r, _, _ = range_boundaries(h["坐标"])
+        文字 = h.get("查找文字")
+        命中列 = [q for q in range(1, 表数据["记录"]["max_column"] + 1)
+                  if 文字 and 新文字(r + dr, q) == 文字]
+        if len(命中列) == 1:
+            新列 = 命中列[0]
+            旧列 = range_boundaries(h.get("覆盖列", get_column_letter(c)) + "1")[0]
+            列票[旧列][新列] += 1
+            共用表头核对["一致"].append(h["坐标"])
+            共用表头核对["对应"].append({"旧坐标": h["坐标"],
+                "新坐标": f"{get_column_letter(新列)}{r + dr}", "覆盖旧列": get_column_letter(旧列), "查找文字": 文字})
+            if 新列 != c + dc:
+                差异.append({"旧坐标": h["坐标"], "类型": "列位置变化", "查找文字": 文字,
+                             "说明": f"共用表头文字在新表位于{get_column_letter(新列)}列"})
+        elif len(命中列) > 1:
+            共用表头核对["缺依据"].append(h["坐标"])
+            歧义.append({"旧坐标": h["坐标"], "候选列": [get_column_letter(q) for q in 命中列],
+                         "原因": "共用表头同名列不唯一，未据此建立业务列对应"})
+        elif 文字 and 新文字(r + dr, c + dc):
+            共用表头核对["冲突"].append({"旧坐标": h["坐标"], "旧": 文字, "新": 新文字(r + dr, c + dc)})
+        else:
+            共用表头核对["缺依据"].append(h["坐标"])
     列映射 = {}
     for 列, 票 in 列票.items():
         最高 = max(票.values())
@@ -235,17 +336,71 @@ def _对齐候选(小表, 工作表名, 表数据, 种子, 弱候选收集=None)
 
     结构对应 = []
     对上旧文字 = set()
+    def 表头首格(行, 列):
+        for 左, 顶, 右, 底 in 表数据['合并']:
+            if 左 <= 列 <= 右 and 顶 <= 行 <= 底:
+                return 顶, 左
+        return 行, 列
+
+    表头冲突列 = set()
+    for h in 小表.get('表头', []):
+        if h.get('共用') or not h.get('查找文字'):
+            continue
+        列, 行, _, _ = range_boundaries(h['坐标'])
+        列 = range_boundaries(h.get('覆盖列', get_column_letter(列)) + '1')[0]
+        if 行 not in 行映射 or 列 not in 列映射:
+            continue
+        新行, 新列 = 表头首格(行映射[行], 列映射[列])
+        现文 = 新文字(新行, 新列)
+        # 后段表头只能追加限制，不能消除前面已经发现的明确冲突。
+        if 现文 == h['查找文字'] and h['坐标'] in 合并组表头:
+            下层新行 = [行映射[qrow] for q in 小表['表头']
+                        if q.get('覆盖列') == get_column_letter(列) and q['坐标'] not in 合并组表头
+                        and (qrow := range_boundaries(q['坐标'])[1]) > 行 and qrow in 行映射
+                        and 行映射[qrow] > 新行]
+            同层词 = {q.get('查找文字') for q in 小表['表头'] if q['坐标'] in 合并组表头
+                      and range_boundaries(q['坐标'])[1] == 行}
+            if 下层新行:
+                # 当前同层期间表头已经出现时，不能跨过去借用前段表头。
+                后继表头 = [(b[1], b[0], 新文字(b[1], b[0])) for b in 表数据['合并']
+                            if 新行 < b[1] < min(下层新行) and b[0] <= 列映射[列] <= b[2]
+                            and 新文字(b[1], b[0]) in 同层词]
+                if 后继表头:
+                    新行, 新列, 现文 = max(后继表头)
+        if 现文 and 现文 != h['查找文字']:
+            表头冲突列.add(列)
+            差异.append({'旧坐标': h['坐标'], '类型': '业务列表头冲突',
+                         '说明': f"{get_column_letter(列)}列所依赖表头{h['查找文字']!r}与新表{现文!r}不一致，保留候选内容但不产生该列业务对应"})
+    缺依据格 = {坐标 for 缺口 in 旧缺口 for 坐标 in 缺口.get("影响业务格", [])}
+    # 兼容旧清单的明确列号；只解析已登记的缺表头问题，不推断其他自然语言。
+    for 缺口 in 旧缺口:
+        if 缺口.get("问题") == "该业务列缺表头归属依据":
+            列号 = re.fullmatch(r"([A-Z]+)列", 缺口.get("坐标", ""))
+            if 列号:
+                缺依据格.update(n["坐标"] for n in 小表["节点"]
+                               if n["角色"] == "业务数值" and get_column_letter(n["列"]) == 列号[1])
     for n in 小表["节点"]:
+        if n['角色'] == '业务数值' and n['列'] in 表头冲突列:
+            continue
+        if n["角色"] == "业务数值" and n["坐标"] in 缺依据格:
+            差异.append({"旧坐标": n["坐标"], "类型": "缺对应依据",
+                       "说明": "旧索引已登记该业务格结构依据缺口，未产生结构对应"})
+            continue
         if n["行"] not in 行映射 or n["列"] not in 列映射:
             if n["角色"] == "业务数值":
                 差异.append({"旧坐标": n["坐标"], "类型": "缺对应依据",
                            "说明": "业务格缺行或列对应依据，未产生结构对应"})
             continue
-        新坐标 = f"{get_column_letter(列映射[n['列']])}{行映射[n['行']]}"
+        新行, 新列 = 行映射[n['行']], 列映射[n['列']]
+        if n['坐标'] in 合并组表头:
+            新行, 新列 = 表头首格(新行, 新列)
+        新坐标 = f"{get_column_letter(新列)}{新行}"
         条目 = {"旧工作表": 小表["来源"]["工作表"], "旧坐标": n["坐标"],
               "新工作表": 工作表名, "新坐标": 新坐标, "角色": n["角色"]}
+        新格 = 表数据['记录']['cells'].get(新坐标, {})
+        条目['新表内容'] = {a: 新格.get(b) for a,b in [('原文','value'),('公式','formula'),('缓存','cached_value')]}
         if n.get("查找文字"):
-            if 新文字(行映射[n["行"]], 列映射[n["列"]]) == n["查找文字"]:
+            if 新文字(新行, 新列) == n["查找文字"]:
                 条目["原文"] = n.get("原文")
                 条目["查找文字"] = n["查找文字"]
                 对上旧文字.add(n["坐标"])
@@ -347,6 +502,29 @@ def _对齐候选(小表, 工作表名, 表数据, 种子, 弱候选收集=None)
             elif 坐标 in 表数据["数字坐标"]:
                 范围内数字.append(坐标)
     对上新文字 = {d["新坐标"] for d in 结构对应 if d.get("查找文字")}
+    # 按实际内容做减集，不能只检查字符串和数字；公式、日期、布尔值同样需要有去向。
+    已对应位置 = {d["新坐标"] for d in 结构对应}
+    未对应内容 = []
+    for 坐标 in 表数据["内容格"]:
+        列, 行, _, _ = range_boundaries(坐标)
+        if 坐标 in 已对应位置 or not (左 <= 列 <= 右 and 顶 <= 行 <= 底2):
+            continue
+        格 = 表数据["记录"]["cells"][坐标]
+        原文 = 格.get("value")
+        if 格.get("formula"):
+            类型 = "公式"
+        elif isinstance(原文, str):
+            类型 = "文字"
+        elif isinstance(原文, bool):
+            类型 = "布尔值"
+        elif isinstance(原文, (int, float)):
+            类型 = "用途未明数字"
+        elif isinstance(原文, (datetime.date, datetime.time)):
+            类型 = "日期时间"
+        else:
+            类型 = "其他内容"
+        未对应内容.append({"坐标": 坐标, "原文": 原文, "类型": 类型,
+                         "公式": 格.get("formula"), "缓存": 格.get("cached_value")})
     新增项目 = []
     for e in 新增行:
         标签 = next((原 for 列, _, 原 in e["文字"]), None)
@@ -394,19 +572,6 @@ def _对齐候选(小表, 工作表名, 表数据, 种子, 弱候选收集=None)
                               "结果": "新增合并，旧表无对应"})
 
     上下文核对 = {"一致": [], "冲突": [], "缺依据": [], "冲突原因": []}
-    # 共用表头：外部所属依据独立核对，不计入小表正文覆盖
-    共用表头核对 = {"一致": [], "冲突": [], "缺依据": []}
-    for h in 小表.get("表头", []):
-        if not h.get("共用"):
-            continue
-        c, r, _, _ = range_boundaries(h["坐标"])
-        新值 = 新文字(r + dr, c + dc)
-        if 新值 == h["查找文字"]:
-            共用表头核对["一致"].append(h["坐标"])
-        elif 新值:
-            共用表头核对["冲突"].append({"旧坐标": h["坐标"], "旧": h["查找文字"], "新": 新值})
-        else:
-            共用表头核对["缺依据"].append(h["坐标"])
     for ctx in 小表.get("上下文", []):
         c, r, _, _ = range_boundaries(ctx["坐标"])
         期望行, 期望列 = r + dr, c + dc
@@ -439,6 +604,8 @@ def _对齐候选(小表, 工作表名, 表数据, 种子, 弱候选收集=None)
                    "同列": {get_column_letter(k): get_column_letter(v) for k, v in 列映射.items()}},
         "上下文核对": 上下文核对,
         "共用表头核对": 共用表头核对,
+        "旧索引缺口": list(旧缺口),
+        "未对应内容": 未对应内容,
         "覆盖计算": {
             "旧表文字覆盖": {"分子": len(旧覆盖分子), "分母": len(旧文字节点), "对上项目": 旧覆盖分子,
                         "未对上项目": sorted(n["坐标"] for n in 旧文字节点 if n["坐标"] not in 对上旧文字)},
@@ -509,6 +676,11 @@ def 比较工作簿(工作簿记录: dict, 索引: dict, 预筛选: bool = True)
     预筛选秒 = 0.0
     对齐秒 = 0.0
     名称目录 = _上层名称目录(索引)
+    结果["缺口"] = list(索引.get("索引清单", {}).get("缺口", []))
+    结果["索引校验说明"] = 索引.get("校验说明", [])
+    小表缺口 = defaultdict(list)
+    for 缺口 in 结果["缺口"]:
+        小表缺口[(缺口.get("样式"), 缺口.get("小表"))].append(缺口)
     for 表 in 工作簿记录["sheets"]:
         表起始 = time.perf_counter()
         表数据 = _工作表数据(表)
@@ -544,9 +716,22 @@ def 比较工作簿(工作簿记录: dict, 索引: dict, 预筛选: bool = True)
         上层 = _工作表上层语义(表, 表数据, 名称目录)
         范围 = {(p["附注"], p["表义"]) for p in 上层["业务路径"]}
         排除 = []
+        范围外线索 = {}
         if 上层["用于筛选"]:
-            排除 = [编号 for 编号 in 待比 if 索引["小表"][编号].get("上层语义", {}).get("完整")
-                    and _业务路径(索引["小表"][编号]).isdisjoint(范围)]
+            范围内文字 = {n["查找文字"] for r in 索引["小表"].values()
+                       if not _业务路径(r).isdisjoint(范围)
+                       for n in r["节点"] if n.get("查找文字")}
+            for 编号 in 待比:
+                旧表 = 索引["小表"][编号]
+                if not 旧表.get("上层语义", {}).get("完整") or not _业务路径(旧表).isdisjoint(范围):
+                    continue
+                项目线索 = {n["查找文字"] for n in 旧表["节点"] if n["角色"] == "项目"
+                        and n.get("查找文字") in 表数据["文字位置"] and n["查找文字"] not in 范围内文字}
+                if 项目线索:
+                    # 标题可能缺失或表名沿用旧名；区别项目仍须进入局部排列核对，不能只凭表名挡掉。
+                    范围外线索[编号] = sorted(项目线索)
+                else:
+                    排除.append(编号)
             排除集 = set(排除)
             待比 = [编号 for 编号 in 待比 if 编号 not in 排除集]
         上层["未进入比较"] = [{"旧表编号": 编号, "小表名称": 索引["小表"][编号]["小表名称"],
@@ -567,14 +752,18 @@ def 比较工作簿(工作簿记录: dict, 索引: dict, 预筛选: bool = True)
             for 种子 in 种子们:
                 if 种子[:2] in 已发现:
                     continue
-                候选 = _对齐候选(小表, 表["name"], 表数据, 种子, 结果["弱候选"])
+                候选 = _对齐候选(小表, 表["name"], 表数据, 种子, 结果["弱候选"],
+                             小表缺口.get((小表["样式"], 小表["小表名称"]), []))
                 if 候选:
                     原因 = 上层["待确认原因"]
+                    if 编号 in 范围外线索:
+                        原因 = "工作表名称与局部项目组合支持的旧业务范围不同，保留候选待通读确认"
                     if not 小表.get("上层语义", {}).get("完整"):
                         原因 = "旧索引缺完整上层语义依据，未按名称排除；请重建索引后复核"
                     候选["上层语义核对"] = {"工作表名称": 表["name"], "业务路径": 上层["业务路径"],
                         "旧业务路径": 小表.get("上层语义", {}).get("业务路径", []),
-                        "依据": 上层["依据"], "待确认原因": 原因, "待通读确认": True}
+                        "依据": 上层["依据"], "局部项目线索": 范围外线索.get(编号, []),
+                        "待确认原因": 原因, "待通读确认": True}
                     候选们.append(候选)
                     覆盖 = 候选["覆盖计算"]["旧表文字覆盖"]
                     if 覆盖["分子"] == 覆盖["分母"]:
@@ -625,6 +814,16 @@ def 比较工作簿(工作簿记录: dict, 索引: dict, 预筛选: bool = True)
         结果["样式命中"][str(i)] = {"候选数": len(命中),
                               "命中小表": sorted({c["小表名称"] for c in 命中}),
                               "未命中说明": "该样式无候选命中" if not 命中 else ""}
+    # 不同范围、不同工作表的候选也不能冒充唯一落点。
+    落点 = defaultdict(set)
+    for c in 结果['候选']:
+        for d in c['结构对应']:
+            落点[(c['旧表编号'],d['旧工作表'],d['旧坐标'])].add((d['新工作表'],d['新坐标']))
+    for c in 结果['候选']:
+        分歧 = [{'旧坐标':d['旧坐标'],'本候选新坐标':d['新坐标'],
+                 '可能新位置':sorted(落点[(c['旧表编号'],d['旧工作表'],d['旧坐标'])])}
+                for d in c['结构对应'] if len(落点[(c['旧表编号'],d['旧工作表'],d['旧坐标'])])>1]
+        if 分歧: c['歧义'].append({'原因':'同一旧格在完整工作簿中存在多个候选落点，待通读确认','不同对应':分歧})
     结果["运行统计"] = {"比较的小表数": 比较小表数, "候选数": len(结果["候选"]),
                    "阶段耗时": {"预筛选秒": round(预筛选秒, 3), "候选对齐秒": round(对齐秒, 3)},
                    "耗时秒": round(time.perf_counter() - 起始, 3)}
@@ -632,7 +831,7 @@ def 比较工作簿(工作簿记录: dict, 索引: dict, 预筛选: bool = True)
 
 
 def _合并候选(候选们):
-    """同旧小表、共享新坐标的候选是同一处发现的重复种子，合并保留最大证据；范围不交的保留为多个候选。"""
+    """只合并旧新对应相容的重复种子；共享表头但业务格对应不同的候选保留。"""
     按表 = defaultdict(list)
     for c in 候选们:
         按表[c["旧表编号"]].append(c)
@@ -641,57 +840,88 @@ def _合并候选(候选们):
         组.sort(key=lambda c: -len(c["结构对应"]))
         保留 = []
         for c in 组:
-            坐标集 = {d["新坐标"] for d in c["结构对应"]}
-            并入 = None
-            for r in 保留:
-                已有 = {d["新坐标"] for d in r["结构对应"]}
-                if 坐标集 & 已有:
-                    并入 = r
-                    break
-            if 并入 is None:
-                保留.append(c)
-            else:
-                if len(c["结构对应"]) > len(并入["结构对应"]):
-                    c.setdefault("歧义", []).append({"原因": "同一种小表的多个种子偏移收敛到同一范围，已合并", "合并前候选数": len(组)})
-                    保留[保留.index(并入)] = c
-                else:
-                    并入.setdefault("歧义", []).append({"原因": "同一种小表的多个种子偏移收敛到同一范围，已合并", "合并前候选数": len(组)})
-        结果.extend(保留)
+            对应集 = frozenset((d["旧坐标"], d["新坐标"]) for d in c["结构对应"])
+            if any(对应集 <= 已有 for _, 已有 in 保留):
+                continue
+            for r, 已有 in 保留:
+                旧对应 = dict(已有)
+                分歧 = [{"旧坐标": 旧, "本候选新坐标": 新, "另一候选新坐标": 旧对应[旧]}
+                        for 旧, 新 in sorted(对应集) if 旧 in 旧对应 and 旧对应[旧] != 新]
+                if 分歧 and {新 for _, 新 in 对应集} & {新 for _, 新 in 已有}:
+                    c["歧义"].append({"原因": "候选共享部分位置但具体对应不同，不能唯一绑定",
+                                    "另一候选范围": r["新表范围"], "不同对应": 分歧})
+                    r["歧义"].append({"原因": "候选共享部分位置但具体对应不同，不能唯一绑定",
+                                    "另一候选范围": c["新表范围"],
+                                    "不同对应": [{"旧坐标": d["旧坐标"], "本候选新坐标": d["另一候选新坐标"],
+                                               "另一候选新坐标": d["本候选新坐标"]} for d in 分歧]})
+            保留.append((c, 对应集))
+        结果.extend(c for c, _ in 保留)
     return 结果
 
 
-def 核验预期对应(结果, 预期, 小表名称):
-    """独立核对：候选的结构对应必须落在事先固定的变换预期内。"""
+def 核验预期对应(结果, 预期, 小表名称, 允许关系=None):
+    """唯一构造样例：必需关系不遗漏，其他对应只能来自预先固定的允许关系。"""
     候选 = [c for c in 结果["候选"] if c["小表名称"] == 小表名称]
     assert len(候选) == 1, f"候选数量不是1：{len(候选)}"
-    对应 = {(d["旧工作表"], d["旧坐标"]): (d["新工作表"], d["新坐标"]) for d in 候选[0]["结构对应"]}
+    允许 = 预期 if 允许关系 is None else 允许关系
+    assert all(允许.get(k) == v for k, v in 预期.items()), "必需关系不在允许关系内"
+    对应 = {}
+    for d in 候选[0]["结构对应"]:
+        k, v = (d["旧工作表"], d["旧坐标"]), (d["新工作表"], d["新坐标"])
+        assert k not in 对应 or 对应[k] == v, f"同一旧格存在冲突对应：{k}"
+        对应[k] = v
     for k, v in 对应.items():
-        assert k in 预期, f"候选包含预期外旧坐标{k}"
-        assert v == 预期[k], f"{k}对应{v}与预期{预期[k]}不符"
+        assert k in 允许, f"候选包含预期外旧坐标{k}"
+        assert v == 允许[k], f"{k}对应{v}与预期{允许[k]}不符"
+    assert not set(预期) - set(对应), f"遗漏必需对应：{sorted(set(预期) - set(对应))}"
     return True
 
 
-def 完整性检查(工作簿记录, 初筛结果):
-    """以工作簿读取结果为底稿：每个实际内容格必须在候选范围或未匹配清单中可回查。"""
+def 比较完整事实(结果):
+    """保留全部业务事实，列表按内容比较；仅排除计时、预筛选统计和物理路径。"""
+    def 规范(obj):
+        if isinstance(obj, dict):
+            return {k: 规范(v) for k, v in sorted(obj.items())
+                    if k not in ('运行统计', '未进入比较', '基准对照', '生成版本', '索引版本', '输入版本', '索引校验说明')}
+        if isinstance(obj, list):
+            return sorted((规范(v) for v in obj), key=lambda v: json.dumps(v, ensure_ascii=False, sort_keys=True, default=_json默认))
+        return obj
+    return 规范(结果)
+
+
+def 完整性检查(工作簿记录, 初筛结果, 必需业务位置=()):
+    """每个内容格须有具体去向；另核对预先固定的业务空格，矩形覆盖不算去向。"""
     问题 = []
-    候选盒 = defaultdict(list)
+    去向 = set()
+    表按名 = {s['name']: s for s in 工作簿记录['sheets']}
     for c in 初筛结果["候选"]:
-        候选盒[c["新工作表"]].append(range_boundaries(c["新表范围"]))
-    未匹配坐标 = defaultdict(set)
+        for d in c['结构对应']:
+            key = (d['新工作表'], d['新坐标'])
+            格 = 表按名.get(key[0], {}).get('cells', {}).get(key[1], {})
+            当前 = {a: 格.get(b) for a,b in [('原文','value'),('公式','formula'),('缓存','cached_value')]}
+            if d['新工作表'] != c['新工作表'] or d.get('新表内容') != 当前:
+                问题.append(f'{key} 对应内容的当前原文、公式或缓存不符')
+            去向.add(key)
+        for d in c.get('未对应内容', []):
+            key = (c['新工作表'], d['坐标'])
+            格 = 表按名.get(key[0], {}).get('cells', {}).get(key[1])
+            if 格 is None or any(d.get(a) != 格.get(b) for a, b in
+                                  [('原文', 'value'), ('公式', 'formula'), ('缓存', 'cached_value')]):
+                问题.append(f'{key} 未对应内容的原文、公式或缓存不符')
+            去向.add(key)
     for m in 初筛结果["未匹配范围"]:
         for s in m["分段"]:
-            未匹配坐标[m["工作表"]].update(s["坐标清单"])
+            去向.update((m['工作表'], a) for a in s['坐标清单'])
     for 表 in 工作簿记录["sheets"]:
         名 = 表["name"]
         for 坐标, 格 in 表["cells"].items():
             if 格.get("value") is None and not 格.get("formula"):
                 continue
-            c, r, _, _ = range_boundaries(坐标)
-            if any(b[0] <= c <= b[2] and b[1] <= r <= b[3] for b in 候选盒.get(名, [])):
+            if (名, 坐标) in 去向:
                 continue
-            if 坐标 in 未匹配坐标.get(名, set()):
-                continue
-            问题.append(f"{名}!{坐标} 既不在候选范围也不在未匹配清单")
+            问题.append(f"{名}!{坐标} 缺少具体对应、未对应内容或未匹配去向")
+    for 名, 坐标 in set(必需业务位置) - 去向:
+        问题.append(f'{名}!{坐标} 已知业务位置遗漏')
     if 问题:
         raise AssertionError("完整性检查失败：\n" + "\n".join(问题[:20]))
     return True
@@ -747,7 +977,10 @@ def _生成报告(结果):
         "## 五样式命中情况", ""]
     for 样式, 情况 in sorted(结果["样式命中"].items()):
         行.append(f"- 样式{样式}：候选{情况['候选数']}个" +
-                (f"，命中：{'、'.join(情况['命中小表'][:8])}" if 情况["命中小表"] else "，无命中"))
+                 (f"，命中：{'、'.join(情况['命中小表'][:8])}" if 情况["命中小表"] else "，无命中"))
+    if 结果.get("缺口"):
+        行 += ["", f"旧索引登记的结构依据缺口共{len(结果['缺口'])}项，完整内容见初筛结果的缺口字段；"
+                     "已命中小表的缺口列入该候选待处理问题，受影响业务格不建立结构对应。"]
     行 += ["", "## 工作表上层语义与比较范围", ""]
     for s in 结果.get("工作表", []):
         u = s.get("上层语义", {})
@@ -787,6 +1020,11 @@ def _生成报告(结果):
 def _候选问题(c):
     """一个候选全部需要后续处理的问题，JSON/报告/交接说明共用同一份判定。"""
     问题 = []
+    for 项 in c.get("未对应内容", []):
+        问题.append(f"候选内未对应{项['类型']}：{项['坐标']}＝{项.get('原文')!r}")
+    for 缺口 in c.get("旧索引缺口", []):
+        问题.append(f"旧索引结构依据缺口：{缺口.get('坐标') or 缺口.get('位置') or '位置见原始记录'}，"
+                   f"{缺口.get('问题', '')}")
     if c.get("上层语义核对", {}).get("待确认原因"):
         问题.append("上层语义：" + c["上层语义核对"]["待确认原因"])
     if c["缺失项目原文"]:
@@ -832,7 +1070,8 @@ def _生成交接说明(结果):
         "4. 对查不到的部分，查阅已有标准区分：同义的新表现、已有维度的新取值、新增维度、真正新增语义；查不到绝不自动新增槽位。",
         "",
         "## 需要进一步处理的范围", ""]
-    if 未解决 or 结果["未匹配范围"]:
+    未定位缺口 = [g for g in 结果.get("缺口", []) if not g.get("小表")]
+    if 未解决 or 结果["未匹配范围"] or 未定位缺口:
         行.append(f"状态：存在必须细读的范围（候选未解决问题{len(未解决)}个，未匹配范围{len(结果['未匹配范围'])}段）。")
         行.append("")
     if 未解决:
@@ -847,7 +1086,13 @@ def _生成交接说明(结果):
         行.append("### 未匹配范围（无任何旧参照，必须细读）")
         for m in 结果["未匹配范围"]:
             行.append(f"- {m['工作表']}：{m['坐标数']}格，分段见 初筛结果.json")
-    if not 未解决 and not 结果["未匹配范围"]:
+    if 结果.get("缺口"):
+        行 += ["", f"旧参照库另登记{len(结果['缺口'])}项结构依据缺口，完整内容见初筛结果的缺口字段。"
+                     "命中小表的缺口已列入上面的候选问题；其他小表的缺口不代表本次新表出现相同问题。"]
+    for g in 未定位缺口:
+        行.append(f"- 尚不能定位到小表的来源缺口：样式{g.get('样式')}，{g.get('问题')}，"
+                 f"位置{g.get('坐标') or g.get('位置') or '未明确'}；需核对其是否影响本次候选。")
+    if not 未解决 and not 结果["未匹配范围"] and not 未定位缺口:
         行.append("本次没有未解决问题（全部候选无差异、无冲突、无歧义、无合并/层级/上下文/共用表头问题，"
                 "且无未匹配范围），不强制产生全表细读任务；通读确认候选边界后即可复用。")
     return "\n".join(行) + "\n"

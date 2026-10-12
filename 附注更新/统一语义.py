@@ -308,6 +308,12 @@ def validate_legacy_bindings(standard, legacy_rows, legacy_gold_hash):
     return True
 
 
+def required_cell_dimensions(metric, standard):
+    """格子对应不以报表口径为前提；历史回执仍按当时规则重建。"""
+    required = {ref['id'] for ref in metric['dimension_refs'] if ref['required']}
+    return required if standard.get('_historical_report_scope') else required - {'report_scope'}
+
+
 def partial_pending_dimensions(known, standard):
     return sorted(set(known['missing_dimensions'])|{key for key,value in known['dimensions'].items()
         if standard['dimension'][key]['value_type']=='selection' and (value['mode']=='unknown' or value['completeness']!='complete')})
@@ -320,12 +326,14 @@ def validate_partial_semantics(known, standard):
     metric=standard['metric'][known['metric_id']]
     _require(metric['status']=='active','不能使用停用指标')
     declared={ref['id'] for ref in metric['dimension_refs']}
-    required={ref['id'] for ref in metric['dimension_refs'] if ref['required']}
+    required=required_cell_dimensions(metric, standard)
     dims=known['dimensions'];evidence=known['dimension_evidence']
     _require(isinstance(dims,dict) and set(dims)<=declared,'部分语义包含未声明维度')
     _require(isinstance(evidence,dict) and set(evidence)==set(dims),'每项已知维度须有证据')
     _texts(known['missing_dimensions'],empty=True);_texts(known['evidence_cells'])
-    _require(set(known['missing_dimensions'])==required-set(dims),'缺少维度须精确列出尚未确定的必需项')
+    missing=set(known['missing_dimensions'])
+    _require(missing==required-set(dims) or missing==({ref['id'] for ref in metric['dimension_refs'] if ref['required']}-set(dims)),
+             '缺少维度须精确列出尚未确定的必需项')
     for key,value in dims.items():
         _dimension_value(value,standard['dimension'][key]);_texts(evidence[key])
     _require(partial_pending_dimensions(known,standard),'全部维度和范围已明确时应保存完整事实')
@@ -356,7 +364,7 @@ def validate_fact(fact, standard):
     _require(metric["status"] == "active", "不能使用停用指标")
     dims, evidence = fact["dimensions"], fact["dimension_evidence"]
     declared = {ref["id"] for ref in metric["dimension_refs"]}
-    required = {ref["id"] for ref in metric["dimension_refs"] if ref["required"]}
+    required = required_cell_dimensions(metric, standard)
     _require(isinstance(dims, dict) and required <= set(dims) <= declared, "缺少必需维度或使用了未声明维度")
     _require(isinstance(evidence, dict) and set(evidence) == set(dims), "每项实际维度必须有证据")
     for key, value in dims.items():
@@ -369,7 +377,8 @@ def validate_fact(fact, standard):
         _require(dims["period"]["kind"] == definition["time_kind"], "指标时点/期间性质与实际期间不一致")
     for side in definition.get("ratio", {}).values():
         projected = {key: copy.deepcopy(rule["value"] if rule["op"] == "constant" else dims[rule["key"]])
-                     for key, rule in side["dimension_bindings"].items()}
+                     for key, rule in side["dimension_bindings"].items()
+                     if rule['op']=='constant' or rule['key'] in dims}
         # 只检查分子分母的实际维度适用性，不伪造它们的金额。
         validate_fact({"record_type": "metric_fact", "metric_id": side["metric_id"], "dimensions": projected,
                        "dimension_evidence": {key: ["比例定义的已验证维度绑定"] for key in projected},
@@ -398,7 +407,7 @@ def validate_facts(facts, standard, owners):
     _require(isinstance(facts, list) and isinstance(owners, dict), "载体事实和业务对象清单无效")
     normalized_owners = {}
     for identifier, dimensions in owners.items():
-        _require(_text(identifier) and isinstance(dimensions, dict) and {"entity", "report_scope"} <= set(dimensions), "业务对象须有主体及口径")
+        _require(_text(identifier) and isinstance(dimensions, dict) and "entity" in dimensions, "业务对象须有主体")
         _require(set(dimensions) <= set(standard["dimension"]), "业务对象含未声明维度")
         normalized_owners[identifier] = {key: _dimension_value(value, standard["dimension"][key]) for key, value in dimensions.items()}
     indexed = {}
@@ -492,7 +501,7 @@ def ensure_standard_compatible(mapping, standard):
     """新增定义或扩充维度可选值可复用；已有含义、必需维度及指标限制必须保持。"""
     _require(mapping.get('schema_version')==2,'映射不是统一标准格式')
     validate_facts(mapping['facts'],standard,mapping['owners'])
-    partials=[row['partial_semantics'] for row in mapping.get('unresolved',[]) if row.get('partial_semantics')]
+    partials=[row['partial_semantics'] for row in mapping.get('unresolved',[])+mapping.get('slot_bindings',[]) if row.get('partial_semantics')]
     for known in partials:validate_partial_semantics(known,standard)
     if mapping.get('gold_hash')==standard['sha256']:return True
     _require(mapping.get('gold_path'),'映射缺少原金标准版本，不能核实兼容性')
@@ -518,12 +527,19 @@ def ensure_standard_compatible(mapping, standard):
     return True
 
 
+def slot_key(metric_id, standard):
+    """金标准槽位及维度定义的身份；具体维度取值另行保存。"""
+    _require(metric_id in standard['metric'] and standard['metric'][metric_id]['status']=='active', '槽位须引用现行金标准')
+    return metric_id, definition_hash(_metric_meaning(metric_id, standard))
+
+
 def semantic_key(fact, standard):
     """指标相同不等于事实相同；完整实例维度一致才得到相同键。"""
     validate_fact(fact, standard)
     _require(fact["record_type"] == "metric_fact", "维度单元格只建立归属绑定，不能作为金额事实匹配")
     dimensions = {key: _dimension_value(value, standard["dimension"][key], matching=True)
-                  for key, value in fact["dimensions"].items() if key != 'entity'}
+                  for key, value in fact["dimensions"].items()
+                  if key != 'entity' and (key != 'report_scope' or standard.get('_historical_report_scope'))}
     metric = standard["metric"][fact["metric_id"]]
     if metric["definition"]["value_type"] == "monetary":
         # 主体名称和金额倍率不决定财务单元格的对应；值始终由用户决定。
