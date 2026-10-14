@@ -178,6 +178,36 @@ internal static class Program
         if (linked.Length == 0) throw new InvalidDataException("文档没有可用的表格连接，请先提取表格。");
         if (selected.Any(t => t.LinkError is not null)) throw new InvalidDataException("文档存在损坏的连接，停止更新。");
         var current = linked.ToDictionary(t => t.Link!.LinkName, StringComparer.OrdinalIgnoreCase);
+        var captionUpdates = request["caption_updates"] is null ? new JArray() : request["caption_updates"] as JArray
+            ?? throw new InvalidDataException("caption_updates 必须是数组。");
+        var captions = new Dictionary<string, (int[] Path, string Before, string After)>();
+        using (var document = WordprocessingDocument.Open(word, false))
+        {
+            var body = document.MainDocumentPart!.Document!.Body!;
+            foreach (var token in captionUpdates)
+            {
+                if (token is not JObject item || item.Properties().Select(p => p.Name).Order().SequenceEqual(new[] { "old_text", "range_name", "text" }) == false)
+                    throw new InvalidDataException("标题更新须有所属表、原文及新文字。");
+                var name = Required(item, "range_name");
+                var before = Required(item, "old_text");
+                var after = Required(item, "text");
+                if (!current.TryGetValue(name, out var table) || captions.ContainsKey(name))
+                    throw new InvalidDataException("标题所属表不存在或重复：" + name);
+                var node = TableSynchronizer.FindNode(body, table.NodePath);
+                var matches = new List<W.Paragraph>();
+                for (var previous = node.PreviousSibling(); previous is not null && previous is not W.Table; previous = previous.PreviousSibling())
+                    if (previous is W.Paragraph paragraph && paragraph.InnerText.Trim() == before) matches.Add(paragraph);
+                if (matches.Count != 1) throw new InvalidDataException("所属表前标题原文不存在或不唯一：" + name);
+                var caption = matches[0];
+                if (caption.ChildElements.Any(e => e is not W.ParagraphProperties && e is not W.Run && e is not W.ProofError)
+                    || caption.Elements<W.Run>().Any(r => r.ChildElements.Any(e => e is not W.RunProperties && e is not W.Text)))
+                    throw new InvalidDataException("标题包含域、链接或其他对象，不能直接替换：" + name);
+                var path = new List<int>();
+                for (DocumentFormat.OpenXml.OpenXmlElement element = caption; element != body; element = element.Parent!)
+                    path.Insert(0, element.Parent!.ChildElements.ToList().IndexOf(element));
+                captions.Add(name, (path.ToArray(), before, after));
+            }
+        }
         foreach (var token in operations)
         {
             if (token is not JObject operation) throw new InvalidDataException("行列变更必须是对象。");
@@ -204,6 +234,14 @@ internal static class Program
                 var node = TableSynchronizer.FindNode(doc.MainDocumentPart!.Document!.Body!, table.NodePath);
                 node.Parent!.ReplaceChild(TableSynchronizer.ParseTableXml(table.OriginalXml), node);
             }
+            foreach (var caption in captions.Values)
+            {
+                var paragraph = (W.Paragraph)TableSynchronizer.FindNode(doc.MainDocumentPart!.Document!.Body!, caption.Path);
+                var texts = paragraph.Descendants<W.Text>().ToArray();
+                if (texts.Length == 0) throw new InvalidDataException("标题缺少实际文字节点。");
+                texts[0].Text = caption.After;
+                foreach (var text in texts.Skip(1)) text.Text = "";
+            }
         }, path =>
         {
             var actual = ReportReader.Read(path);
@@ -213,6 +251,10 @@ internal static class Program
                 if (!TableSynchronizer.SameXml(LinkManager.RebaseTableXml(table.OriginalXml, word, structured), found.OriginalXml))
                     throw new InvalidDataException("结构保存后校验不一致。");
             }
+            using var document = WordprocessingDocument.Open(path, false);
+            foreach (var caption in captions.Values)
+                if (TableSynchronizer.FindNode(document.MainDocumentPart!.Document!.Body!, caption.Path).InnerText.Trim() != caption.After)
+                    throw new InvalidDataException("标题保存后校验不一致。");
         });
         var settings = new Dictionary<string, WorkTableInfo>();
         foreach (var table in ReportReader.Read(structured).Tables.Where(t => current.ContainsKey(t.Link?.LinkName ?? "") && (scope?.Contains(t) ?? true)))
@@ -234,7 +276,11 @@ internal static class Program
         Backup(output);
         var prepared = scope is null ? output : Path.Combine(Path.GetDirectoryName(output)!, "章节更新中间成果_" + Guid.NewGuid().ToString("N") + ".docx");
         var saved = TableSynchronizer.Save(preview, prepared);
-        if (scope is not null) scope.SaveSelectedTables(word, snapshot.SourceHash, prepared, output);
+        if (scope is not null) scope.SaveSelectedTables(word, snapshot.SourceHash, prepared, output, captions.Values.Select(c => c.Path).ToArray());
+        using (var document = WordprocessingDocument.Open(output, false))
+            foreach (var caption in captions.Values)
+                if (TableSynchronizer.FindNode(document.MainDocumentPart!.Document!.Body!, caption.Path).InnerText.Trim() != caption.After)
+                    throw new InvalidDataException("最终标题回读不一致。");
         var afterScope = ChapterScope.Resolve(request, ReportReader.Read(output));
         return new { ok = true, action = "update", output, successful_tables = saved.SuccessfulTables,
             written_cells = saved.WrittenCells, output_verified = saved.OutputVerified, scope = afterScope?.Info, errors = saved.Errors };

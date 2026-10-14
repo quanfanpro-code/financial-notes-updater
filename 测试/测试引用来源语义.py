@@ -70,7 +70,7 @@ class 引用来源语义测试(unittest.TestCase):
             engine=case.case.engine()
             result=engine.recognize_workbook(source,target_mapping=case.case.target())
         self.assertEqual({p['task'] for p in requests},{'a_semantic_bind','a_semantic_review'})
-        self.assertEqual(result['formula_source_version'],2)
+        self.assertEqual(result['formula_source_version'],3)
         saved=load_fact_mapping(result['mapping_path'],engine.standard)
         self.assertEqual(saved['recognition_scope']['coverage']['targets'][0]['exact_sources'],['综合!B3'])
 

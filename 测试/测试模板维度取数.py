@@ -14,6 +14,216 @@ from 附注更新.分步流程 import run_step
 
 
 class 模板维度取数测试(unittest.TestCase):
+    def test_槽位增行后保留原维度及复制来源(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        from 测试.测试槽位记录调整行数 import 槽位记录
+        case=结构夹具.UnifiedStructureTests();case.setUp();target=槽位记录(case.target)
+        target.update(slot_binding_version=1,semantic_reading={'synthetic':True})
+        purpose={'reason':'已核准槽位增行后仍须保留更新前已知维度','operations':case.proposal['operations'],
+            'bindings':[{'target':'明细!B'+str(row),'source':'明细!B'+str(row)} for row in range(2,6)],
+            'labels':[{'target':'明细!A4','source':'明细!A4'}]}
+        plan=build_fact_update_plan(target,case.source,case.standard,update_purpose=purpose)
+        self.assertEqual(plan['issues'],[])
+        added=next(row for row in plan['updates'] if row['cell']=='B4')
+        self.assertEqual(added['original_dimensions']['asset_selection']['members'],['乙类设备'])
+        self.assertNotIn('entity',added['original_dimensions'])
+        self.assertEqual(added['dimensions']['asset_selection']['members'],['丙类设备'])
+
+    def test_原槽位记录保存时同步最新类别及已知维度(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        from 测试.测试槽位记录调整行数 import 槽位记录
+        from 附注更新.表格 import write_updated_workbook
+        from 附注更新.统一勾稽 import derive_fact_mapping,_template_cell_records,_check_mapping
+        case=结构夹具.UnifiedStructureTests();case.setUp();target=槽位记录(case.target)
+        target.update(slot_binding_version=1,semantic_reading={'synthetic':True})
+        snapshot=read_workbook(target['source_path']);materialize_candidate_blanks(snapshot)
+        financial={row['sheet']+'!'+row['cell'] for row in target['slot_bindings']}
+        target['excluded']=[{'sheet':s['name'],'cell':cell,'category':'label','reason':'受控测试的标题或留白'}
+            for s in snapshot['sheets'] for cell in s['cells'] if s['name']+'!'+cell not in financial]
+        purpose={'reason':'槽位与数据同时更新，不保留原模板行的旧类别','operations':case.proposal['operations'],
+            'bindings':[{'target':f'明细!B{row}','source':f'明细!B{row}'} for row in range(2,6)],
+            'labels':[{'target':'明细!A4','source':'明细!A4'}]}
+        plan=build_fact_update_plan(target,case.source,case.standard,update_purpose=purpose)
+        gold=case.folder/'标准.jsonl';gold.write_text('\n'.join(json.dumps(row,ensure_ascii=False) for row in 结构夹具.records()),encoding='utf-8')
+        plan.update(gold_path=str(gold),gold_hash=file_hash(gold))
+        pp=case.folder/'更新清单.json';pp.write_text(json.dumps(plan,ensure_ascii=False),encoding='utf-8')
+        output=case.folder/'最新槽位更新.xlsx';write_updated_workbook(target['source_path'],output,plan)
+        saved=derive_fact_mapping(target,output,plan,pp);_check_mapping(saved,read_standard_v2(gold))
+        actual=_template_cell_records(saved)
+        self.assertEqual(len(actual),4)
+        for item in plan['updates']:
+            self.assertEqual(actual[item['sheet']+'!'+item['cell']]['dimensions'],item['dimensions'])
+        self.assertEqual(actual['明细!B4']['dimensions']['asset_selection']['members'],['丙类设备'])
+
+    def test_表头改变时一次列出所有漏安排的格(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        case=结构夹具.UnifiedStructureTests();case.setUp();maps=[]
+        for year in ('2024','2025'):
+            item=case.make(year,[['项目','年末'],['甲设备',77],['乙设备',88],['丙设备',99]],
+                           [('B2','甲设备'),('B3','乙设备'),('B4','丙设备')])
+            for fact in item['facts']:
+                fact['dimensions']['period']={'kind':'instant','date':year+'-12-31'}
+                fact['dimension_evidence']['period']=['明细!B1'];item['owners'][fact['owner_reference']]=copy.deepcopy(fact['dimensions'])
+            maps.append(item)
+        purpose={'reason':'表头更新必须覆盖所管辖的全部数据格','bindings':[{'target':'明细!B2','source':'明细!B2'}],
+                 'labels':[{'target':'明细!B1','source':'明细!B1','period_source':'明细!B2'}]}
+        with self.assertRaisesRegex(ValueError,'B3.*B4'):
+            build_fact_update_plan(*maps,case.standard,update_purpose=purpose)
+
+    def test_已识别的单一名称引用随来源同步(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        case=结构夹具.UnifiedStructureTests();case.setUp()
+        a=case.make('旧名称',[['项目','期末'],['甲设备',77]],[('B2','甲设备')])
+        b=case.make('公式名称',[['项目','期末'],['乙设备',88]],[('B2','乙设备')])
+        book=load_workbook(b['source_path']);book.create_sheet('原文')['A1']='乙设备';book['明细']['A2']="='原文'!A1"
+        book.save(b['source_path']);book.close();b['source_hash']=file_hash(b['source_path']);b['facts'][0]['source_reference']['file_hash']=b['source_hash']
+        purpose={'reason':'身份已核准，按同一名称字段同步实际引用文字','bindings':[{'target':'明细!B2','source':'明细!B2'}],'labels':[]}
+        try:plan=build_fact_update_plan(a,b,case.standard,update_purpose=purpose)
+        except ValueError as error:self.fail('名称的原文引用没有同步：'+str(error))
+        self.assertEqual(plan['labels'][0]['value'],'乙设备')
+        self.assertTrue(plan['labels'][0]['source_text_reference_chain'])
+
+    def test_按已识别期间补齐同列日期表头(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        case=结构夹具.UnifiedStructureTests();case.setUp()
+        a=case.make('旧期初',[['项目','期初余额'],['甲设备',77]],[('B2','甲设备')])
+        b=case.make('新期初',[['2025年度','金额'],['甲设备',88]],[('B2','甲设备')])
+        for item,date,ref in [(a,'2024-12-31','明细!B1'),(b,'2025-01-01','明细!A1')]:
+            fact=item['facts'][0];fact['dimensions']['period']={'kind':'instant','date':date}
+            fact['dimension_evidence']['period']=[ref];item['owners'][fact['owner_reference']]=copy.deepcopy(fact['dimensions'])
+        purpose={'reason':'按原文已核准的新期初日期更新对应列','bindings':[{'target':'明细!B2','source':'明细!B2'}],'labels':[]}
+        try:plan=build_fact_update_plan(a,b,case.standard,update_purpose=purpose)
+        except ValueError as error:self.fail('实际期间已有依据，应同步列表头：'+str(error))
+        self.assertEqual(plan['labels'][0]['cell'],'B1')
+        self.assertEqual(plan['labels'][0]['value'],'2025年1月1日\n期初余额')
+
+    def test_一次列出各格未安排同步的维度(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        case=结构夹具.UnifiedStructureTests();case.setUp();maps=[]
+        for year in ('2024','2025'):
+            item=case.make(year,[['项目','年末'],['甲设备',77],['乙设备',88]],[('B2','甲设备'),('B3','乙设备')])
+            for fact in item['facts']:
+                fact['dimensions']['period']={'kind':'instant','date':year+'-12-31'}
+                item['owners'][fact['owner_reference']]=copy.deepcopy(fact['dimensions'])
+            maps.append(item)
+        purpose={'reason':'两格的期间都缺对应表头安排','bindings':[{'target':'明细!'+cell,'source':'明细!'+cell} for cell in ('B2','B3')],'labels':[]}
+        with self.assertRaisesRegex(ValueError,'B2 / period.*B3 / period'):
+            build_fact_update_plan(*maps,case.standard,update_purpose=purpose)
+
+    def test_表外标题从合法文字清单生成Word安排(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        case=结构夹具.UnifiedStructureTests();case.setUp()
+        a=case.make('旧表外标题',[['旧类别','期末'],['甲设备',11]],[('B2','甲设备')])
+        b=case.make('新表外标题',[['新类别','期末'],['甲设备',77]],[('B2','甲设备')])
+        from openpyxl.workbook.defined_name import DefinedName
+        book=load_workbook(a['source_path']);book.defined_names['附注表']=DefinedName('附注表',attr_text='明细!$A$2:$B$2')
+        book.save(a['source_path']);book.close()
+        a['source_hash']=file_hash(a['source_path']);a['facts'][0]['source_reference']['file_hash']=a['source_hash']
+        a['source_context']=[{'table_id':'测试表路径','range_name':'附注表','title':'旧类别',
+                             'sheet':'明细','first_row':2,'first_column':1,'row_count':1,'column_count':2}]
+        purpose={'reason':'来源已确认，标题与数据一起更新',
+                 'bindings':[{'target':'明细!B2','source':'明细!B2'}],
+                 'labels':[{'target':'明细!A1','source':'明细!A1'}]}
+        plan=build_fact_update_plan(a,b,case.standard,update_purpose=purpose)
+        self.assertEqual(plan.get('caption_updates'),[{'range_name':'附注表','old_text':'旧类别','text':'新类别'}])
+
+    def test_范围变化时补齐已识别的表外名称并拒绝不同来源混用(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        from openpyxl.workbook.defined_name import DefinedName
+        case=结构夹具.UnifiedStructureTests();case.setUp()
+        maps=[]
+        for title in ('旧范围','新范围'):
+            item=case.make(title,[[title,'年末'],['甲设备',77]],[('B2','甲设备')])
+            book=load_workbook(item['source_path']);book.defined_names['附注表']=DefinedName('附注表',attr_text='明细!$A$2:$B$2')
+            book.save(item['source_path']);book.close()
+            item['source_hash']=file_hash(item['source_path']);fact=item['facts'][0];fact['source_reference']['file_hash']=item['source_hash']
+            fact['dimensions']['asset_selection']={'domain':'固定资产','mode':'predicate','predicate':title,'completeness':'complete'}
+            fact['dimension_evidence']['asset_selection']=['明细!A1']
+            item['owners'][fact['owner_reference']]=copy.deepcopy(fact['dimensions'])
+            item['source_context']=[{'table_id':'测试表路径','range_name':'附注表','title':title,
+                                     'sheet':'明细','first_row':2,'first_column':1,'row_count':1,'column_count':2}]
+            maps.append(item)
+        purpose={'reason':'已经发证的范围名称须随来源更新','bindings':[{'target':'明细!B2','source':'明细!B2'}],'labels':[]}
+        original=copy.deepcopy(purpose)
+        try:plan=build_fact_update_plan(*maps,case.standard,update_purpose=purpose)
+        except ValueError as error:self.fail('已识别的表外范围名称应同步更新：'+str(error))
+        self.assertEqual(plan['labels'][0]['value'],'新范围')
+        self.assertEqual(plan['caption_updates'],[{'range_name':'附注表','old_text':'旧范围','text':'新范围'}])
+        self.assertEqual(purpose,original)
+        unsupported=copy.deepcopy(maps[1]);unsupported['facts'][0]['dimension_evidence']['asset_selection']=['明细!A9']
+        with self.assertRaises(ValueError):build_fact_update_plan(maps[0],unsupported,case.standard,update_purpose=purpose)
+
+    def test_前表增行后后表标题按实际命名区关联(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        from openpyxl.workbook.defined_name import DefinedName
+        for start,old_title,new_title in [(4,'范围甲','范围乙'),(11,'范围丙','范围丁')]:
+            with self.subTest(start=start):
+                case=结构夹具.UnifiedStructureTests();case.setUp();maps=[]
+                for title in (old_title,new_title):
+                    rows=[['项类','期末'],['甲设备',77]]+[[None,None] for _ in range(start-3)]+[[title,None],['乙设备',88]]
+                    item=case.make(title,rows,[('B2','甲设备'),(f'B{start+1}','乙设备')])
+                    book=load_workbook(item['source_path'])
+                    book.defined_names['附注表']=DefinedName('附注表',attr_text='明细!$A$1:$B$2')
+                    book.defined_names['后表']=DefinedName('后表',attr_text=f'明细!$A${start+1}:$B${start+1}')
+                    book.active[f'A{start}']=title;book.save(item['source_path']);book.close()
+                    item['source_hash']=file_hash(item['source_path'])
+                    for fact in item['facts']:fact['source_reference']['file_hash']=item['source_hash']
+                    fact=item['facts'][1]
+                    fact['dimensions']['asset_selection']={'domain':'固定资产','mode':'predicate','predicate':title,'completeness':'complete'}
+                    fact['dimension_evidence']['asset_selection']=[f'明细!A{start}','明细!A1']
+                    item['owners'][fact['id']]=copy.deepcopy(fact['dimensions'])
+                    item['source_context']=[{'table_id':'后表路径','range_name':'后表','title':title,'sheet':'明细',
+                        'first_row':start+1,'first_column':1,'row_count':1,'column_count':2}]
+                    maps.append(item)
+                purpose={'reason':'前表扩行后，后表已识别范围仍须随来源更新',
+                    'operations':[{'range_name':'附注表','axis':'row','action':'insert','index':2,'count':1,'template_index':1,
+                        'reason':'已确认完整类别名单新增一行'}],
+                    'bindings':[{'target':f'明细!B{r}','source':'明细!B2'} for r in (2,3)]+
+                        [{'target':f'明细!B{start+2}','source':f'明细!B{start+1}'}],
+                    'labels':[{'target':'明细!A3','source':'明细!A2'}]}
+                original=copy.deepcopy(maps[0])
+                plan=build_fact_update_plan(*maps,case.standard,update_purpose=purpose)
+                self.assertEqual(plan['issues'],[])
+                self.assertEqual(plan['caption_updates'],[{'range_name':'后表','old_text':old_title,'text':new_title}])
+                self.assertEqual(next(x for x in plan['labels'] if x['cell']==f'A{start+1}')['value'],new_title)
+                self.assertEqual(maps[0],original)
+
+    def test_公共表外名称不取各列的局部表头(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        from openpyxl.workbook.defined_name import DefinedName
+        case=结构夹具.UnifiedStructureTests();case.setUp();maps=[]
+        for title in ('旧总范围','新总范围'):
+            item=case.make(title,[[title,None,None],['项目','阶段一','阶段二'],['甲设备',77,88]],
+                           [('B3','甲设备'),('C3','甲设备')])
+            book=load_workbook(item['source_path']);book.defined_names['附注表']=DefinedName('附注表',attr_text='明细!$A$2:$C$3')
+            book.save(item['source_path']);book.close();item['source_hash']=file_hash(item['source_path'])
+            for index,fact in enumerate(item['facts']):
+                fact['source_reference']['file_hash']=item['source_hash']
+                fact['dimensions']['asset_selection']={'domain':'固定资产','mode':'predicate','predicate':title+str(index),'completeness':'complete'}
+                fact['dimension_evidence']['asset_selection']=['明细!A1','明细!'+('B2' if index==0 else 'C2')]
+                item['owners'][fact['owner_reference']]=copy.deepcopy(fact['dimensions'])
+            item['source_context']=[{'table_id':'测试表路径','range_name':'附注表','title':title,
+                                     'sheet':'明细','first_row':2,'first_column':1,'row_count':2,'column_count':3}]
+            maps.append(item)
+        purpose={'reason':'公共标题与各列表头分层保留','bindings':[{'target':'明细!'+cell,'source':'明细!'+cell} for cell in ('B3','C3')],'labels':[]}
+        try:plan=build_fact_update_plan(*maps,case.standard,update_purpose=purpose)
+        except ValueError as error:self.fail('共同标题不能取各列局部表头：'+str(error))
+        self.assertEqual(plan['caption_updates'],[{'range_name':'附注表','old_text':'旧总范围','text':'新总范围'}])
+
+    def test_相同原文名称接续不同集合表达的来源依据(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        case=结构夹具.UnifiedStructureTests();case.setUp();maps=[]
+        for members in (['甲设备','乙设备'],['甲设备或乙设备']):
+            item=case.make('共同原文'+str(len(maps)),[['项目','年末'],['甲设备或乙设备',77]],[('B2','甲设备或乙设备')])
+            fact=item['facts'][0];fact['dimensions']['asset_selection']['members']=members
+            item['owners'][fact['owner_reference']]=copy.deepcopy(fact['dimensions']);maps.append(item)
+        purpose={'reason':'以B已确认身份更新，原文名称相同仍接续来源依据',
+                 'bindings':[{'target':'明细!B2','source':'明细!B2'}],'labels':[]}
+        try:plan=build_fact_update_plan(*maps,case.standard,update_purpose=purpose)
+        except ValueError as error:self.fail('相同原文依据没有接续：'+str(error))
+        self.assertEqual(plan['labels'][0]['value'],'甲设备或乙设备')
+        self.assertEqual(plan['updates'][0]['dimensions']['asset_selection']['members'],['甲设备或乙设备'])
+
     def test_先删行再增行时新格名称依据不能退回模板行(self):
         from 测试 import 测试统一结构 as 结构夹具
         case=结构夹具.UnifiedStructureTests();case.setUp()
@@ -50,6 +260,29 @@ class 模板维度取数测试(unittest.TestCase):
         plan=build_fact_update_plan(*maps,case.standard,update_purpose=purpose)
         self.assertEqual(plan['issues'],[]);self.assertEqual(plan['labels'][0]['value'],'其他（范围包含：乙设备）')
         self.assertEqual(plan['updates'][0]['dimensions']['asset_selection']['excluded'],['甲设备'])
+
+    def test_其他范围已用完整条件表达时随B更新说明(self):
+        from 测试 import 测试统一结构 as 结构夹具
+        case=结构夹具.UnifiedStructureTests();case.setUp();maps=[]
+        for name,predicate in [('旧其他条件','固定资产中除甲、乙设备以外的其他'),('新其他条件','固定资产中除甲设备以外的其他')]:
+            item=case.make(name,[['项目','余额'],['其他',12]],[('B2','其他')])
+            item['facts'][0]['dimensions']['asset_selection']={'domain':'固定资产','mode':'predicate',
+                'predicate':predicate,'completeness':'complete'}
+            item['owners']['明细!B2']=copy.deepcopy(item['facts'][0]['dimensions']);maps.append(item)
+        purpose={'reason':'按已识别的完整条件说明其他的实际范围，不解析或改写语义',
+            'bindings':[{'target':'明细!B2','source':'明细!B2'}],
+            'labels':[{'target':'明细!A2','source':'明细!A2','selection_source':'明细!B2','selection_dimension':'asset_selection'}]}
+        original=copy.deepcopy(maps)
+        plan=build_fact_update_plan(*maps,case.standard,update_purpose=purpose)
+        self.assertEqual(plan['issues'],[])
+        self.assertEqual(plan['labels'][0]['value'],'其他（范围：固定资产中除甲设备以外的其他）')
+        self.assertEqual(plan['updates'][0]['dimensions']['asset_selection'],maps[1]['facts'][0]['dimensions']['asset_selection'])
+        same=build_fact_update_plan(maps[1],maps[1],case.standard,update_purpose=purpose)
+        self.assertEqual(same['labels'][0]['value'],'其他')
+        missing=copy.deepcopy(maps[1]);missing['facts'][0]['dimension_evidence']['asset_selection']=['明细!A1']
+        with self.assertRaisesRegex(ValueError,'范围说明须有B原文'):
+            build_fact_update_plan(maps[0],missing,case.standard,update_purpose=purpose)
+        self.assertEqual(maps,original)
 
     def test_原期间来自表外时可明确写入对应列表头(self):
         from 测试 import 测试统一结构 as 结构夹具
@@ -296,6 +529,12 @@ class 模板维度取数测试(unittest.TestCase):
         self.assertEqual(total['sources'][0]['cell'],'B5')
 
     def test_空白名单按已绑定行搬值并保留未填姓名(self):
+        self.核验空白名单()
+
+    def test_缺主体槽位保存时不冒充完整业务对象(self):
+        self.核验空白名单(missing_entity=True)
+
+    def 核验空白名单(self,missing_entity=False):
         from 测试 import 测试统一结构 as 结构夹具
         case=结构夹具.UnifiedStructureTests();case.setUp()
         a=case.target
@@ -310,6 +549,9 @@ class 模板维度取数测试(unittest.TestCase):
         known['dimensions']['asset_selection']={'domain':'固定资产','mode':'unknown','completeness':'unknown'}
         known['dimension_evidence']={k:['明细!A1'] for k in known['dimensions']}
         known.update(missing_dimensions=[],evidence_cells=['明细!A1'])
+        if missing_entity:
+            known['dimensions'].pop('entity');known['dimension_evidence'].pop('entity')
+            known['missing_dimensions']=['entity'];b['owners'].pop(item['owner_reference'])
         b.update(slot_binding_version=1,semantic_reading={'synthetic':True},slot_bindings=[
             {'sheet':'明细','cell':'B2','partial_semantics':known,'recognition_provenance':item['recognition_provenance']}])
         purpose={'reason':'以B一行空白姓名的明细替换A两行旧名单',
@@ -337,6 +579,10 @@ class 模板维度取数测试(unittest.TestCase):
         saved=derive_fact_mapping(a,output,plan,pp)
         _check_mapping(saved,read_standard_v2(gold))
         self.assertEqual(len(saved['facts']),1)
+        if missing_entity:
+            self.assertEqual(saved['slot_bindings'][0]['partial_semantics']['dimensions']['entity'],a['facts'][0]['dimensions']['entity'])
+            self.assertNotIn('entity',b['slot_bindings'][0]['partial_semantics']['dimensions'])
+            self.assertEqual(set(saved['owners']),{row['owner_reference'] for row in saved['facts']})
         self.assertEqual(saved['slot_bindings'][0]['cell'],'B2')
         self.assertEqual(saved['slot_bindings'][0]['partial_semantics']['dimensions']['asset_selection'],known['dimensions']['asset_selection'])
         book=load_workbook(output)
@@ -344,6 +590,12 @@ class 模板维度取数测试(unittest.TestCase):
         book.close()
 
     def test_名单增行沿用模板并保存所有新旧格的实际维度(self):
+        self.核验名单增行()
+
+    def test_Word表区增行不登记旁侧不存在的空位(self):
+        self.核验名单增行(word_table=True)
+
+    def 核验名单增行(self,word_table=False):
         from 测试 import 测试统一结构 as 结构夹具
         case=结构夹具.UnifiedStructureTests();case.setUp()
         book=load_workbook(case.target['source_path']);book.active['D8']='旁侧说明';book.save(case.target['source_path']);book.close()
@@ -352,6 +604,7 @@ class 模板维度取数测试(unittest.TestCase):
         from 附注更新.统一语义 import definition_hash
         from 附注更新.统一证据 import context_catalog, resolve_context
         context={'text':'本表按资产类别列示','sheet':'明细','first_row':1,'first_column':1,'row_count':4,'column_count':2}
+        if word_table:context.update(table_id='原Word表路径',range_name='附注表')
         case.target['source_context']=[context]
         old_reference='@context:'+definition_hash(context)
         case.target['facts'][-1]['dimension_evidence']['asset_selection'].append(old_reference)
@@ -360,7 +613,7 @@ class 模板维度取数测试(unittest.TestCase):
         paths=[]
         for side,item in [('A',case.target),('B',case.source)]:
             item.update(gold_path=str(gold),gold_hash=file_hash(gold),unresolved=[])
-            snapshot=read_workbook(item['source_path']);materialize_candidate_blanks(snapshot)
+            snapshot=read_workbook(item['source_path'],context=item.get('source_context',[]));materialize_candidate_blanks(snapshot)
             financial={r['source_reference']['location'] for r in item['facts']}
             item['excluded']=[{'sheet':s['name'],'cell':address,'category':'label','reason':'测试表的标题或留白'}
                               for s in snapshot['sheets'] for address in s['cells'] if s['name']+'!'+address not in financial]
@@ -383,7 +636,8 @@ class 模板维度取数测试(unittest.TestCase):
         self.assertEqual(next(r for r in saved['facts'] if r['id']=='明细!B4')['dimensions']['asset_selection']['members'],['丙类设备'])
         total=next(r for r in saved['facts'] if r['id']=='明细!B5')
         reference=total['dimension_evidence']['asset_selection'][-1]
-        self.assertNotEqual(reference,old_reference)
+        if word_table:self.assertEqual(reference,old_reference)
+        else:self.assertNotEqual(reference,old_reference)
         catalog=context_catalog(saved['source_context'],saved['source_path'])
         self.assertEqual(resolve_context(reference,catalog,'明细!B5')['scope']['bounds'],[1,1,5,2])
         with self.assertRaises(ValueError):resolve_context(reference,catalog,'明细!B6')

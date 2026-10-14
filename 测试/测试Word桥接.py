@@ -68,6 +68,78 @@ class WordBridgeTests(unittest.TestCase):
         self.assertEqual(result["table_count"], 1)
         return excel, linked, context
 
+    def test_表外标题随所属表更新且同名其他段落保留(self):
+        word = self.folder / '两张同名标题原件.docx'
+        doc = Document()
+        doc.add_heading('六、合并财务报表项目注释', level=1)
+        for value in ('20', '30'):
+            caption = doc.add_paragraph('旧资产类别')
+            caption.runs[0].bold = True
+            table = doc.add_table(rows=2, cols=2)
+            for row, values in zip(table.rows, [('项目', '余额'), ('明细', value)]):
+                for cell, text in zip(row.cells, values): cell.text = text
+        doc.save(word)
+        original = word.read_bytes()
+        excel, linked, context = (self.folder / name for name in ('两表.xlsx', '两表连接.docx', '两表上下文.json'))
+        self.call('extract', word=word, excel=excel, linked_word=linked, context=context,
+                  chapter_title='合并财务报表项目注释')
+        output = self.folder / '标题更新.docx'
+        self.call('update', word=linked, excel=excel, output=output,
+                  chapter_title='合并财务报表项目注释',
+                  caption_updates=[{'range_name': 'TA_001', 'old_text': '旧资产类别', 'text': '新资产类别'}])
+        actual = Document(output)
+        self.assertEqual([p.text for p in actual.paragraphs if '资产类别' in p.text], ['新资产类别', '旧资产类别'])
+        self.assertTrue(next(p for p in actual.paragraphs if p.text == '新资产类别').runs[0].bold)
+        self.assertEqual([[r.cells[1].text for r in t.rows[1:]] for t in actual.tables], [['20'], ['30']])
+        self.assertEqual(word.read_bytes(), original)
+        with zipfile.ZipFile(linked) as before, zipfile.ZipFile(output) as after:
+            for name in before.namelist():
+                if name != 'word/document.xml': self.assertEqual(before.read(name),after.read(name),name)
+
+    def test_标题校对标记保留而文字更新(self):
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        doc=Document();doc.add_heading('六、合并财务报表项目注释',level=1)
+        caption=doc.add_paragraph()
+        for kind,text in [('gramStart','旧'),('gramEnd','设备范围')]:
+            marker=OxmlElement('w:proofErr');marker.set(qn('w:type'),kind);caption._p.append(marker)
+            caption.add_run(text).bold=True
+        table=doc.add_table(rows=1,cols=2);table.cell(0,0).text='明细';table.cell(0,1).text='77'
+        word=self.folder/'带校对标记.docx';doc.save(word)
+        excel,linked,context=(self.folder/name for name in ('校对表.xlsx','校对连接.docx','校对上下文.json'))
+        self.call('extract',word=word,excel=excel,linked_word=linked,context=context,chapter_title='合并财务报表项目注释')
+        output=self.folder/'校对标题更新.docx'
+        self.call('update',word=linked,excel=excel,output=output,chapter_title='合并财务报表项目注释',
+            caption_updates=[{'range_name':'TA_001','old_text':'旧设备范围','text':'新设备范围'}])
+        actual=next(p for p in Document(output).paragraphs if p.text=='新设备范围')
+        self.assertTrue(actual.runs[0].bold)
+        self.assertEqual([node.get(qn('w:type')) for node in actual._p if node.tag==qn('w:proofErr')],['gramStart','gramEnd'])
+        with zipfile.ZipFile(linked) as before,zipfile.ZipFile(output) as after:
+            for name in before.namelist():
+                if name!='word/document.xml':self.assertEqual(before.read(name),after.read(name),name)
+
+    def test_标题含复杂域时仍拒绝发布(self):
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        doc=Document();doc.add_heading('六、合并财务报表项目注释',level=1);caption=doc.add_paragraph()
+        field=OxmlElement('w:fldSimple');field.set(qn('w:instr'),'DATE')
+        run=OxmlElement('w:r');text=OxmlElement('w:t');text.text='日期范围';run.append(text);field.append(run);caption._p.append(field)
+        table=doc.add_table(rows=1,cols=1);table.cell(0,0).text='77'
+        word=self.folder/'复杂域标题.docx';doc.save(word)
+        excel,linked,context=(self.folder/name for name in ('域表.xlsx','域连接.docx','域上下文.json'))
+        self.call('extract',word=word,excel=excel,linked_word=linked,context=context,chapter_title='合并财务报表项目注释')
+        output=self.folder/'域标题不得发布.docx'
+        self.call('update',success=False,word=linked,excel=excel,output=output,
+            caption_updates=[{'range_name':'TA_001','old_text':'日期范围','text':'新范围'}])
+        self.assertFalse(output.exists())
+
+    def test_表外标题原文不符时拒绝发布(self):
+        excel, linked, _ = self.extract()
+        output = self.folder / '无效标题更新.docx'
+        self.call('update', success=False, word=linked, excel=excel, output=output,
+                  caption_updates=[{'range_name': 'TA_001', 'old_text': '其他表的标题', 'text': '不能冒用'}])
+        self.assertFalse(output.exists())
+
     def save_changed(self, excel, rows):
         book = load_workbook(excel)
         sheet = book["sheet1"]

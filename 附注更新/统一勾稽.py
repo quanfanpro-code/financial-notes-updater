@@ -370,6 +370,7 @@ def verify_fact_update_plan(plan, target, source, standard):
         row['semantic_field']=' / '.join(definition[key] for key in ('economic_object','measure','measurement_basis'))
     for key in ('updates','retained_blanks','unprovided_fields','operations','labels','unplaced_sources','source_a_hash','source_b_hash','template_layout'):
         _require(plan.get(key)==fresh.get(key),'清单与重新语义取数不一致：'+key)
+    _require(plan.get('caption_updates',[])==fresh.get('caption_updates',[]),'标题安排与重新语义取数不一致')
     fresh['_working_target']=original_target if scope else target
     return fresh
 
@@ -386,6 +387,8 @@ def derive_fact_mapping(parent, source_path, plan, plan_path, word_link=None):
         parent=relocate_mapping(parent,plan['template_layout'])
     path=Path(source_path).resolve(); digest=hashlib.sha256(path.read_bytes()).hexdigest()
     result=deepcopy(parent)
+    result['facts']=[row for row in result['facts'] if row['record_type']!='metric_fact']+list(_template_cell_records(parent).values())
+    result['slot_bindings']=[]
     for key in ('packet_mappings','request_receipts','mapping_hash','mapping_path','a_link','review_path',
                 'calculation_evidence','formula_values','calculation_issues','_validated_standard_hash','reused_mapping',
                 'classification_rounds','equivalence_proofs','external_review_v2','outline','recognition_scope',
@@ -431,6 +434,8 @@ def derive_fact_mapping(parent, source_path, plan, plan_path, word_link=None):
                 result['slot_binding_version']=1
             else:full.append(row)
         result['facts']=full
+        used_owners={row.get('owner_reference') for row in full}
+        result['owners']={key:value for key,value in result['owners'].items() if key in used_owners}
     updates={(row['sheet'],row['cell']):row for row in [*plan['updates'],*plan.get('labels',[])]}
     # openpyxl 保存会把空字符串格归一化为 None；两种表示同为空白，与写入回读校验一致。
     def _same_value(actual,wanted):return same_excel_value(actual,wanted)
@@ -463,8 +468,9 @@ def derive_fact_mapping(parent, source_path, plan, plan_path, word_link=None):
     if plan.get('template_layout'):
         occupied={r['source_reference']['location'] for r in result['facts']}
         occupied.update(r['sheet']+'!'+r['cell'] for kind in ('excluded','unresolved','slot_bindings') for r in result.get(kind,[]))
+        actual_cells={sheet['name']+'!'+cell for sheet in snapshot['sheets'] for cell in sheet['cells']}
         for location,item in plan['template_layout']['added'].items():
-            if location not in occupied:
+            if location not in occupied and location in actual_cells:
                 sheet,cell=location.rsplit('!',1)
                 result.setdefault('excluded',[]).append({'sheet':sheet,'cell':cell,'category':'label','reason':'模板增行的名称或留白，财务格已另行绑定'})
     result['coverage']=workbook_coverage(result,snapshot);result['complete']=result['coverage']['complete']
@@ -516,14 +522,15 @@ def _template_cell_records(mapping):
     try:
         for item in mapping['slot_bindings']:
             location=item['sheet']+'!'+item['cell'];known=item['partial_semantics']
-            original=next((old for old,new in mapping.get('_template_layout',{}).get('positions',{}).items() if new==location),location)
+            layout=mapping.get('_template_layout',{});added=layout.get('added',{}).get(location)
+            original=added['template'] if added else next((old for old,new in layout.get('positions',{}).items() if new==location),location)
             sh,address=original.rsplit('!',1);cell=book[sh][address]
             rows[location]={'id':location,'record_type':'metric_fact','owner_reference':location,
                 **{k:deepcopy(known[k]) for k in ('metric_id','dimensions','dimension_evidence')},
                 'source_reference':{'file_hash':mapping['source_hash'],'location':location},
                 'recognition_provenance':deepcopy(item['recognition_provenance']),
-                'raw_value':_plain(cell.value),'raw_value_state':'formula' if cell.data_type=='f' else
-                ('blank' if cell.value is None or isinstance(cell.value,str) and not cell.value.strip() else 'value')}
+                'raw_value':None if added else _plain(cell.value),'raw_value_state':'blank' if added else ('formula' if cell.data_type=='f' else
+                ('blank' if cell.value is None or isinstance(cell.value,str) and not cell.value.strip() else 'value'))}
     finally:book.close()
     return rows
 
@@ -532,6 +539,7 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
     """本次模板的维度取自已确定B来源，原始识别不改写。"""
     if not purpose:return mapping
     if 'bindings' in purpose:
+        purpose=deepcopy(purpose)
         _require({'bindings','labels','reason'}<=set(purpose)<={'bindings','labels','reason','operations','unprovided'} and isinstance(purpose['reason'],str) and purpose['reason'].strip(), '模板更新须有明确依据')
         _require(source is not None and standard is not None,'模板更新缺少B及金标准')
         view=deepcopy(mapping)
@@ -555,7 +563,116 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
         try:
             from .表格 import _apply_operation
             for operation in purpose.get('operations',[]):_apply_operation(a,operation)
+            from .统一证据 import context_catalog
+            caption_contexts=[]
+            for record in context_catalog(view.get('source_context',[]),workbook=a).values():
+                item,scope=record['content'],record['scope']
+                if not (isinstance(item,dict) and item.get('range_name') and scope):continue
+                top,left,bottom,right=scope['bounds']
+                caption_contexts.append({**item,'first_row':top,'first_column':left,
+                    'row_count':bottom-top+1,'column_count':right-left+1})
+            period_headers=defaultdict(list)
+            from openpyxl.utils.cell import coordinate_to_tuple,range_boundaries
+            from .表格 import _definitions,_destinations
+            named_ranges=[(sh,*range_boundaries(area)) for definition in _definitions(a) for sh,area in _destinations(definition)]
+            for destination,origin in bound.items():
+                old,new=targets[destination],sources[origin]
+                if old['dimensions'].get('period')==new['dimensions'].get('period'):continue
+                before_refs=old['dimension_evidence'].get('period',[]);after_refs=new['dimension_evidence'].get('period',[])
+                if any((destination in label.get('period_targets',[]) or label['target'] in before_refs)
+                       and label['source'] in after_refs and (label.get('period_source') or label.get('period_sources'))
+                       for label in purpose['labels']):continue
+                sheet,address=destination.rsplit('!',1);row,column=coordinate_to_tuple(address);headers=[]
+                for ref in before_refs:
+                    if ref.startswith('@context:') or ref in targets:continue
+                    sh,cell=ref.rsplit('!',1);r,c=coordinate_to_tuple(cell)
+                    if (sh==sheet and c==column and r<row and isinstance(a[sh][cell].value,str)
+                            and any(s==sheet and left<=column<=right and top<=r<row<=bottom for s,left,top,right,bottom in named_ranges)):
+                        headers.append((r,ref))
+                if headers:period_headers[max(headers)[1]].append((destination,origin,after_refs))
+            for header,items in period_headers.items():
+                common=set.intersection(*(set(refs) for _,_,refs in items))
+                choices=[]
+                for ref in common:
+                    if ref.startswith('@context:') or ref in sources:continue
+                    sheet,cell=ref.rsplit('!',1);row,_=coordinate_to_tuple(cell)
+                    if isinstance(b[sheet][cell].value,str):choices.append((row,ref))
+                if not choices:continue
+                source_header=max(choices)[1]
+                existing=next((label for label in purpose['labels'] if label['target']==header),None)
+                if existing is not None and existing['source']!=source_header:continue
+                label=existing if existing is not None else {'target':header,'source':source_header,'preserve_text':True}
+                label.update(period_sources=list(dict.fromkeys(origin for _,origin,_ in items)),
+                             period_targets=list(dict.fromkeys(destination for destination,_,_ in items)))
+                label.pop('period_source',None)
+                if existing is None:purpose['labels'].append(label)
+            caption_sources=defaultdict(list)
+            from openpyxl.utils.cell import coordinate_to_tuple,get_column_letter
+            for destination,origin in bound.items():
+                old,new=targets[destination],sources[origin]
+                target_sheet,target_address=destination.rsplit('!',1);target_row,target_col=coordinate_to_tuple(target_address)
+                source_sheet,source_address=origin.rsplit('!',1);source_row,_=coordinate_to_tuple(source_address)
+                for key,value in new['dimensions'].items():
+                    if old['dimensions'].get(key)==value or standard['dimension'][key]['value_type']!='selection':continue
+                    before_refs=old['dimension_evidence'].get(key,[]);after_refs=new['dimension_evidence'][key]
+                    if any(item['target'] in before_refs and any(ref in after_refs for ref in [item['source'],*item.get('source_aliases',[])])
+                           for item in purpose['labels']):continue
+                    identical=[]
+                    for left in before_refs:
+                        if left.startswith('@context:') or left in targets:continue
+                        sh,cell=left.rsplit('!',1);text=a[sh][cell].value
+                        if not isinstance(text,str) or not text.strip() or a[sh][cell].data_type=='f':continue
+                        for right in after_refs:
+                            if right.startswith('@context:') or right in sources:continue
+                            source_sh,source_cell=right.rsplit('!',1)
+                            if b[source_sh][source_cell].data_type!='f' and b[source_sh][source_cell].value==text:
+                                identical.append((left,right))
+                    if len(identical)==1 and not any(item['target']==identical[0][0] for item in purpose['labels']):
+                        left,right=identical[0];purpose['labels'].append({'target':left,'source':right})
+                    elif len(identical)==1:
+                        left,right=identical[0]
+                        existing=next(item for item in purpose['labels'] if item['target']==left)
+                        if existing.get('preserve_text') and right!=existing['source']:
+                            aliases=existing.setdefault('source_aliases',[])
+                            if right not in aliases:aliases.append(right)
+                    else:
+                        before_labels=[ref for ref in before_refs if not ref.startswith('@context:') and ref not in targets]
+                        after_labels=[ref for ref in after_refs if not ref.startswith('@context:') and ref not in sources]
+                        if len(before_labels)==len(after_labels)==1 and not any(label['target']==before_labels[0] for label in purpose['labels']):
+                            left,right=before_labels[0],after_labels[0]
+                            sh,cell=left.rsplit('!',1);source_sh,source_cell=right.rsplit('!',1)
+                            if isinstance(a[sh][cell].value,str) and isinstance(b[source_sh][source_cell].value,str):
+                                purpose['labels'].append({'target':left,'source':right})
+                    for context in caption_contexts:
+                        if not (isinstance(context,dict) and context.get('range_name') and context.get('sheet')==target_sheet
+                                and context['first_row']<=target_row<context['first_row']+context['row_count']
+                                and context['first_column']<=target_col<context['first_column']+context['column_count']):continue
+                        caption=f"{target_sheet}!{get_column_letter(context['first_column'])}{context['first_row']-1}"
+                        if caption not in before_refs or a[target_sheet][caption.rsplit('!',1)[1]].value!=context.get('title'):continue
+                        candidates=[]
+                        for ref in after_refs:
+                            if ref.startswith('@context:') or ref in sources:continue
+                            sh,cell=ref.rsplit('!',1);row,_=coordinate_to_tuple(cell)
+                            if sh==source_sheet and row<source_row and isinstance(b[sh][cell].value,str) and b[sh][cell].data_type!='f':
+                                candidates.append((row,ref))
+                        if candidates:
+                            caption_sources[caption].append({ref for _,ref in candidates})
+            for caption,groups in caption_sources.items():
+                if any(item['target']==caption for item in purpose['labels']):continue
+                origins=set.intersection(*groups)
+                if origins:
+                    nearest=max(coordinate_to_tuple(ref.rsplit('!',1)[1])[0] for ref in origins)
+                    origins={ref for ref in origins if coordinate_to_tuple(ref.rsplit('!',1)[1])[0]==nearest}
+                else:origins=set.union(*groups)
+                origins=sorted(origins)
+                texts={b[ref.rsplit('!',1)[0]][ref.rsplit('!',1)[1]].value for ref in origins}
+                _require(len(texts)==1,'同一表外名称的B原文不一致，须核准来源：'+caption)
+                purpose['labels'].append({'target':caption,'source':origins[0],
+                    **({'source_aliases':origins[1:]} if len(origins)>1 else {})})
             occupied=set()
+            label_targets={ref for row in targets.values() for refs in row['dimension_evidence'].values() for ref in refs if not ref.startswith('@context:')}
+            label_targets.update(f"{item['sheet']}!{get_column_letter(item['first_column'])}{item['first_row']-1}"
+                                 for item in caption_contexts if item.get('first_row'))
             for item in purpose['labels']:
                 _require({'target','source'}<=set(item)<={'target','source','source_aliases','period_source','period_sources','period_targets','preserve_text','selection_source','selection_dimension'},'模板文字须绑定实际来源位置')
                 _require(not ('period_source' in item and 'period_sources' in item),'期间来源不能重复声明')
@@ -568,6 +685,7 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
                 sheet,cell=destination.rsplit('!',1);source_sheet,source_cell=origin.rsplit('!',1)
                 _require(sheet in a and source_sheet in b,'维度文字工作表不存在')
                 period_targets=item.get('period_targets',[])
+                _require(destination in label_targets or period_targets,'维度文字没有对应的财务格或合法表头：'+destination)
                 _require(isinstance(period_targets,list) and all(isinstance(ref,str) for ref in period_targets)
                          and len(period_targets)==len(set(period_targets)) and (not period_targets or period_locations),
                          '新期间表头须明确所应用的数据格及B实际期间')
@@ -603,7 +721,8 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
                     if aliased.data_type=='f':
                         from .同义复核 import _referenced_text
                         alias_value=_referenced_text(b,alias_sheet,alias_cell)['text']
-                    _require(alias_value==text_value,'同一A名称的各处B原文不一致')
+                    _require(alias_value==(_plain(a[sheet][cell].value) if item.get('preserve_text') else text_value),
+                             '同一A名称的各处B原文不一致')
                 _require(('selection_source' in item)==('selection_dimension' in item),'范围说明须同时指定B来源及选择维度')
                 if 'selection_source' in item:
                     reference,key=item['selection_source'],item['selection_dimension']
@@ -611,17 +730,22 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
                     selected=sources[reference]['dimensions'][key]
                     previous=[targets[loc]['dimensions'][key] for loc in bound
                               if destination in targets[loc]['dimension_evidence'].get(key,[])]
-                    _require(standard['dimension'][key]['value_type']=='selection' and selected['mode']=='complement'
+                    _require(standard['dimension'][key]['value_type']=='selection' and selected['mode'] in {'complement','predicate'}
                              and selected['completeness']=='complete' and origin in sources[reference]['dimension_evidence'][key],
                              '范围说明须有B原文及明确排除范围')
-                    _require(previous and all(value==previous[0] and value['mode']=='complement' and value['completeness']=='complete'
-                             and value['domain']==selected['domain'] and value['base']==selected['base'] for value in previous),
+                    _require(previous and all(value==previous[0] and value['completeness']=='complete'
+                             and value['domain']==selected['domain'] for value in previous),
                              '同一名称的原范围不一致，须分别说明')
-                    included=[value for value in previous[0]['excluded'] if value not in selected['excluded']]
-                    excluded=[value for value in selected['excluded'] if value not in previous[0]['excluded']]
                     notes=[]
-                    if included:notes.append('范围包含：'+'、'.join(included))
-                    if excluded:notes.append('范围不含：'+'、'.join(excluded))
+                    if selected['mode']=='predicate':
+                        if selected!=previous[0]:notes.append('范围：'+selected['predicate'])
+                    else:
+                        _require(previous[0]['mode']=='complement' and previous[0]['base']==selected['base'],
+                                 '同一名称的原范围不一致，须分别说明')
+                        included=[value for value in previous[0]['excluded'] if value not in selected['excluded']]
+                        excluded=[value for value in selected['excluded'] if value not in previous[0]['excluded']]
+                        if included:notes.append('范围包含：'+'、'.join(included))
+                        if excluded:notes.append('范围不含：'+'、'.join(excluded))
                     if notes:text_value=str(text_value)+'（'+'；'.join(notes)+'）'
                 if period_locations:
                     periods=[]
@@ -674,7 +798,7 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
                         'cells':{cell.coordinate:{'value':_plain(cell.value)} for row in a[sh] for cell in row}}
                 response={'kind':'metric_fact','metric_id':old['metric_id'],'dimensions':dimensions,
                           'dimension_evidence':{key:[ref.removeprefix(sh+'!') for ref in refs] for key,refs in evidence.items()},'reason':item['reason']}
-                checked=validate_response({'cells':{address:response}},packet,standard)[address]['fact']
+                checked=validate_response({'cells':{address:response}},packet,standard,context_workbook=a)[address]['fact']
                 _require(all(dimensions.get('period') in copied_periods[header] for header,refs in copied_period_targets.items() if destination in refs),
                          '未提供字段的期间与本次表头不一致')
                 key=semantic_key(checked,standard)
@@ -688,15 +812,21 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
                 unprovided[destination]={'action':action,'reason':item['reason'],'source_evidence':deepcopy(item['source_evidence'])}
                 old['dimensions']=dimensions;old['dimension_evidence']=checked['dimension_evidence']
                 old['owner_reference']=old['id'];view['owners'][old['owner_reference']]=deepcopy(dimensions)
+            unhandled_labels=[]
             for destination,row in targets.items():
                 if destination in bound or destination in unprovided:continue
-                _require(not any(label['sheet']+'!'+label['cell'] in refs and not same_excel_value(label['old_value'],label['value'])
-                                 for refs in row['dimension_evidence'].values() for label in labels),
-                         '名称或期间改变后，引用此文字的每个数据格须重新绑定或核实未提供：'+destination)
-                _require(not any(destination in refs for refs in copied_period_targets.values()),'新期间表头对应的数据格未安排处理：'+destination)
+                if (any(label['sheet']+'!'+label['cell'] in refs and not same_excel_value(label['old_value'],label['value'])
+                        for refs in row['dimension_evidence'].values() for label in labels)
+                        or any(destination in refs for refs in copied_period_targets.values())):
+                    unhandled_labels.append(destination)
+            _require(not unhandled_labels,'名称或期间改变后，所管辖的数据格须重新绑定或核实未提供：'+'；'.join(unhandled_labels))
+            unlinked_dimensions=[]
             for destination,origin in bound.items():
                 old,new=targets[destination],sources[origin]
                 dimensions=deepcopy(new['dimensions'])
+                for key in ('entity','report_scope'):
+                    if key not in dimensions and key in old['dimensions']:
+                        dimensions[key]=deepcopy(old['dimensions'][key])
                 period_labels=[(left,right) for left,right in copied_text
                     if left in copied_periods and (left in old['dimension_evidence'].get('period',[]) or destination in copied_period_targets.get(left,[]))]
                 linked_period_labels=[(left,right) for left,right in period_labels
@@ -727,9 +857,10 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
                             linked=linked or any(left in old['dimension_evidence'].get(key,[]) and
                                 right.rsplit('!',1)[0]==sh and coordinate_to_tuple(right.rsplit('!',1)[1])[0]==coordinate_to_tuple(addr)[0] and
                                 b[sh][right.rsplit('!',1)[1]].value is None for left,right in copied_text)
-                        _require(linked,'维度变化须同步更新本格对应的文字：'+destination+' / '+key)
+                        if not linked:unlinked_dimensions.append(destination+' / '+key)
                 old['dimensions']=dimensions
                 old['owner_reference']=old['id'];view['owners'][old['owner_reference']]=deepcopy(old['dimensions'])
+            _require(not unlinked_dimensions,'维度变化须同步更新对应的文字：'+'；'.join(unlinked_dimensions))
             if view.get('_template_layout'):
                 original={r['source_reference']['location'] for r in mapping['facts']}
                 for destination,item in view['_template_layout']['added'].items():
@@ -742,6 +873,11 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
         view['facts'].extend(targets[location] for location in bound if location not in existing)
         view['slot_bindings']=[r for r in view.get('slot_bindings',[]) if r['sheet']+'!'+r['cell'] not in bound]
         view['_purpose_sources']=bound;view['_purpose_labels']=labels
+        view['_purpose_caption_updates']=[{'range_name':item['range_name'],'old_text':label['old_value'],'text':label['value']}
+            for label in labels if not same_excel_value(label['value'],label['old_value']) for item in caption_contexts
+            if item['sheet']==label['sheet'] and item.get('title')==label['old_value']
+            and label['cell']==f"{get_column_letter(item['first_column'])}{item['first_row']-1}"]
+        view['_effective_update_purpose']=purpose
         if unprovided:view['_purpose_unprovided']=unprovided
         view['_purpose_source_facts']={location:sources[location] for location in set(bound.values())}
         return view
@@ -767,14 +903,15 @@ def build_fact_update_plan(target_mapping, source_mapping, standard, equivalence
     if target_mapping.get('_template_layout'):
         from .模板布局 import relocate_mapping
         before=relocate_mapping(recognition_target,target_mapping['_template_layout'])
-        original_dimensions={row['id']:deepcopy(row['dimensions']) for row in before['facts']}
+        original_dimensions={row['id']:deepcopy(row['dimensions']) for row in _template_cell_records(before).values()}
     from .同义复核 import approved_mapping_pairs
     approved=approved_mapping_pairs(equivalence_proofs,target_mapping,source_mapping,standard)
     plan = {'schema_version': 2, 'gold_hash': standard['sha256'],
             'source_a_hash': target_mapping['source_hash'], 'source_b_hash': source_mapping['source_hash'],
             'updates': [], 'issues': [], 'unplaced_sources': [], 'retained_blanks': [], 'operations': [],
             'labels':deepcopy(target_mapping.get('_purpose_labels',[]))}
-    if update_purpose:plan['update_purpose']=deepcopy(update_purpose)
+    plan['caption_updates']=deepcopy(target_mapping.get('_purpose_caption_updates',[]))
+    if update_purpose:plan['update_purpose']=deepcopy(target_mapping.get('_effective_update_purpose',update_purpose))
     if target_mapping.get('_template_layout'):
         plan['template_layout']=deepcopy(target_mapping['_template_layout'])
         plan['operations']=deepcopy(plan['template_layout']['operations'])

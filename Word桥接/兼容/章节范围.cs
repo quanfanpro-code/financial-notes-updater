@@ -97,7 +97,7 @@ internal sealed record ChapterScope(string Title, string StartHeading, string? E
     }
 
     // 上游保存会重定位全篇连接。限定章节时以原包为底稿，仅移植选中的表，避免触碰其他章节。
-    public SavedFile SaveSelectedTables(string original, string expectedHash, string prepared, string output)
+    public SavedFile SaveSelectedTables(string original, string expectedHash, string prepared, string output, IReadOnlyList<int[]>? paragraphPaths = null)
     {
         original = Path.GetFullPath(original); prepared = Path.GetFullPath(prepared); output = Path.GetFullPath(output);
         if (string.Equals(original, output, StringComparison.OrdinalIgnoreCase) || string.Equals(prepared, output, StringComparison.OrdinalIgnoreCase))
@@ -125,6 +125,16 @@ internal sealed record ChapterScope(string Title, string StartHeading, string? E
             return node;
         }
         foreach (var id in TableIds) Locate(body, id).ReplaceWith(new XElement(Locate(donorBody, id)));
+        foreach (var path in paragraphPaths ?? Array.Empty<int[]>())
+        {
+            if (path.Length == 0 || path[0] < StartIndex || path[0] >= EndIndex)
+                throw new InvalidDataException("标题不属于当前章节。");
+            var before = body; var after = donorBody;
+            foreach (var index in path) { before = before.Elements().ElementAt(index); after = after.Elements().ElementAt(index); }
+            if (before.Name != Wns + "p" || after.Name != Wns + "p")
+                throw new InvalidDataException("标题段落位置已变化。");
+            before.ReplaceWith(new XElement(after));
+        }
         using var xmlMemory = new MemoryStream();
         using (var writer = XmlWriter.Create(xmlMemory, new XmlWriterSettings { Encoding = new UTF8Encoding(false), Indent = false,
             OmitXmlDeclaration = document.Declaration is null, CloseOutput = false })) document.Save(writer);

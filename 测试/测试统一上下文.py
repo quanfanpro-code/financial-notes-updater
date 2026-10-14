@@ -196,6 +196,29 @@ class ContextTests(unittest.TestCase):
         self.assertIn(chapter,applicable_context(catalog,'附注',[10,4,11,5]))
         self.assertNotIn(chapter,applicable_context(catalog,'附注',[1,1,2,2]))
 
+    def test_布局预览使用当前命名区域校验说明(self):
+        from openpyxl import load_workbook
+        from 附注更新.统一证据 import context_catalog
+        before=file_hash(self.source);book=load_workbook(self.source)
+        try:
+            original=self.response(build_payload(self.packet,self.engine.standard))
+            packet=copy.deepcopy(self.packet)
+            packet.update(candidate_cells=['E10'],physical_table=[9,4,10,5],
+                cells={'D9':{'value':'项目'},'E9':{'value':'期末余额'},
+                       'D10':{'value':'固定资产原值'},'E10':{'value':-125}})
+            answer={'cells':{'E10':original['cells']['B2']}}
+            book.defined_names['原表一'].attr_text="'附注'!$D$9:$E$10"
+            with self.assertRaisesRegex(ValueError,'说明依据不存在'):
+                validate_response(answer,packet,self.engine.standard)
+            checked=validate_response(answer,packet,self.engine.standard,context_workbook=book)
+            self.assertEqual(checked['E10']['fact']['raw_value'],-125)
+            other=next(key for key,row in context_catalog(self.context,self.source).items() if row['content']==self.context[-1])
+            invalid=copy.deepcopy(answer);invalid['cells']['E10']['dimension_evidence']['period']=[other]
+            with self.assertRaisesRegex(ValueError,'说明依据不存在'):
+                validate_response(invalid,packet,self.engine.standard,context_workbook=book)
+        finally:book.close()
+        self.assertEqual(file_hash(self.source),before)
+
     def test_saved_mapping_reloads_and_rejects_replaced_context(self):
         self.engine._http=lambda system,payload:self.response(payload)
         result=self.engine.classify_packet(self.packet)

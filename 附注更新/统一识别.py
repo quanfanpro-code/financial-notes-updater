@@ -194,12 +194,12 @@ def standard_review_material(mapping, standard):
                 '扩充后继续识别本表，程序复用仍适用的已确认格，再识别未决格；仍无法判断的项目保留具体原因。']}
 
 
-def validate_response(response, packet, standard, *, isolate_errors=False):
+def validate_response(response, packet, standard, *, isolate_errors=False, context_workbook=None):
     _fields(response, {"cells"})
     _require(isinstance(response["cells"], dict) and set(response["cells"]) == set(packet["candidate_cells"]), "回执须逐一覆盖且仅覆盖本包候选")
     _hash(packet["source_hash"])
     checked = {}
-    catalog=context_catalog(packet.get('document_context',[]),packet.get('source_path'))
+    catalog=context_catalog(packet.get('document_context',[]),packet.get('source_path'),workbook=context_workbook)
     def evidence(addresses, current_cell, *, financial=False):
         _texts(addresses)
         references=[]

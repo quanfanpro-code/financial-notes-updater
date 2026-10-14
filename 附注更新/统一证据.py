@@ -8,12 +8,12 @@ from .表格 import _definitions, _destinations, _word_table_ranges
 from .统一语义 import _require, definition_hash
 
 
-def context_catalog(context, source_path=None):
+def context_catalog(context, source_path=None, *, workbook=None):
     """原文生成稳定引用；命名区域沿用现有Word链接，移动行列后按当前范围取证。"""
     _require(isinstance(context,(list,tuple)),'语义说明须为列表')
     ranges={}
-    if source_path and any(isinstance(item,dict) and item.get('range_name') for item in context):
-        book=load_workbook(source_path,data_only=False)
+    if (source_path or workbook is not None) and any(isinstance(item,dict) and item.get('range_name') for item in context):
+        book=workbook if workbook is not None else load_workbook(source_path,data_only=False)
         try:
             names={}
             for definition in _definitions(book):
@@ -22,7 +22,8 @@ def context_catalog(context, source_path=None):
                 for item in items:
                     left,top,right,bottom=range_boundaries(item['range'])
                     ranges[(sheet,item['table_id'],item['range_name'])]=[top,left,bottom,right]
-        finally:book.close()
+        finally:
+            if workbook is None:book.close()
     catalog={}
     for item in context:
         if isinstance(item,str):

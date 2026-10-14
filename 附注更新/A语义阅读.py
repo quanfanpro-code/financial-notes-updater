@@ -112,11 +112,13 @@ def expand_scopes(answer, table, cells, standard):
 
 def formula_source_material(snapshot, selected):
     """追溯静态引用及其行列文字；不求值，也不据公式直接发证。"""
+    compact=snapshot.get('semantic_formula_sources',3)>=3
     sheets={s['name']:s for s in snapshot['sheets']};queue=deque();seen=set()
     for sheet in snapshot['sheets']:
         queue.extend((sheet['name'],a) for a,c in sheet['cells'].items()
                      if a in selected.get(sheet['name'],set()) and c.get('formula'))
     result={'引用':{},'原文':{},'未展开':[]};indexes={}
+    if compact:result.update(引用范围={},共同行列文字={},合并标题范围={})
     def context_cells(name,address):
         sheet=sheets[name];cell=sheet['cells'][address];row,col=cell['row'],cell['column']
         if name not in indexes:
@@ -128,6 +130,7 @@ def formula_source_material(snapshot, selected):
         rows,columns=indexes[name]
         owned=set(rows.get(row,[]))
         owned.update(a for a in columns.get(col,[]) if sheet['cells'][a]['row']<row and not sheet['cells'][a].get('formula'))
+        if compact:result['合并标题范围'].setdefault(name,sheet['merges'])
         for area in sheet['merges']:
             left,top,right,bottom=range_boundaries(area)
             if (top<=row<=bottom and left<=col) or (left<=col<=right and bottom<row):
@@ -140,7 +143,13 @@ def formula_source_material(snapshot, selected):
                 if (c['row']==row and c['column']<col) or isinstance(c.get('cached_value'),str):
                     text[name+'!'+a]={'公式':c['formula']};queue.append((name,a))
             elif isinstance(c.get('value'),str) and c['value'].strip():text[name+'!'+a]=c['value']
-        return text
+        # 共用文字按原位置只保存一次；每格保留适用范围，避免公式链平方复制全文。
+        if not compact:return text
+        result['共同行列文字'].update(text)
+        scope={'同行':f'{name}!{row}:{row}',
+               '合并标题范围引用':name}
+        if row>1:scope['同列上方']=f'{name}!{get_column_letter(col)}1:{get_column_letter(col)}{row-1}'
+        return scope
     while queue:
         name,address=queue.popleft();location=name+'!'+address
         if location in seen:continue
@@ -164,16 +173,23 @@ def formula_source_material(snapshot, selected):
                 (a,c) for a,c in cells.items() if left<=c['column']<=right and top<=c['row']<=bottom]
             if not sources:
                 result['未展开'].append({'位置':location,'引用':token.value});continue
+            if compact and match['b']:
+                scope_ref=target+'!'+area.replace('$','').upper()
+                result['引用范围'].setdefault(scope_ref,[target+'!'+a for a,c in sources])
+                refs.append({'范围引用':scope_ref})
             for a,c in sources:
-                ref=target+'!'+a;refs.append(ref)
+                ref=target+'!'+a
+                if not compact or not match['b']:refs.append(ref)
                 if ref not in result['原文']:
                     record={'行列文字':context_cells(target,a)}
                     if c.get('formula'):record['公式']=c['formula']
-                    elif isinstance(c.get('value'),str):record['文字']=c['value']
+                    elif isinstance(c.get('value'),str):
+                        if compact:record['文字引用']=ref
+                        else:record['文字']=c['value']
                     else:record['数据位置']='只确认业务含义，不使用数值及空白状态'
                     result['原文'][ref]=record
                 queue.append((target,a))
-        result['引用'][location]=list(dict.fromkeys(refs))
+        result['引用'][location]=list({json.dumps(ref,ensure_ascii=False):ref for ref in refs}.values())
     return result
 
 
@@ -228,7 +244,7 @@ def source_material(snapshot, context, tables=None, semantic_only=False):
         material['公式原文']={sheet['name']+'!'+address:cell['formula'] for sheet in snapshot['sheets']
             for address,cell in sheet['cells'].items() if address in selected.get(sheet['name'],set()) and cell.get('formula')}
         material['公式用途']='仅用于理解构成和引用来源。与文字说明不一致时核对原文及直接来源，保留冲突依据；不计算新金额，不按数值相等判断身份。'
-        if snapshot['semantic_formula_sources']==2 and material['公式原文']:
+        if snapshot['semantic_formula_sources']>=2 and material['公式原文']:
             material['公式引用依据']=formula_source_material(snapshot,selected)
     if semantic_only:material['数值处理']='仅身份确认阶段隐藏已确定数据范围内的数值及空白状态；全部位置都要确认含义，原件及最终保存的原值不变。'
     if common:material['共同原文']={key:text for text,key in common.items()}
@@ -806,6 +822,11 @@ def review_material(payload, binding, tables, snapshot, context, standard, prior
     issues=list(grouped.values())
     result={**payload,'task':'a_semantic_review','recognized':shared_binding(binding),'共同声明合并':True,
             '返回骨架':{'tables':[{'id':t['id'],'corrections':{'patches':[],'resolved_ranges':[]},'issues':[]} for t in tables]}}
+    # 绑定可纠正初选；核查必须看到实际采用的完整定义，不能只沿用初选目录。
+    metrics=[m['id'] for m in payload.get('standards',{}).get('metrics',[])]
+    metrics.extend(m['id'] for row in binding['tables'] for m in row.get('metrics',[])
+                   if m['id'] in standard['metric'] and standard['metric'][m['id']]['status']=='active')
+    if metrics:result['standards']=standard_material(metrics,standard)
     if issues:result['program_issues']=issues
     questions=semantic_questions(binding,tables,snapshot,standard)
     if questions:result['semantic_questions']=questions
@@ -1022,11 +1043,25 @@ def batch_origin(batch, mapping, cache):
                              if all(candidate.get(k,[])==batch.get(k,[]) for k in fields)),old,cache)
 
 
+def semantic_groups(tables, saved_groups):
+    """沿用已核查分组；其余按已读出的科目共用材料，子表身份保持独立。"""
+    saved_ids={t['id'] for group in saved_groups.values() for t in group}
+    subjects={}
+    for table in tables:
+        if table['id'] not in saved_ids:subjects.setdefault(table['subject'],[]).append(table)
+    groups=[];grouped=set()
+    for table in tables:
+        if table['id'] in grouped:continue
+        group=saved_groups.get(table['id'],subjects.get(table['subject'],[]))
+        groups.append(group);grouped.update(t['id'] for t in group)
+    return groups
+
+
 def recognize_a(engine, source, context, progress=None, artifact_metadata=None, previous_result=None, *, b_scope=None, b_outline=None):
     """A/B共用：读原文→按语义检索→按范围确认→核查已有结果。保留旧A协议兼容。"""
     from .语义 import SemanticCancelled
     snapshot=read_workbook(source,context=context);materialize_candidate_blanks(snapshot)
-    snapshot['semantic_formula_sources']=2
+    snapshot['semantic_formula_sources']=3
     snapshot['semantic_slot_bindings']=True
     engine.source_hash=snapshot['sha256']
     previous=None;origin_cache={}
@@ -1084,7 +1119,7 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
         result[proof_key]=deepcopy(proof)
         result['identity_version']=1
         result['cell_identity_version']=1
-        result['formula_source_version']=2
+        result['formula_source_version']=3
         result['slot_binding_version']=1
         if b_scope is not None:
             result['dimension_vocabulary_version']=1
@@ -1129,7 +1164,7 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
         proof['selection_additions'].extend(stage_proofs(engine,start))
         selected.update((r['id'],r) for r in addition['tables'])
     selection={'tables':[selected[t['id']] for t in reading['tables']]}
-    # 新请求逐张完整表处理；旧已核查分组保持原状，不为分组变化重跑。
+    # 已确认科目的新子表共用材料；旧已核查分组保持原状，不为分组变化重跑。
     saved_groups={}
     for saved in (previous or {}).get(proof_key,{}).get('batches',[]):
         if not saved['review']:continue
@@ -1140,10 +1175,7 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
         if (all(t in reading['tables'] for t in tables) and
             {t['id'] for t in answer.get('tables',[]) if isinstance(t,dict) and isinstance(t.get('issues'),list)}=={t['id'] for t in tables}):
             saved_groups[tables[0]['id']]=tables
-    groups=[];grouped=set()
-    for table in reading['tables']:
-        if table['id'] in grouped:continue
-        group=saved_groups.get(table['id'],[table]);groups.append(group);grouped.update(t['id'] for t in group)
+    groups=semantic_groups(reading['tables'],saved_groups)
     for tables in groups:
         engine._check_cancel()
         payload,aliases=binding_payload(tables,selection,snapshot,context,engine.standard,reading_notes=reading.get('notes',''))
@@ -1157,6 +1189,7 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
             old_source,_=source_material(snapshot,context,tables,semantic_only='数值处理' in old_payload['source'])
             supplied=[m['id'] for m in old_payload['standards']['metrics']]
             if old_payload['standards']!=standard_material(supplied,engine.standard):continue
+            if old_payload.get('style_templates')!=payload.get('style_templates'):continue
             if (old_payload.get('style_templates')==payload.get('style_templates') and
                 old_payload['source']==old_source and {m['id'] for m in payload['standards']['metrics']}<=set(supplied)):
                 payload=deepcopy(old_payload)

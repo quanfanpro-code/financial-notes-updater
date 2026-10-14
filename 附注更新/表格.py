@@ -620,6 +620,7 @@ def build_update_plan(a,b,a_mappings,b_mappings):
 
 def same_excel_value(actual,wanted):
     """按现有xlsx写入器的确定保存精度核验，不设置金额容差。"""
+    if actual==wanted:return True
     if isinstance(wanted,(int,float,Decimal)) and not isinstance(wanted,bool) and isinstance(actual,(int,float,Decimal)):
         from openpyxl.compat.strings import safe_string
         encoded=safe_string(wanted)

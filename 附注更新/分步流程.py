@@ -816,11 +816,25 @@ def _prepare_update_v2(config,run,log,cancel,ap,bp):
         if not isinstance(scope.get('label'),str) or not scope['label'].strip():raise ValueError('局部验证须明确名称')
         ar=select_mapping_scope(ar,scope['target']);br=select_mapping_scope(br,scope['source'])
         log('本次仅作局部验证：'+scope['label']+'；原整份语义及范围外未决保留')
-    # A、B识别已完成标准绑定；对应阶段只按统一身份证比较。
+    # A、B识别已完成标准绑定；只为模板结构和具体来源编排，不重做两端识别。
     plan=build_fact_update_plan(ar,br,standard,update_purpose=purpose)
+    usage={};structure_files={}
+    if not purpose and (plan['issues'] or plan['unplaced_sources']):
+        from .统一识别 import UnifiedSemanticEngine
+        from .模板更新编排 import plan_template_purpose
+        settings=validate_settings(config)
+        engine=UnifiedSemanticEngine(settings,gold,Path(config.get('output_dir') or ROOT/'输出')/'模板编排缓存',log,cancel)
+        log('沿用已核准身份，集中安排来源、名单、日期和必要的行数变化')
+        purpose,structure_files=plan_template_purpose(engine,ar,br,standard,run/'模板编排')
+        plan=build_fact_update_plan(ar,br,standard,update_purpose=purpose)
+        usage=dict(engine.usage)
+        for file in structure_files.values():
+            paths.append(file)
+            report=_read(Path(file))
+            paths.extend(record['path'] for item in report['evidence'] for record in item.values())
+        inputs=_input_records(paths)
     from .表格 import complete_numeric_formats
     complete_numeric_formats(ar,plan)
-    usage={};structure_files={}
     plan['unused_sources']=[]
     from .表格编排 import source_ready
     if not ((ar.get('scope_coverage',{}) if scope else ar.get('coverage',{})).get('complete') and
@@ -836,7 +850,7 @@ def _prepare_update_v2(config,run,log,cancel,ap,bp):
     plan.update(schema='附注更新清单-v2',complete=ready,inputs=inputs,a_mapping=str(ap),b_mapping=str(bp),
                 gold_path=str(gold),gold_hash=digest,a_link=str(Path(selected_link).resolve()) if selected_link else None)
     if scope:plan.update(validation_scope=copy.deepcopy(scope),scope_coverage={'target':ar['scope_coverage'],'source':br['scope_coverage']})
-    if purpose:plan['update_purpose']=copy.deepcopy(purpose)
+    if purpose:plan.setdefault('update_purpose',copy.deepcopy(purpose))
     if plan.get('template_layout'):plan['word_operations']=copy.deepcopy(plan['operations'])
     _verify_inputs(inputs);check_cancel(cancel)
     plan_path=save_json(run/'更新清单.json',plan)
@@ -950,7 +964,8 @@ def _write_v2(config,run,log,cancel,path,plan):
     if old_link:
         word=run/'更新后附注.docx'
         result=bridge({'action':'update','word':old_link['linked_word'],'excel':str(prime),'output':str(word),
-                       'operations':plan.get('word_operations',[]),'chapter_title':CHAPTER_TITLE},run,cancel)
+                       'operations':plan.get('word_operations',[]),'caption_updates':fresh.get('caption_updates',[]),
+                       'chapter_title':CHAPTER_TITLE},run,cancel)
         if not result.get('output_verified'):raise ValueError('Word尚未通过回读核验')
         context=bridge({'action':'read','word':str(word),'chapter_title':CHAPTER_TITLE},run,cancel)
         new_link={'schema':LINK_SCHEMA,'word_path':str(word),'word_hash':file_hash(word),

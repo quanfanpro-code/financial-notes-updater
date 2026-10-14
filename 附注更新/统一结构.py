@@ -40,7 +40,9 @@ def _text_evidence(book,references):
 
 def _shape(book,proposal,target,source,source_book,standard):
     """在内存中复用实际写入器，记录物理移动；不据位置产生任何业务身份。"""
-    target_facts=_business(target);source_facts=_business(source)
+    complete_targets=_business(target);source_facts=_business(source)
+    target_facts={**complete_targets,**{r['sheet']+'!'+r['cell']:r['partial_semantics'] for r in target.get('slot_bindings',[])}}
+    source_metrics={row['metric_id'] for row in source_facts.values()}|{r['partial_semantics']['metric_id'] for r in source.get('slot_bindings',[])}
     positions={sheet.title+'!'+cell.coordinate:(sheet.title,cell.row,cell.column)
                for sheet in book for cell in sheet._cells.values()}
     for location in target_facts:positions.setdefault(location,_position(location))
@@ -66,8 +68,9 @@ def _shape(book,proposal,target,source,source_book,standard):
             _require(_text(operation.get('coverage_reason')),'删除须说明来源完整披露范围，而非把未提供数据解释成删除')
             for location in deleted:
                 row=target_facts[location]
-                _require(semantic_key(row,standard) not in source_keys,'不能删除来源仍明确披露的相同语义')
-                _require(any(other['metric_id']==row['metric_id'] for other in source_facts.values()),'来源未提供该业务，不能删除原披露')
+                if location in complete_targets:
+                    _require(semantic_key(row,standard) not in source_keys,'不能删除来源仍明确披露的相同语义')
+                _require(row['metric_id'] in source_metrics,'来源未提供该业务，不能删除原披露')
             _require(not any(affected(position) and position[axis]==point for position in added),'不能先插入再删除同一新位置')
             removed.extend(deleted)
             new={}

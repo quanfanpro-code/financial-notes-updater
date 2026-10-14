@@ -27,23 +27,23 @@ def relocate_mapping(mapping, layout):
             finally:book.close()
             removed_evidence[reference]=f'原模板已移除位置的识别依据（仅用于接续原识别）：{mapping["source_hash"]} / {reference} / {value}'
         return '@context:'+definition_hash(removed_evidence[reference])
+    def move_reference(reference, destination, template=None):
+        if reference.startswith('@context:'):return preserve_evidence(reference)
+        if template and positions.get(reference) is not None:
+            before=_position(template);after=_position(destination);prior=_position(reference)
+            ref=list(_position(positions[reference]))
+            if prior[0]==before[0]:
+                # 名称跟随新行、列标题跟随新列，其余位置先按全表变化移动。
+                if prior[1]==before[1]:ref[1]=after[1]
+                if prior[2]==before[2]:ref[2]=after[2]
+                return _location_text(ref)
+        return preserve_evidence(reference)
     def move_fact(row, destination, template=None):
         row=deepcopy(row)
         row['id']=destination;row['source_reference']['location']=destination
         if row['record_type']=='metric_fact':
             row['owner_reference']=destination
-            def move_evidence(reference):
-                if reference.startswith('@context:'):return preserve_evidence(reference)
-                if template and positions.get(reference) is not None:
-                    before=_position(template);after=_position(destination);prior=_position(reference)
-                    ref=list(_position(positions[reference]))
-                    if prior[0]==before[0]:
-                        # 名称跟随新行、列标题跟随新列，其余位置先按全表变化移动。
-                        if prior[1]==before[1]:ref[1]=after[1]
-                        if prior[2]==before[2]:ref[2]=after[2]
-                        return _location_text(ref)
-                return preserve_evidence(reference)
-            row['dimension_evidence']={key:[move_evidence(ref) for ref in refs] for key,refs in row['dimension_evidence'].items()}
+            row['dimension_evidence']={key:[move_reference(ref,destination,template) for ref in refs] for key,refs in row['dimension_evidence'].items()}
         if template:row.update(raw_value=None,raw_value_state='blank')
         return row
     view['facts']=[move_fact(row,positions[location]) for location,row in original.items() if positions[location] is not None]
@@ -58,10 +58,16 @@ def relocate_mapping(mapping, layout):
             if destination is not None:
                 if row.get('partial_semantics'):
                     known=row['partial_semantics']
-                    def move_reference(ref):
-                        return preserve_evidence(ref)
-                    known['dimension_evidence']={key:[move_reference(ref) for ref in refs] for key,refs in known['dimension_evidence'].items()}
-                    known['evidence_cells']=[move_reference(ref) for ref in known['evidence_cells']]
+                    known['dimension_evidence']={key:[move_reference(ref,destination) for ref in refs] for key,refs in known['dimension_evidence'].items()}
+                    known['evidence_cells']=[move_reference(ref,destination) for ref in known['evidence_cells']]
+                row['sheet'],row['cell']=destination.rsplit('!',1);moved.append(row)
+        if kind=='slot_bindings':
+            original_slots={r['sheet']+'!'+r['cell']:r for r in mapping.get(kind,[])}
+            for destination,item in layout['added'].items():
+                if item['template'] not in original_slots:continue
+                row=deepcopy(original_slots[item['template']]);known=row['partial_semantics']
+                known['dimension_evidence']={key:[move_reference(ref,destination,item['template']) for ref in refs] for key,refs in known['dimension_evidence'].items()}
+                known['evidence_cells']=[move_reference(ref,destination,item['template']) for ref in known['evidence_cells']]
                 row['sheet'],row['cell']=destination.rsplit('!',1);moved.append(row)
         view[kind]=moved
     view['source_context']=context+list(removed_evidence.values())
@@ -84,7 +90,8 @@ def project_layout(mapping,source,standard,operations,source_locations=None):
             known={r['source_reference']['location'] for r in source['facts']}
             known.update(r['sheet']+'!'+r['cell'] for r in source.get('slot_bindings',[]))
             _require(source_locations and set(source_locations)<=known,'本次名单须引用已确认B来源')
-            selected={**source,'facts':[r for r in source['facts'] if r['source_reference']['location'] in source_locations]}
+            selected={**source,'facts':[r for r in source['facts'] if r['source_reference']['location'] in source_locations],
+                      'slot_bindings':[r for r in source.get('slot_bindings',[]) if r['sheet']+'!'+r['cell'] in source_locations]}
         positions,added,removed=_shape(a,{'operations':operations},mapping,selected,b,standard)
     finally:a.close();b.close()
     layout={'operations':deepcopy(operations),'positions':{key:_location_text(value) if value is not None else None for key,value in positions.items()},
