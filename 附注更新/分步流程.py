@@ -12,13 +12,11 @@ from .流程 import ROOT,bridge,save_json,trace_workbook,check_cancel
 from .设置 import validate_settings
 from .语义 import SemanticEngine,SemanticCancelled,SemanticProgressError,_normal_dimensions,recognition_progress
 from .表格 import read_workbook,file_hash,build_update_plan,write_updated_workbook,recalculate_copy,materialize_business_blanks,cell_at
-from .结构 import resolve_structure
 from .金标准 import ensure_compatible,validate_mapping_scope,normalize_mapping_metric,read_standard
 
 MAP_SCHEMA="附注语义映射-v1"
 LINK_SCHEMA="附注Word关联-v1"
 PLAN_SCHEMA="附注更新清单-v1"
-CHAPTER_TITLE="财务报表重要项目的说明"
 STEPS={"extract_a":"提取附注表格","recognize_a":"识别附注表格","recognize_b":"识别更新数据","match":"建立语义对应","write":"生成更新文件"}
 CARRIER_NAMES={"A":"附注表格","B":"更新数据表"}
 FILE_PREFIXES={"A":"附注表格","B":"更新数据"}
@@ -50,9 +48,6 @@ def _gold(config,record=None):
 def _load_link(path,a_path=None):
     item=_read(path)
     if item.get("schema")!=LINK_SCHEMA:raise ValueError("这不是本程序保存的附注表格与Word位置关联文件")
-    scope=item.get("scope") or item.get("context",{}).get("scope",{})
-    if scope.get("chapter_title")!=CHAPTER_TITLE:
-        raise ValueError("位置关联未限定财务报表重要项目的说明章节，请重新提取本章节")
     _check(item["word_path"],item["word_hash"],"关联的Word原件")
     _check(item["linked_word"],item["linked_word_hash"],"带连接的Word")
     _check(item["a_path"],item["a_hash"],"关联的附注表格")
@@ -113,14 +108,17 @@ def _record(snapshot,result,carrier,gold,original_path,context,a_link=None):
 
 
 def _recognition_context(link):
-    """带入正文与未提取的政策表，保留原顺序和表内行列关系。"""
+    """正文按原顺序只带一次，已提取表用原表区引用连接。"""
     from zipfile import ZipFile
     from xml.etree import ElementTree as ET
+    from openpyxl.utils import get_column_letter
     word=_check(link['word_path'],link['word_hash'],'关联的Word原件')
     with ZipFile(word) as package:root=ET.fromstring(package.read('word/document.xml'))
     ns='{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-    context=list(link['context'].get('tables',[]))
-    extracted={item.get('word_body_index') for item in context}
+    context=[{k:v for k,v in item.items() if k not in
+              ('chapter_context','preceding_blocks','unit_text_candidates','context_note')}
+             for item in link['context'].get('tables',[])]
+    extracted={item['table_id']:item for item in context if item.get('table_id')}
     paragraphs=[]
     def read(node):
         if node.tag==ns+'tbl':
@@ -135,10 +133,16 @@ def _recognition_context(link):
             return
         for child in node:read(child)
     for index,node in enumerate(root.find(ns+'body')):
-        if node.tag==ns+'tbl' and index in extracted:continue
+        item=extracted.get('/word/document.xml#body/'+str(index))
+        if node.tag==ns+'tbl' and item and item.get('sheet'):
+            left=item['first_column'];top=item['first_row']
+            area=(f'{get_column_letter(left)}{top}:'
+                  f'{get_column_letter(left+item["column_count"]-1)}{top+item["row_count"]-1}')
+            paragraphs.append('[原文此处为表格：'+item['sheet']+'!'+area+']')
+            continue
         read(node)
     if paragraphs:
-        context.append({'title':'原Word正文及未提取表格（按原顺序，须判断各段适用范围）',
+        context.append({'title':'原Word正文顺序（表格引用指向实际表区，各段适用范围由模型判断）',
                         'text':'\n'.join(paragraphs),'source_path':str(word),'source_hash':link['word_hash']})
     return context
 
@@ -326,15 +330,14 @@ def _extract(config,run,log,cancel):
     word=_path(config,"word_path","原始附注 Word")
     if word.suffix.lower()!=".docx":raise ValueError("原始附注 Word需要为.docx")
     before=file_hash(word);a=run/"附注表格.xlsx";linked=run/"原始附注_带连接.docx";context=run/"Word表格上下文.json"
-    log("只提取财务报表重要项目的说明章节，并单独保存附注表格与Word的位置关联")
-    result=bridge({"action":"extract","word":str(word),"excel":str(a),"linked_word":str(linked),"context":str(context),"chapter_title":CHAPTER_TITLE},run,cancel)
+    log("机械提取Word表格及位置关联；参与更新的范围由后续已有范围识别确定")
+    result=bridge({"action":"extract","word":str(word),"excel":str(a),"linked_word":str(linked),"context":str(context)},run,cancel)
     _check(word,before,"原始附注 Word")
     link={"schema":LINK_SCHEMA,"word_path":str(word),"word_hash":before,"linked_word":str(linked),
         "linked_word_hash":file_hash(linked),"a_path":str(a),"a_hash":file_hash(a),"context":_read(context)}
-    link["scope"]=link["context"].get("scope",{})
-    if link["scope"].get("chapter_title")!=CHAPTER_TITLE:raise ValueError("Word提取未返回已确认的章节范围")
+    link["scope"]=link["context"].get("scope") or {}
     link_path=save_json(run/"附注表格与Word位置关联.json",link)
-    return {"status":"complete","message":f"已提取指定章节的{result['table_count']}张表。下一步识别附注表格语义。",
+    return {"status":"complete","message":"原始表格及位置关联已保存；下一步由模型确定处理范围并识别语义。",
         "files":{"a_path":str(a),"a_link":link_path},"table_count":result["table_count"]}
 
 
@@ -401,398 +404,146 @@ def _check_b_mapping_mode(config, path):
             raise ValueError("所选更新数据映射曾按附注筛选，不能作为完整更新数据映射。请在第 3 步清空旧映射选择后重新识别；需要沿用原筛选方式时，先勾选“先按附注内容筛选来源（可选）”。")
 
 
-def _recognize_v2(config,carrier,run,log,cancel,progress=None):
+def _recognize_v2(config, carrier, run, log, cancel, progress=None):
     from .统一识别 import UnifiedSemanticEngine
-    from openpyxl import Workbook
-    key='a_path' if carrier=='A' else 'b_path'
-    original=_path(config,key,CARRIER_NAMES[carrier]);gold,digest=_gold(config)
-    settings=validate_settings(config)
-    context=[];link_path=None
-    if carrier=='A' and config.get('a_link'):
-        link_path=_path(config,'a_link','附注表格与Word位置关联文件')
-        link=_load_link(link_path,original);context.extend(_recognition_context(link))
-    additional=str(config.get('a_context_text' if carrier=='A' else 'b_context_text','') or '').strip()
-    if additional:context.append(additional)
-    identity=hashlib.sha256(_json({'source':file_hash(original),'gold':digest,'context':context,'carrier':carrier}).encode('utf-8')).hexdigest()
-    cache=Path(config.get('output_dir') or ROOT/'输出')/'统一语义缓存'/identity
-    engine=UnifiedSemanticEngine(settings,gold,cache,log,cancel)
-    mapping_key='a_mapping' if carrier=='A' else 'b_mapping'
-    latest_gold=None;learning=[];usage=Counter()
-    metadata={'carrier':carrier,'original_path':str(original),'original_hash':file_hash(original),'additional_context':additional}
-    if link_path:metadata['a_link']=str(link_path)
-    def publish(record):
-        counts={'mappings':len(record['facts']),'excluded':len(record['excluded']),'unresolved':len(record['unresolved'])}
-        identity_coverage=record.get('a_identity_coverage' if carrier=='A' else 'b_identity_coverage')
-        if identity_coverage is not None:
-            counts.update(mappings=identity_coverage['financial_cells'],unresolved=identity_coverage['unresolved_cells'])
-        if progress:
-            progress({'step':'recognize_a' if carrier=='A' else 'recognize_b','status':'running','checkpoint':True,
-                      'files':{mapping_key:record['mapping_path'],**({'gold_path':latest_gold} if latest_gold else {})},'counts':counts,'output_dir':str(run),
-                      'message':'已保存识别进度；B相关范围定位与当前A候选身份分别记录'})
-    target_mapping=None
-    if carrier=='B' and config.get('a_mapping'):
+    key = 'a_path' if carrier == 'A' else 'b_path'
+    original = _path(config, key, CARRIER_NAMES[carrier])
+    gold, digest = _gold(config)
+    context = []
+    metadata = {'carrier': carrier, 'original_path': str(original), 'original_hash': file_hash(original)}
+    for name in ('update_purpose','comparison_requirements'):
+        if config.get(name):metadata[name]=copy.deepcopy(config[name])
+    if carrier=='B':
+        for name in ('b_source_ranges','a_required_ranges'):
+            if config.get(name):metadata[name]=copy.deepcopy(config[name])
+    for name in ('field_scope','withdrawn','source_targets','source_candidates','arranged_targets','source_images'):
+        if config.get(carrier.lower()+'_'+name):
+            metadata[name]=copy.deepcopy(config[carrier.lower()+'_'+name])
+    if carrier == 'A' and config.get('a_link'):
+        link_path = _path(config, 'a_link', '附注表格与Word位置关联文件')
+        context.extend(_recognition_context(_load_link(link_path, original)))
+        metadata['a_link'] = str(link_path)
+    additional = str(config.get('a_context_text' if carrier == 'A' else 'b_context_text', '') or '').strip()
+    metadata['additional_context'] = '\n'.join(filter(None, (additional,
+        str(config.get(carrier.lower()+'_additional_context', '') or '').strip())))
+    if additional:
+        context.append(additional)
+    identity = hashlib.sha256(_json({'source': file_hash(original), 'gold': digest, 'context': context, 'carrier': carrier}).encode('utf-8')).hexdigest()
+    engine = UnifiedSemanticEngine(validate_settings(config), gold,
+        Path(config.get('output_dir') or ROOT / '输出') / '直接识别缓存' / identity, log, cancel)
+    target = None
+    if carrier == 'B' and config.get('a_mapping'):
         from .统一勾稽 import load_fact_mapping
+        target = load_fact_mapping(_path(config, 'a_mapping', 'A识别结果'), engine.standard)
+        if target.get('carrier') != 'A':
+            raise ValueError('B查找需要必须来自A结果')
+        if config.get('a_path'):
+            _check(config['a_path'], target.get('source_hash'), 'A原件')
+    if carrier == 'A' and config.get('b_mapping'):
+        from .统一勾稽 import load_fact_mapping
+        from .A合集 import _records
+        from .A语义阅读 import direct_reference
         try:
-            target_mapping=load_fact_mapping(config['a_mapping'],engine.standard)
-            if config.get('a_path'):_check(config['a_path'],target_mapping['source_hash'],'A原件')
-        except (ValueError,OSError,KeyError) as error:
-            log('A映射暂不可用，先保存完整B科目及子表初识：'+str(error));target_mapping=None
-    log('A逐层落实全部数据格' if carrier=='A' else
-        ('按A需求概要定位B相关范围，再机械比较和确认候选身份' if target_mapping is not None else '没有有效A，先保存B科目及子表目录'))
-    previous=config.get(mapping_key)
-    result=engine.recognize_workbook(original,context=context,progress=publish,artifact_metadata=metadata,target_mapping=target_mapping,
-                                     **({'previous_result':previous} if previous else {}))
-    # 本次分层流程只导出真实缺口，不将目录未定位或按需缺来源送入全库发布循环。
-    while carrier!='A' and result['unresolved'] and not result.get('recognition_scope'):
-        from .统一补充 import review_missing_standard
-        check_cancel(cancel)
-        pending_count=len(result['unresolved'])
-        log('复核未决项是已有定义的新取值，还是金标准确实缺项；不生成或修改金额')
-        try:
-            learned=review_missing_standard(engine,result,run)
-        except SemanticCancelled:
-            raise
-        except Exception as error:
-            message=engine._redact(str(error));learning.append({'error':message,'new_ids':[],'changed_ids':[]})
-            log('金标准补充尚未完成，保留已识别映射和待审原文：'+message)
-            break
-        learning.append(learned)
-        if not learned['new_ids'] and not learned['changed_ids']:break
-        # 先登记已发布版本，接续失败或取消时界面仍能保留该版本及旧映射。
-        latest_gold=learned['path'];publish(result)
-        usage.update(dict(engine.usage));gold=Path(latest_gold);digest=file_hash(gold)
-        next_identity=hashlib.sha256(_json({'source':file_hash(original),'gold':digest,'context':context,'carrier':carrier}).encode('utf-8')).hexdigest()
-        cache=Path(config.get('output_dir') or ROOT/'输出')/'统一语义缓存'/next_identity
-        engine=UnifiedSemanticEngine(settings,gold,cache,log,cancel)
-        log('新金标准已另存，核实已有映射兼容性后继续识别待处理单元格')
-        result=engine.recognize_workbook(original,context=context,progress=publish,previous_result=result['mapping_path'],artifact_metadata=metadata)
-        if len(result['unresolved'])>=pending_count:
-            log('新版本未减少待审格，保存本次结果，避免重复生成定义或循环调用模型')
-            break
-    usage.update(dict(engine.usage));result['usage']=dict(usage)
-    learning_path=None
-    if learning:
-        learning_path=save_json(run/'本次统一金标准补充记录.json',{'reviews':learning,'latest_published_gold_path':latest_gold})
-        result['gold_learning_path']=str(learning_path)
-    result.update(carrier=carrier,original_path=str(original),original_hash=file_hash(original))
-    if link_path:result['a_link']=str(link_path)
-    mapping_path=run/(FILE_PREFIXES[carrier]+'语义映射.json')
-    review=run/(FILE_PREFIXES[carrier]+'语义识别核对.xlsx')
-    identity_pending=result.get('b_identity_coverage',{}).get('unresolved',result['unresolved'])
-    pending=run/(FILE_PREFIXES[carrier]+'待处理语义与金标准补充材料.json') if carrier!='A' and identity_pending else None
-    result.update(review_path=str(review),additional_context=additional)
-    if pending:result['standard_review_path']=str(pending)
-    result['mapping_path']=str(mapping_path);save_json(mapping_path,result)
-    if pending:
-        from .统一识别 import standard_review_material
-        save_json(pending,standard_review_material(result,engine.standard))
-    a_coverage=result.get('a_identity_coverage') if carrier=='A' else None
-    identity_coverage=result.get('a_identity_coverage' if carrier=='A' else 'b_identity_coverage')
-    book=Workbook();sheet=book.active;sheet.title=carrier+'金标准身份证' if identity_coverage is not None else '逐格语义识别'
-    sheet.append(['来源位置','识别结果','金标准指标或类别','实际维度','原值或原公式','依据','尚未填写的维度取值'])
-    for fact in result['facts']:
-        sheet.append([fact['source_reference']['location'],'已识别',fact.get('metric_id') or fact.get('dimension_id'),
-                      _json(fact.get('dimensions',{})),fact.get('raw_value'),_json(fact.get('dimension_evidence',{})),None])
-    original_cells={}
-    if result['unresolved'] or result.get('source_identities') or result.get('slot_bindings'):
-        original_snapshot=read_workbook(original)
-        if original_snapshot['sha256']!=result['source_hash']:raise ValueError('导出核对表时原件已变化')
-        original_cells={part['name']:part['cells'] for part in original_snapshot['sheets']}
-    from .统一语义 import partial_pending_dimensions
-    for row in result.get('slot_bindings',[]):
-        known=row['partial_semantics'];cell=original_cells.get(row['sheet'],{}).get(row['cell'],{})
-        sheet.append([row['sheet']+'!'+row['cell'],'槽位已确认',known['metric_id'],_json(known['dimensions']),
-                      cell.get('formula') or cell.get('value'),_json(known['dimension_evidence']),
-                      _json(partial_pending_dimensions(known,engine.standard))])
-    if identity_coverage is not None:
-        for identity in result['source_identities']:
-            name,address=identity['source_reference']['location'].rpartition('!')[::2]
-            sheet.append([identity['source_reference']['location'],'已识别原文语义',identity['closest_metric_id'],identity['meaning'],
-                          original_cells.get(name,{}).get(address,{}).get('value'),_json(identity['evidence_cells']),identity['standard_difference']])
-    for kind,label in (('excluded','标题或说明等'),('unresolved','待核实')):
-        for row in (identity_coverage['unresolved'] if kind=='unresolved' and identity_coverage is not None else result[kind]):
-            known=row.get('partial_semantics',{})
-            sheet.append([row['sheet']+'!'+row['cell'],'已识别部分语义，待核实' if known else label,
-                          known.get('metric_id',row.get('category')),_json(known['dimensions']) if known else None,
-                          original_cells.get(row['sheet'],{}).get(row['cell'],{}).get('value'),row['reason']])
-    for row in sheet:
-        for cell in row:
-            if isinstance(cell.value,str):cell.data_type='s'
-    sheet.freeze_panes='A2';sheet.auto_filter.ref=sheet.dimensions
-    for column,width in {'A':30,'B':18,'C':40,'D':70,'E':30,'F':80,'G':20,'H':45}.items():sheet.column_dimensions[column].width=width
-    from .同义复核 import append_review_sheet,mapping_review_proofs
-    append_review_sheet(book,mapping_review_proofs(result))
-    from .统一证据 import append_context_sheet
-    append_context_sheet(book,result.get('source_context',[]),original)
-    with review.open('xb') as handle:book.save(handle)
-    book.close()
-    required=result.get('recognition_scope',{}).get('coverage',{})
-    ready=((a_coverage['complete'] if a_coverage is not None else result['complete']) if carrier=='A' else required.get('complete') and required.get('satisfied'))
-    scope_message=('；'+('B相关范围定位' if result.get('outline',{}).get('method')=='b_required_location' else 'B科目及子表初识')+
-                   ('已记录' if result.get('outline',{}).get('complete') else '有未定位区域')+
-                   ('，尚无有效A，仅保存初识' if target_mapping is None else '，按当前A需要确认候选身份')) if carrier=='B' else ''
-    if carrier=='B' and target_mapping is not None:
-        needs=required.get('targets',[])
-        scope_message+=f"；A需要{len(needs)}格，其中{sum(not row.get('standard_sources',row['exact_sources']) for row in needs)}格尚未确认槽位对应"
-        if identity_coverage is not None:
-            scope_message+=f"；B准确对应金标准{identity_coverage['financial_cells']}格，待修正识别{identity_coverage['unresolved_cells']}格"
-    message=(f"A金标准身份证已保存：准确对应{a_coverage['financial_cells']}格，待修正识别{a_coverage['unresolved_cells']}格。" if a_coverage is not None else
-             f"B金标准身份证已保存：准确对应{identity_coverage['financial_cells']}格，待修正识别{identity_coverage['unresolved_cells']}格"+scope_message+'。' if identity_coverage is not None else
-             f"{CARRIER_NAMES[carrier]}映射已保存：业务{len(result['facts'])+len(result.get('slot_bindings',[]))}格，标题说明等{len(result['excluded'])}格，语义待核实{len(result['unresolved'])}格"+scope_message+'。')
-    return {'status':'complete' if ready else 'partial',
-            'message':message,
-            'files':{mapping_key:str(mapping_path),'a_review' if carrier=='A' else 'b_review':str(review),
-                     **({'gold_path':latest_gold} if latest_gold else {}),
-                     **({'a_gold_changes' if carrier=='A' else 'b_gold_changes':str(learning_path)} if learning_path else {}),
-                     **({'a_standard_review' if carrier=='A' else 'b_standard_review':str(pending)} if pending else {})},'usage':result['usage']}
+            reference_path = _path(config, 'b_mapping', '已保存B识别结果')
+            reference = load_fact_mapping(reference_path, engine.standard)
+            if reference.get('carrier') != 'B':
+                raise ValueError('身份表达参照不是B结果')
+            if config.get('b_path'):
+                _check(config['b_path'], reference['source_hash'], 'B原件')
+            identifiers = config.get('a_allowed_metrics')
+            ranges = ([{'sheet': loc.rsplit('!', 1)[0], 'range': loc.rsplit('!', 1)[1]}
+                       for loc, row in _records(reference)
+                       if any(row.get(key) in identifiers for key in ('metric_id', 'dimension_id'))]
+                      if identifiers is not None else None)
+            if ranges is None or ranges:
+                metadata['既有另一方身份参照'] = {
+                    '载体': 'B', 'path': str(reference_path), 'sha256': file_hash(reference_path),
+                    '原样身份': direct_reference(reference, compact=True, ranges=ranges)}
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            log('已有B身份参照不能复用，A继续按本方原文识别：' + str(error))
+    mapping_key = 'a_mapping' if carrier == 'A' else 'b_mapping'
+    previous_result=config.get(mapping_key)
+    if carrier=='A' and config.get('a_prime_mapping'):
+        selected=_read(previous_result) if previous_result else {}
+        execution=_read(config['a_prime_mapping'])
+        if (selected.get('source_hash')!=metadata['original_hash'] and
+                execution.get('output_hash')==metadata['original_hash']):
+            previous_result=config['a_prime_mapping']
+    continuing=bool(previous_result and _read(previous_result).get('schema')=='附注更新执行记录-v1')
+    if carrier=='B' and config.get('list_dimension'):
+        from .A语义阅读 import recognize_list_relations
+        from .统一勾稽 import load_fact_mapping
+        if target is None:raise ValueError('B名单字段识别须沿用已有A合集')
+        previous=load_fact_mapping(_path(config,'b_mapping','B识别结果'),engine.standard)
+        log('逐格识别已授权的B名单身份字段，其他已有结果复用')
+        return recognize_list_relations(engine,target,previous,config,run)
+    if not continuing and (carrier=='A' or target is not None) and not any(config.get(carrier.lower()+'_'+key) for key in ('target_table','field_scope','source_targets','source_ranges','allowed_metrics')):
+        from .正常入口识别 import recognize_document
+        return recognize_document(engine,original,context,metadata,target,run,log,progress,
+            previous_result=previous_result,scope_answers=config.get(carrier.lower()+'_scope_answers'))
+    log(carrier + '：直接识别并保存原答复')
+    result = engine.recognize_workbook(original, context=context, artifact_metadata=metadata,
+        target_mapping=target, previous_result=previous_result,
+        allowed_metrics=config.get(carrier.lower() + '_allowed_metrics'),
+        target_table=config.get(carrier.lower() + '_target_table'))
+    path = Path(result['mapping_path'])
+    answer_path = run / (carrier + '识别答复.txt')
+    answer_path.write_text(result.get('本次关系答复',result.get('答复接入来源',{}).get('本次原答复',result['识别答复'])), encoding='utf-8-sig')
+    from .A合集 import direct_recognition_status
+    status=direct_recognition_status(result) if result.get('collection_version')==2 else 'saved'
+    return {'status': status,
+            'message': carrier + ('本次识别字段已完整接入并保存。' if status=='complete' else '原答复和已接入字段已保存；识别尚未完整接入，缺交或未确定字段保留，未重答。'),
+            'files': {mapping_key: str(path), 'recognition_answer': str(answer_path)}, 'usage': result['usage']}
 
 
-def _recognize(config,carrier,run,log,cancel,progress=None):
-    selected_gold,_=_gold(config)
-    with selected_gold.open(encoding='utf-8-sig') as handle:
-        first=next((json.loads(line) for line in handle if line.strip()),{})
-    if first.get('record_type'):
-        return _recognize_v2(config,carrier,run,log,cancel,progress)
-    if carrier=="B":_check_b_mapping_mode(config,config.get("b_mapping"))
-    key="a_path" if carrier=="A" else "b_path"
-    original=_path(config,key,CARRIER_NAMES[carrier])
-    if original.suffix.lower() not in {".xlsx",".xlsm"}:raise ValueError("识别对象需要为Excel工作簿")
-    gold,digest=_gold(config);before=file_hash(original)
-    context=[];link_path=None
-    if carrier=="A" and config.get("a_link"):
-        link_path=_path(config,"a_link","附注表格与Word位置关联文件")
-        link=_load_link(link_path,original);context.extend(_recognition_context(link))
-    context_key="a_context_text" if carrier=="A" else "b_context_text"
-    additional_context=str(config.get(context_key,config.get("context_text","")) or "").strip()
-    if additional_context:context.append(additional_context)
-    if config.get("report_scope"):
-        context.append({"report_scope":config["report_scope"],"basis":additional_context,"source":"本次已确认的报告口径"})
-    snapshot=read_workbook(original,context=context)
-    if carrier=="B" and any(c.get("formula") for s in snapshot["sheets"] for c in s["cells"].values()):
-        log("对更新数据表的独立副本重算公式，保留原文件")
-        recalculated=run/("更新数据_公式重算"+original.suffix)
-        recalculate_copy(original,recalculated);snapshot=read_workbook(recalculated,context=context)
-    snapshot["original_hash"]=before;snapshot["original_path"]=str(original)
-    reference=None
-    if carrier=="B" and config.get("a_mapping"):
-        try:
-            a_record,_=_load_mapping(config["a_mapping"],"A")
-            ensure_compatible(a_record,gold)
-            reference=a_record["mappings"]
-        except (ValueError,OSError,KeyError,TypeError) as error:
-            log("现有附注表格映射暂不能作参考，更新数据表仍按当前金标准独立识别："+str(error))
-    engine=_engine(config,gold,{"original":before,"gold":digest,"carrier":carrier,
-        "context":context,"report_scope":config.get("report_scope"),"reference":reference},log,cancel)
-    log("逐格识别"+CARRIER_NAMES[carrier]+"并保存独立语义映射；本步骤不更新任何金额")
-    target_scope=None
-    if carrier=="B" and config.get("scope_prefilter",False) and config.get("a_link"):
-        from .识别范围 import build_target_meanings
-        target_link=_load_link(config["a_link"],config.get("a_path") or None)
-        if config.get("a_mapping"):
-            target_record,_=_load_mapping(config["a_mapping"],"A",complete=False)
-            if target_link["a_hash"] not in {target_record.get("source_hash"),target_record.get("original_hash")}:
-                raise ValueError("识别范围引用的位置关联与当前附注表格映射不一致")
-        target_snapshot=read_workbook(target_link["a_path"],context=target_link["context"].get("tables",[]))
-        target_scope=build_target_meanings(target_link,target_snapshot)
-    scope_arguments={"target_scope":target_scope} if target_scope else {}
-    if target_scope and config.get("b_scope"):
-        # 范围筛选仅使用来源文字和目标披露说明；后续增加金标准槽位不改变这两项证据。
-        scope_arguments["scope_selection"]=_read(config["b_scope"])
-    previous_path=config.get("a_mapping" if carrier=="A" else "b_mapping")
-    if previous_path:
-        log("核验已选择的本表语义映射，保留仍然适用的已确认成果")
-        scope_arguments["previous_result"]={"mapping_path":str(Path(previous_path).resolve()),"mapping_sha256":file_hash(previous_path)}
-    last_progress_identity=None
-    last_progress_event={}
-    latest_published_gold=None;latest_published_digest=None
-    evidence_dir=run/"识别进度"/"识别依据"
-    def save_progress(current_snapshot,current_result,current_gold):
-        nonlocal last_progress_identity,last_progress_event
-        partial=recognition_progress(current_snapshot,current_result)
-        current_digest=file_hash(current_gold)
-        if partial.get("gold_hash")!=current_digest:
-            raise ValueError("识别进度与本轮金标准版本不一致")
-        _check(original,before,"识别原件")
-        identity=hashlib.sha256(_json({"result":partial,"gold":current_digest,"published_gold":latest_published_gold,"published_gold_hash":latest_published_digest}).encode("utf-8")).hexdigest()
-        if identity==last_progress_identity:return
-        evidence_dir.mkdir(parents=True,exist_ok=True)
-        frozen_gold=evidence_dir/("金标准_"+current_digest+".jsonl")
-        if not frozen_gold.exists():
-            with Path(current_gold).open("rb") as source,frozen_gold.open("xb") as target:
-                import shutil
-                shutil.copyfileobj(source,target)
-        _check(frozen_gold,current_digest,"进度所用金标准副本")
-        structure_path=evidence_dir/"原始实际结构.json"
-        if not structure_path.exists():save_json(structure_path,current_snapshot)
-        item=_record(current_snapshot,partial,carrier,frozen_gold,original,context,link_path)
-        item.update(additional_context=additional_context,selected_gold_path=str(current_gold),
-                    structure_path=str(structure_path),checkpoint=True)
-        files={}
-        if latest_published_gold:
-            _check(latest_published_gold,latest_published_digest,"本次已发布的新金标准")
-            item.update(latest_published_gold_path=latest_published_gold,latest_published_gold_hash=latest_published_digest)
-            files["gold_path"]=latest_published_gold
-        if item.get("scope_selection"):
-            scope_digest=hashlib.sha256(_json(item["scope_selection"]).encode("utf-8")).hexdigest()
-            scope_path=evidence_dir/("更新数据识别范围_"+scope_digest+".json")
-            if not scope_path.exists():save_json(scope_path,item["scope_selection"])
-            if _json(_read(scope_path))!=_json(item["scope_selection"]):raise ValueError("进度识别范围回读不一致")
-            item["scope_selection_path"]=str(scope_path);files["b_scope"]=str(scope_path)
-        folder=run/"识别进度"/(datetime.now().strftime("%Y%m%d_%H%M%S_%f")+"_"+uuid.uuid4().hex[:6])
-        path=folder/(FILE_PREFIXES[carrier]+"语义映射.json")
-        temporary=path.with_suffix(".tmp")
-        save_json(temporary,item)
-        if _json(_read(temporary))!=_json(item):raise ValueError("识别进度回读校验失败")
-        expected_hash=file_hash(temporary)
-        temporary.rename(path)
-        _check(path,expected_hash,"进度映射")
-        _check(original,before,"识别原件")
-        _check(current_snapshot["path"],current_snapshot["sha256"],"识别工作簿")
-        files["a_mapping" if carrier=="A" else "b_mapping"]=str(path)
-        counts={key:len(item.get(key,[])) for key in ("mappings","excluded","unresolved")}
-        last_progress_identity=identity
-        event={"status":"running","step":"recognize_a" if carrier=="A" else "recognize_b", "output_dir":str(run),
-               "message":f"已保存识别进度：业务格{counts['mappings']}格，非业务格{counts['excluded']}格，待处理{counts['unresolved']}格。",
-               "files":files,"file_hashes":{str(path):expected_hash},"counts":counts,"checkpoint":True}
-        last_progress_event=copy.deepcopy(event)
-        log(event["message"])
-        if progress is not None:progress(event)
-    def publish_progress(current_snapshot,current_result,current_gold):
-        try:save_progress(current_snapshot,current_result,current_gold)
-        except SemanticProgressError:raise
-        except Exception as error:raise SemanticProgressError("保存识别进度失败："+str(error)) from error
-    result=engine.recognize(snapshot,reference=reference,progress=lambda snap,result:publish_progress(snap,result,gold),**scope_arguments)
-    publish_progress(snapshot,result,gold)
-    learning_reports=[]; learned_ids=[]; seen_learning=set(); usage=Counter()
-    while result.get("unresolved"):
-        signature=(digest,tuple(sorted((str(i.get("sheet")),str(i.get("cell"))) for i in result["unresolved"])))
-        if signature in seen_learning:break
-        seen_learning.add(signature)
-        from .语义补充 import review_missing_semantics
-        log("核查未确认项是否为真正缺少的新语义；与已有定义及开放维度区别后保存新版本")
-        published_this_review=False
-        try:
-            learned=review_missing_semantics(engine,snapshot,result,str(gold),str(run))
-            if learned.get("new_ids"):
-                # 发布是已经发生的状态变化，必须先登记；后续应用或保存失败也要保留接续版本。
-                next_gold=Path(learned["path"]);next_digest=file_hash(next_gold)
-                definitions=read_standard(next_gold)
-                if any(definitions.get(identifier,{}).get("status")!="active" for identifier in learned["new_ids"]):
-                    raise ValueError("补充结果的新ID不在已发布版本的有效定义中")
-                _check(next_gold,next_digest,"刚发布的新金标准")
-                latest_published_gold=str(next_gold);latest_published_digest=next_digest
-                published_this_review=True
-                event=copy.deepcopy(last_progress_event)
-                for path,expected_hash in event.get("file_hashes",{}).items():_check(path,expected_hash,"已保存进度")
-                event["files"]["gold_path"]=latest_published_gold
-                event["file_hashes"][latest_published_gold]=next_digest
-                event["message"]="已登记本次发布的新金标准；已有映射保留实际识别版本，接续时核验兼容性。"
-                last_progress_event=copy.deepcopy(event)
-                try:
-                    if progress is not None:progress(event)
-                except Exception as error:raise SemanticProgressError("通知已发布金标准失败："+str(error)) from error
-                log(event["message"])
-            previous_pending=len(result["unresolved"])
-            result=_apply_reviewed_existing(result,learned,engine,snapshot)
-            publish_progress(snapshot,result,gold)
-            if len(result["unresolved"])<previous_pending:
-                log(f"独立复核确认已有槽位适用，解决{previous_pending-len(result['unresolved'])}个待核实格；未新增金标准")
-        except (SemanticCancelled,SemanticProgressError):
-            raise
-        except Exception as error:
-            if published_this_review:raise
-            message=f"{type(error).__name__}：{error}"
-            secret=str(config.get("api_key") or "")
-            if secret:message=message.replace(secret,"[密钥已隐藏]")
-            learning_reports.append({"status":"failed","reason":message,"new_ids":[],"gold_path":str(gold)})
-            log("金标准补充未完成，仍保存本次已识别语义和待核实事项："+message)
-            break
-        learning_reports.append(learned)
-        if not learned.get("new_ids"):break
-        _check(original,before,"识别原件");_check(gold,digest,"补充前金标准")
-        learned_ids.extend(learned["new_ids"]);usage.update(dict(engine.usage))
-        log(f"本地金标准新增{len(learned['new_ids'])}个经核实的语义槽位，继续识别本次资料")
-        previous_selection=result.get("scope_selection")
-        engine=_engine(config,next_gold,{"original":before,"gold":next_digest,"carrier":carrier,"context":context,"report_scope":config.get("report_scope"),"reference":reference},log,cancel)
-        arguments={"target_scope":target_scope,"scope_selection":previous_selection} if target_scope else {}
-        next_snapshot=copy.deepcopy(snapshot)
-        # 后续引擎失败时直接返回最近已验进度，不能再用旧result生成较早版本的成果。
-        next_result=engine.recognize(next_snapshot,reference=reference,previous_result=result,progress=lambda snap,result:publish_progress(snap,result,next_gold),**arguments)
-        snapshot=next_snapshot;result=next_result;gold=next_gold;digest=next_digest
-        publish_progress(snapshot,result,gold)
-    usage.update(dict(engine.usage));result["usage"]=dict(usage)
-    _check(original,before,"识别原件");_check(gold,digest,"金标准")
-    frozen_gold=_gold_snapshot(gold,digest)
-    item=_record(snapshot,result,carrier,frozen_gold,original,context,link_path)
-    item["selected_gold_path"]=str(gold)
-    learning_path=None
-    if learning_reports:
-        learning_path=save_json(run/"本次金标准补充记录.json",{"new_ids":learned_ids,"gold_path":str(gold),"gold_hash":digest,"latest_published_gold_path":latest_published_gold,"reviews":learning_reports})
-        item["gold_learning_path"]=learning_path
-        item["new_gold_ids"]=learned_ids
-    item["additional_context"]=additional_context
-    review=_mapping_review(item,snapshot,run/(FILE_PREFIXES[carrier]+"语义核对表.xlsx"))
-    item["review_path"]=review
-    structure_path=save_json(run/(FILE_PREFIXES[carrier]+"实际结构.json"),snapshot)
-    pending=None
-    if item.get("unresolved") or not item.get("complete"):
-        pending=_standard_review(item,snapshot,run,structure_path)
-        item["standard_review_path"]=pending
-    scope_path=None
-    if item.get("scope_selection"):
-        scope_path=save_json(run/"更新数据识别范围.json",item["scope_selection"])
-        item["scope_selection_path"]=scope_path
-    mapping_path=save_json(run/(FILE_PREFIXES[carrier]+"语义映射.json"),item)
-    count=len(item["mappings"]);unresolved=len(item.get("unresolved",[]))
-    return {"status":"complete" if item.get("complete") else "partial",
-        "message":f"{FILE_PREFIXES[carrier]}语义映射已独立保存：确认{count}格，待核实{unresolved}项。"+(f"本次金标准新增{len(learned_ids)}个语义槽位。" if learned_ids else ""),
-        "files":{"a_mapping" if carrier=="A" else "b_mapping":mapping_path,
-                 "a_review" if carrier=="A" else "b_review":review,
-                 **({"a_standard_review" if carrier=="A" else "b_standard_review":pending} if pending else {}),
-                 **({"b_scope":scope_path} if scope_path else {}),
-                 **({"a_gold_changes" if carrier=="A" else "b_gold_changes":learning_path} if learning_path else {}),
-                 **({"gold_path":latest_published_gold} if latest_published_gold else {})},
-        "usage":dict(item.get("usage",{}))}
+def _recognize(config, carrier, run, log, cancel, progress=None):
+    return _recognize_v2(config, carrier, run, log, cancel, progress)
 
 def _match_v2(config,run,log,cancel,ap,bp):
-    """建立语义对应只比较已确认槽位，取数留在明确生成更新文件的步骤。"""
-    from .统一语义 import read_standard_v2
-    from .统一勾稽 import load_fact_mapping,compare_semantic_slots,select_mapping_scope
-    gold,digest=_gold(config);standard=read_standard_v2(gold)
-    ar=load_fact_mapping(ap,standard);br=load_fact_mapping(bp,standard)
-    for key,record in (('a_path',ar),('b_path',br)):
-        if config.get(key):_check(config[key],record['source_hash'],CARRIER_NAMES['A' if key=='a_path' else 'B'])
-    inputs=_input_records([ap,bp,gold,ar['source_path'],br['source_path']])
-    if digest!=standard['sha256'] or inputs[str(gold)]!=digest:raise ValueError('对应期间金标准已变化')
-    for record in (ar,br):
-        _check(record['mapping_path'],record['mapping_hash'],'语义映射')
-        _check(record['source_path'],record['source_hash'],'语义原件')
-    scope=config.get('validation_scope')
-    if scope:
-        if not isinstance(scope.get('label'),str) or not scope['label'].strip():raise ValueError('局部验证须明确名称')
-        ar=select_mapping_scope(ar,scope['target']);br=select_mapping_scope(br,scope['source'])
-    log('按金标准槽位直接建立对应，分别保留双方实际维度取值')
-    plan=compare_semantic_slots(ar,br,standard)
-    plan.update(inputs=inputs,a_mapping=str(ap),b_mapping=str(bp),gold_path=str(gold),gold_hash=digest,
-                a_link=config.get('a_link',ar.get('a_link')))
-    for key in ('validation_scope','update_purpose'):
-        if config.get(key):plan[key]=copy.deepcopy(config[key])
-    _verify_inputs(inputs);check_cancel(cancel)
-    path=save_json(run/'单元格语义对应.json',plan)
-    save_json(run/'更新清单校验.json',{'path':path,'sha256':file_hash(path)})
-    trace=run/'单元格语义对应核对.xlsx';trace_workbook(trace,plan)
-    return {'status':'complete' if plan['complete'] else 'partial',
-            'message':f"A共{plan['target_count']}个已确认业务格，其中{plan['matched_targets']}格在B有同标准槽位；对应{plan['source_count']}个不同B位置，双方实际维度已分别保留。",
-            'files':{'update_plan':path,'trace':str(trace)},'usage':{}}
+    """匹配入口保存搬运安排，写入阶段不再补做对应。"""
+    return _prepare_update_v2(config,run,log,cancel,ap,bp)
 
 
 def _prepare_update_v2(config,run,log,cancel,ap,bp):
     """新版独立映射先接入同一个勾稽入口；范围及结构未验收时明确保留待处理。"""
     from .统一语义 import read_standard_v2
     from .统一勾稽 import load_fact_mapping,build_fact_update_plan,calculation_files,select_mapping_scope,target_for_purpose
-    gold,digest=_gold(config)
-    standard=read_standard_v2(gold)
+    raw=_read(ap)
+    if raw.get('collection_version')==2:
+        from .A合集 import _standard
+        gold=Path(raw['gold_path']);digest=raw['gold_hash'];standard=_standard(raw)
+    else:
+        gold,digest=_gold(config)
+        standard=read_standard_v2(gold)
     ar=load_fact_mapping(ap,standard); br=load_fact_mapping(bp,standard)
+    if any(record.get('collection_version')!=2 for record in (ar,br)):
+        raise ValueError('匹配只使用A、B两个已保存身份证合集；历史映射保留，不执行旧位置取数流程')
+    if ar.get('collection_version')==2 or br.get('collection_version')==2:
+        from .模板更新编排 import direct_update_plan
+        for key,record in (('a_path',ar),('b_path',br)):
+            if config.get(key):_check(config[key],record['source_hash'],CARRIER_NAMES['A' if key=='a_path' else 'B'])
+            _check(record['source_path'],record['source_hash'],'语义原件')
+        plan=direct_update_plan(ar,br,config.get('update_purpose'),config.get('validation_scope'),
+                                comparison_requirements=config.get('comparison_requirements'))
+        paths=[ap,bp,ar['source_path'],br['source_path']]
+        for record in (ar,br):
+            for reference in record.get('副本接续',{}).get('执行记录',[]):
+                _check(reference['path'],reference['sha256'],'A副本接续记录')
+                paths.append(reference['path'])
+            evidence=record.get('calculation_evidence')
+            if evidence:
+                paths.extend([evidence['path'],_read(evidence['path'])['workbook_path']])
+        selected_link=config.get('a_link',ar.get('a_link'))
+        if selected_link:
+            link=_load_link(selected_link,ar['source_path'])
+            paths.extend([selected_link,link['word_path'],link['linked_word']])
+        plan.update(schema='附注更新清单-v2',inputs=_input_records(paths),a_mapping=str(ap),b_mapping=str(bp),
+                    gold_path=str(gold),a_link=selected_link,word_operations=copy.deepcopy(plan['operations']))
+        if config.get('validation_scope'):plan['validation_scope']=copy.deepcopy(config['validation_scope'])
+        path=save_json(run/'更新清单.json',plan)
+        save_json(run/'更新清单校验.json',{'path':path,'sha256':file_hash(path)})
+        return {'status':'complete','message':'两合集的对应、搬运及名单安排已保存；未明确内容原样保留。',
+                'files':{'update_plan':path},'usage':{}}
     for key,record in (('a_path',ar),('b_path',br)):
         if config.get(key):_check(config[key],record['source_hash'],CARRIER_NAMES['A' if key=='a_path' else 'B'])
     paths=[ap,bp,gold,ar['source_path'],br['source_path']]
@@ -817,32 +568,12 @@ def _prepare_update_v2(config,run,log,cancel,ap,bp):
         ar=select_mapping_scope(ar,scope['target']);br=select_mapping_scope(br,scope['source'])
         log('本次仅作局部验证：'+scope['label']+'；原整份语义及范围外未决保留')
     # A、B识别已完成标准绑定；只为模板结构和具体来源编排，不重做两端识别。
-    plan=build_fact_update_plan(ar,br,standard,update_purpose=purpose)
+    plan=build_fact_update_plan(ar,br,standard,update_purpose=purpose,
+                                comparison_requirements=config.get('comparison_requirements'))
     usage={};structure_files={}
-    if not purpose and (plan['issues'] or plan['unplaced_sources']):
-        from .统一识别 import UnifiedSemanticEngine
-        from .模板更新编排 import plan_template_purpose
-        settings=validate_settings(config)
-        engine=UnifiedSemanticEngine(settings,gold,Path(config.get('output_dir') or ROOT/'输出')/'模板编排缓存',log,cancel)
-        log('沿用已核准身份，集中安排来源、名单、日期和必要的行数变化')
-        purpose,structure_files=plan_template_purpose(engine,ar,br,standard,run/'模板编排')
-        plan=build_fact_update_plan(ar,br,standard,update_purpose=purpose)
-        usage=dict(engine.usage)
-        for file in structure_files.values():
-            paths.append(file)
-            report=_read(Path(file))
-            paths.extend(record['path'] for item in report['evidence'] for record in item.values())
-        inputs=_input_records(paths)
     from .表格 import complete_numeric_formats
     complete_numeric_formats(ar,plan)
     plan['unused_sources']=[]
-    from .表格编排 import source_ready
-    if not ((ar.get('scope_coverage',{}) if scope else ar.get('coverage',{})).get('complete') and
-            (br.get('scope_coverage',{}).get('complete') if scope else source_ready(br,ar,standard))):
-        plan['issues'].append({'kind':'coverage_not_verified','reason':'A逐格语义、B来源范围或当前A所需候选身份尚未完成，须处理相应未决'})
-    for row in plan['unplaced_sources']:
-        plan['issues'].append({'kind':'unplaced_source','location':row['source_reference']['location'],
-                               'reason':'此业务事实未找到目标位置，须判断新增披露、行列变化或本次不采用'})
     for row in plan['updates']:
         definition=standard['metric'][row['metric_id']]['definition']
         row['semantic_field']=' / '.join(definition[key] for key in ('economic_object','measure','measurement_basis'))
@@ -865,11 +596,13 @@ def _prepare_update_v2(config,run,log,cancel,ap,bp):
 def _match(config,run,log,cancel):
     ap=_path(config,"a_mapping","附注表格语义映射文件");bp=_path(config,"b_mapping","更新数据语义映射文件")
     versions=[_read(path).get('schema_version') for path in (ap,bp)]
+    if versions!=[2,2]:
+        raise ValueError('匹配只使用A、B两个已保存身份证合集；历史映射保留，不执行旧对应流程')
     if 2 in versions:
         if versions!=[2,2]:raise ValueError('两份映射使用不同标准层次，须完成旧定义迁移后再勾稽')
         return _match_v2(config,run,log,cancel,ap,bp)
     _check_b_mapping_mode(config,bp)
-    ar,a=_load_mapping(ap,"A");br,b=_load_mapping(bp,"B")
+    ar,a=_load_mapping(ap,"A",complete=False);br,b=_load_mapping(bp,"B",complete=False)
     _selected_sources(config,ar,br)
     gold,gold_hash=_gold(config,ar)
     ensure_compatible(br,gold)
@@ -879,7 +612,7 @@ def _match(config,run,log,cancel):
     paths=[ap,bp,gold,ar["gold_path"],br["gold_path"],ar["source_path"],br["source_path"],ar["original_path"],br["original_path"]]
     if br.get("scope_selection"):
         from .识别范围 import build_target_meanings
-        current_target=build_target_meanings(link or {"scope":{"chapter_title":CHAPTER_TITLE},"tables":ar.get("context",[])},a)
+        current_target=build_target_meanings(link or {"tables":ar.get("context",[])},a)
         target_hash=hashlib.sha256(_json(current_target).encode("utf-8")).hexdigest()
         if not current_target.get("disclosures") or target_hash!=br["scope_selection"].get("target_hash"):
             raise ValueError("更新数据映射的识别范围不适用于当前附注披露，请按当前附注重新识别更新数据")
@@ -887,41 +620,11 @@ def _match(config,run,log,cancel):
     inputs=_input_records(paths)
     log("读取两份已保存映射，以相同金标准语义建立对应；从更新数据表的实际单元格取数")
     plan=build_update_plan(a,b,ar["mappings"],br["mappings"])
-    operations=[];working=copy.deepcopy(ar);working_snapshot=a;usage={};engine=None
+    operations=[];working=copy.deepcopy(ar);usage={}
     working_gold=_gold_snapshot(gold,gold_hash)
     working.update(gold_path=str(working_gold),gold_hash=gold_hash,selected_gold_path=str(gold))
     inputs.update(_input_records([working_gold]))
-    needs=bool(plan.get("unplaced_sources") or any(i.get("kind")=="missing_source" for i in plan.get("issues",[]) if isinstance(i,dict)))
-    if needs and a.get("names"):
-        engine=_engine(config,gold,{"a_map":file_hash(ap),"b_map":file_hash(bp),"action":"structure"},log,cancel)
-        engine.source_hash=b["sha256"];engine.cache_source_hash=hashlib.sha256(_json(inputs).encode()).hexdigest()
-        log("核验语义差异是否需要增减行列；已保存的附注表格和更新数据语义映射直接复用")
-        structure=resolve_structure(engine,a,b,ar,br,plan,str(run))
-        usage=dict(getattr(engine,"usage",{}))
-        if structure.get("issues"):plan["issues"].extend(structure["issues"])
-        else:
-            operations=structure["operations"];working_snapshot=structure["a_snapshot"]
-            working.update(source_path=working_snapshot["path"],source_hash=working_snapshot["sha256"],
-                original_path=working_snapshot["path"],original_hash=working_snapshot["sha256"],
-                mappings=structure["a_mappings"],context=working_snapshot.get("context",[]),
-                confirmed_business_ranges={},recalculated=False,recalculation={})
-            plan=build_update_plan(working_snapshot,b,working["mappings"],br["mappings"])
-            inputs.update(_input_records([working_snapshot["path"]]))
     plan["unused_sources"]=[]
-    if plan.get("unplaced_sources"):
-        from .结构 import review_unused_sources,validate_unused_sources
-        if engine is None:
-            engine=_engine(config,gold,{"a_map":file_hash(ap),"b_map":file_hash(bp),"action":"source_selection"},log,cancel)
-            engine.source_hash=b["sha256"];engine.cache_source_hash=hashlib.sha256(_json(inputs).encode()).hexdigest()
-        log("逐项核实更新数据中尚无接收位置的业务，区分必要新增行列和本次附注不采用的来源")
-        decisions=review_unused_sources(engine,working_snapshot,b,working["mappings"],br["mappings"],plan)
-        approved=validate_unused_sources(working_snapshot,b,working["mappings"],br["mappings"],plan,decisions.get("unused_sources",[]))
-        plan["unused_sources"]=approved
-        positions={(m["sheet"],m["cell"]) for m in approved}
-        plan["unplaced_sources"]=[m for m in plan["unplaced_sources"] if (m["sheet"],m["cell"]) not in positions]
-        plan["issues"].extend(decisions.get("issues",[]));usage=dict(getattr(engine,"usage",{}))
-        plan["issues"].extend({"kind":"unplaced_source","sheet":m["sheet"],"cell":m["cell"],
-            "reason":"更新数据表已确认的业务格尚未确定接收位置或本次不采用的明确依据"} for m in plan["unplaced_sources"])
     ready=not plan["issues"] and bool(plan["updates"] or plan.get("retained_blanks"))
     plan.update(schema=PLAN_SCHEMA,complete=ready,inputs=inputs,a_mapping=str(ap),b_mapping=str(bp),
         working_a=working,gold_path=str(gold),gold_hash=gold_hash,word_operations=operations,a_link=str(selected_link) if selected_link else None,usage=usage)
@@ -935,53 +638,63 @@ def _match(config,run,log,cancel):
         "files":{"update_plan":plan_path,"trace":str(trace)},"usage":usage}
 
 def _write_v2(config,run,log,cancel,path,plan):
-    from .统一语义 import read_standard_v2
-    from .统一勾稽 import load_fact_mapping,verify_fact_update_plan,derive_fact_mapping
-    plan_hash=file_hash(path)
+    """完整安排只读取其绑定材料，不重新识别或重算语义对应。"""
+    # 旧同名标记曾接受模型额外编排，不能直接执行其保存结果。
+    if plan.get('matching_method')!='unique_exact_identity_v4':
+        raise ValueError('此清单不属于当前唯一身份证匹配结果；请从已保存的两个合集重新匹配，识别答复无需重做')
+    records=[]
+    for key in ('a_mapping','b_mapping'):
+        mapping_path=str(Path(plan[key]).resolve())
+        record=_read(mapping_path)
+        record.update(mapping_path=mapping_path,mapping_hash=plan['inputs'][mapping_path])
+        records.append(record)
+    return _write_direct(config,run,log,cancel,path,plan,*records)
+
+
+def _write_direct(config,run,log,cancel,path,plan,ar,br):
+    from .A合集 import direct_output_record, validate_direct_collection
     _verify_inputs(plan['inputs'])
-    _check(plan['gold_path'],plan['gold_hash'],'更新清单绑定的金标准')
-    if config.get('gold_path'):_check(config['gold_path'],plan['gold_hash'],'当前金标准')
-    standard=read_standard_v2(plan['gold_path'])
-    ar=load_fact_mapping(plan['a_mapping'],standard);br=load_fact_mapping(plan['b_mapping'],standard)
+    for mapping in (ar,br):validate_direct_collection(mapping,for_matching=True)
+    plan_hash=file_hash(path)
     for key,record in (('a_path',ar),('b_path',br),('a_mapping',ar),('b_mapping',br)):
-        if config.get(key):
-            _check(config[key],record['mapping_hash'] if key.endswith('mapping') else record['source_hash'],'当前选择的表格或语义映射')
-    selected_link=config.get('a_link') if 'a_link' in config else plan.get('a_link')
-    old_link=None
-    if selected_link:
-        if not plan.get('a_link') or Path(selected_link).resolve()!=Path(plan['a_link']).resolve():
-            raise ValueError('当前Word位置关联与更新清单不同，请重新生成更新清单')
-        if str(Path(selected_link).resolve()) not in plan['inputs']:
-            raise ValueError('更新清单未绑定Word位置关联')
-        old_link=_load_link(selected_link,ar['source_path'])
-    fresh=verify_fact_update_plan(plan,ar,br,standard)
-    working=fresh.pop('_working_target')
-    check_cancel(cancel);log('重新核对语义与取数后生成更新文件，并保存可复用的逐格语义映射')
-    prime=run/(('局部验证_' if plan.get('validation_scope') else '')+'更新后附注表格'+Path(working['source_path']).suffix)
-    write_updated_workbook(working['source_path'],prime,fresh)
-    _verify_inputs(plan['inputs']);_check(path,plan_hash,'本次更新清单');check_cancel(cancel)
-    files={'a_prime':str(prime)}
-    if old_link:
+        if config.get(key):_check(config[key],record['mapping_hash'] if key.endswith('mapping') else record['source_hash'],'当前选择与更新安排')
+    working=plan.get('working_a') or ar
+    if plan.get('structure'):
+        working=_read(plan['structure']['mapping_path'])
+    link_path=config.get('a_link',plan.get('a_link'))
+    link=None
+    if link_path:
+        if not plan.get('a_link') or Path(link_path).resolve()!=Path(plan['a_link']).resolve():
+            raise ValueError('所选Word位置关联与保存的安排不对应')
+        link=_load_link(link_path,ar['source_path'])
+    check_cancel(cancel)
+    prime=run/('更新后附注表格'+Path(working['source_path']).suffix)
+    write_updated_workbook(working['source_path'],prime,plan)
+    files={'a_prime':str(prime),'update_plan':str(path)}
+    if link:
         word=run/'更新后附注.docx'
-        result=bridge({'action':'update','word':old_link['linked_word'],'excel':str(prime),'output':str(word),
-                       'operations':plan.get('word_operations',[]),'caption_updates':fresh.get('caption_updates',[]),
-                       'chapter_title':CHAPTER_TITLE},run,cancel)
-        if not result.get('output_verified'):raise ValueError('Word尚未通过回读核验')
-        context=bridge({'action':'read','word':str(word),'chapter_title':CHAPTER_TITLE},run,cancel)
-        new_link={'schema':LINK_SCHEMA,'word_path':str(word),'word_hash':file_hash(word),
-                  'linked_word':str(word),'linked_word_hash':file_hash(word),'a_path':str(prime),
-                  'a_hash':file_hash(prime),'context':context,'scope':context.get('scope',{})}
-        files.update(word=str(word),word_link=save_json(run/'更新后附注表格与Word位置关联.json',new_link))
-    derived=derive_fact_mapping(working,prime,fresh,path,files.get('word_link'))
-    mapping_path=save_json(run/'更新后附注表格语义映射.json',derived)
-    load_fact_mapping(mapping_path,standard)
-    files['a_prime_mapping']=mapping_path
-    trace=run/'本次更新核对.xlsx';trace_workbook(trace,fresh);files['trace']=str(trace)
-    _verify_inputs(plan['inputs']);_check(path,plan_hash,'本次更新清单');check_cancel(cancel)
-    updated=sum(not x.get('unprovided_reason') for x in fresh['updates'])
-    return {'status':'complete','message':f"已按金标准语义取数更新{updated}个业务格，{len(fresh.get('unprovided_fields',[]))}格B未提供且未计为取数更新；保存更新后表格及其独立语义映射。",
-            'files':files,'updated_cells':updated,'unprovided_cells':len(fresh.get('unprovided_fields',[])),
-            'retained_blank_cells':len(fresh['retained_blanks'])}
+        chapter=(link.get('scope') or link.get('context',{}).get('scope') or {}).get('chapter_title')
+        scope={'chapter_title':chapter} if chapter else {}
+        result=bridge({'action':'update','word':link['linked_word'],'excel':str(prime),'output':str(word),
+                       'operations':plan.get('word_operations',plan.get('operations',[])),
+                       'caption_updates':plan.get('caption_updates',[]),**scope},run,cancel)
+        files['word']=str(word)
+        context=bridge({'action':'read','word':str(word),**scope},run,cancel)
+        new_link={'schema':LINK_SCHEMA,'word_path':str(word),'word_hash':file_hash(word),'linked_word':str(word),
+                  'linked_word_hash':file_hash(word),'a_path':str(prime),'a_hash':file_hash(prime),'context':context,'scope':context.get('scope',{})}
+        files['word_link']=save_json(run/'更新后附注表格与Word位置关联.json',new_link)
+    record=direct_output_record(ar,br,prime,plan,str(path))
+    if files.get('word_link'):record['a_link']=files['word_link']
+    files['a_prime_mapping']=save_json(run/'更新执行记录.json',record)
+    if ar.get('collection_version')!=2:
+        trace=run/'本次更新执行记录.xlsx';trace_workbook(trace,plan);files['trace']=str(trace)
+    _verify_inputs(plan['inputs'])
+    _check(path,plan_hash,'本次更新清单')
+    return {'status':'complete','message':'已按保存的安排生成副本；未安排内容继续保留。',
+            'files':files,'updated_cells':sum(not row.get('unprovided_reason') for row in plan.get('updates',[])),
+            'unprovided_cells':len(plan.get('unprovided_fields',[])),
+            'retained_blank_cells':len(plan.get('retained_blanks',[])),
+            'unused_source_cells':len(plan.get('unused_sources',[])),'usage':{}}
 
 
 def _write(config,run,log,cancel):
@@ -990,91 +703,11 @@ def _write(config,run,log,cancel):
     if not seal.is_file() or _read(seal).get("sha256")!=file_hash(path):
         raise ValueError("更新清单缺少校验记录或已被改动，请重新生成清单")
     plan=_read(path)
-    if plan.get('schema')=='附注语义对应-v2':
-        _verify_inputs(plan['inputs'])
-        for key in ('a_mapping','b_mapping','gold_path','a_link'):
-            if config.get(key) and (not plan.get(key) or Path(config[key]).resolve()!=Path(plan[key]).resolve()):
-                raise ValueError('当前选择与语义对应清单不同：'+key)
-        bound={**config,**{k:plan[k] for k in ('a_mapping','b_mapping','gold_path','a_link')},
-               **{k:plan.get(k) for k in ('validation_scope','update_purpose')}}
-        prepared=_prepare_update_v2(bound,run,log,cancel,Path(plan['a_mapping']),Path(plan['b_mapping']))
-        generated=Path(prepared['files']['update_plan'])
-        return _write_v2(bound,run,log,cancel,generated,_read(generated))
     if plan.get('schema')=='附注更新清单-v2':return _write_v2(config,run,log,cancel,path,plan)
-    if plan.get("schema")!=PLAN_SCHEMA or not plan.get("complete") or plan.get("issues"):
-        raise ValueError("更新清单尚未确认完整，不能生成最终文件")
-    _verify_inputs(plan["inputs"])
-    locked_gold=plan.get("gold_path") or plan["working_a"]["gold_path"]
-    locked_hash=plan.get("gold_hash") or plan["working_a"]["gold_hash"]
-    _check(locked_gold,locked_hash,"更新清单绑定的金标准")
-    if config.get("gold_path") and file_hash(config["gold_path"])!=locked_hash:
-        raise ValueError("当前金标准版本与更新清单不同，请重新建立对应后生成文件")
-    ensure_compatible(_read(plan["a_mapping"]),locked_gold)
-    ensure_compatible(_read(plan["b_mapping"]),locked_gold)
-    selected_link=config.get("a_link") if "a_link" in config else plan.get("a_link")
-    if selected_link and (not plan.get("a_link") or Path(selected_link).resolve()!=Path(plan["a_link"]).resolve()):
-        raise ValueError("当前Word位置关联与更新清单不同，请重新生成更新清单")
-    br,b=_load_mapping(plan["b_mapping"],"B")
-    working=plan["working_a"];a=_snapshot(working)
-    _selected_sources(config,_read(plan["a_mapping"]),br)
-    fresh=build_update_plan(a,b,working["mappings"],br["mappings"])
-    from .结构 import validate_unused_sources
-    approved=validate_unused_sources(a,b,working["mappings"],br["mappings"],fresh,plan.get("unused_sources",[]))
-    unused_positions={(m["sheet"],m["cell"]) for m in approved}
-    remaining=[m for m in fresh["unplaced_sources"] if (m["sheet"],m["cell"]) not in unused_positions]
-    if fresh["issues"] or remaining or _json(fresh["updates"])!=_json(plan["updates"]) or _json(fresh.get("retained_blanks",[]))!=_json(plan.get("retained_blanks",[])):
-        raise ValueError("清单与当前来源重新取数或空白保留依据不一致，请重新建立对应")
-    fresh["unused_sources"]=approved;fresh["unplaced_sources"]=remaining
-    check_cancel(cancel);log("按已保存更新清单生成更新后附注表格；不再调用模型识别")
-    prime=run/("更新后附注表格"+Path(a["path"]).suffix)
-    write_updated_workbook(a["path"],prime,fresh)
-    _verify_inputs(plan["inputs"]);check_cancel(cancel)
-    files={"a_prime":str(prime)}
-    new_link=None
-    selected_link=config.get("a_link") if "a_link" in config else plan.get("a_link")
-    if selected_link:
-        if not plan.get("a_link") or Path(selected_link).resolve()!=Path(plan["a_link"]).resolve():
-            raise ValueError("当前Word位置关联与更新清单不同，请重新生成更新清单")
-        old_link=_load_link(plan["a_link"])
-        word=run/"更新后附注.docx"
-        result=bridge({"action":"update","word":old_link["linked_word"],"excel":str(prime),"output":str(word),
-            "operations":plan.get("word_operations",[]),"chapter_title":CHAPTER_TITLE},run,cancel)
-        if not result.get("output_verified"):raise ValueError("Word尚未通过回读核验")
-        context=bridge({"action":"read","word":str(word),"chapter_title":CHAPTER_TITLE},run,cancel)
-        new_link={"schema":LINK_SCHEMA,"word_path":str(word),"word_hash":file_hash(word),
-            "linked_word":str(word),"linked_word_hash":file_hash(word),"a_path":str(prime),
-            "a_hash":file_hash(prime),"context":context,"scope":context.get("scope",{})}
-        link_path=save_json(run/"更新后附注表格与Word位置关联.json",new_link)
-        files.update(word=str(word),word_link=link_path)
-    _verify_inputs(plan["inputs"])
-    updated_context=new_link["context"].get("tables",[]) if new_link else working.get("context",[])
-    snapshot=read_workbook(prime,context=updated_context)
-    new_mapping=copy.deepcopy(working)
-    # 新布局已由前一步确认；只换来源身份和位置，不重新猜测业务语义。
-    new_mapping.update(source_path=str(prime),source_hash=snapshot["sha256"],original_path=str(prime),
-        original_hash=snapshot["sha256"],carrier="A",recalculated=False,recalculation={},confirmed_business_ranges={},
-        complete=True,unresolved=[],excluded=[],usage={},derived_from_mapping=plan["a_mapping"])
-    # 结构变更可能使旧表范围证据失效；用新映射的范围恢复真实业务空白候选。
-    for m in new_mapping["mappings"]:
-        try:cell_at(snapshot,m["sheet"],m["cell"])
-        except ValueError:
-            area=m.get("table_range")
-            if not area:raise ValueError("更新后附注表格映射包含没有范围依据的空白格")
-            table={"range":area,"table_semantic":m.get("table_semantic") or m.get("semantic_field"),
-                "note_ids":[m["slot_id"].split("-T",1)[0]],"scope":m["scope"],"header_cells":[]}
-            materialize_business_blanks(snapshot,m["sheet"],table)
-            cell_at(snapshot,m["sheet"],m["cell"])
-    new_mapping["confirmed_business_ranges"]={s["name"]:s.get("confirmed_business_ranges",[]) for s in snapshot["sheets"]}
-    if new_link:
-        new_mapping["a_link"]=files["word_link"];new_mapping["context"]=new_link["context"].get("tables",[])
-    else:new_mapping.pop("a_link",None)
-    new_mapping.pop("review_path",None)
-    new_mapping.pop("standard_review_path",None)
-    map_path=save_json(run/"更新后附注表格语义映射.json",new_mapping)
-    files["a_prime_mapping"]=map_path
-    trace=run/"本次更新核对.xlsx";trace_workbook(trace,fresh);files["trace"]=str(trace)
-    return {"status":"complete","message":f"已按清单更新{len(fresh['updates'])}个业务格；{len(fresh.get('retained_blanks',[]))}格因来源未提供而保持原空白，未计为已更新；{len(approved)}个来源经核实本次不采用。已保存更新后附注表格语义映射供下一轮复用。",
-        "files":files,"updated_cells":len(fresh["updates"]),"retained_blank_cells":len(fresh.get("retained_blanks",[])),"unused_source_cells":len(approved)}
+    if plan.get("schema")!=PLAN_SCHEMA:
+        raise ValueError("所选文件没有完整搬运安排；历史候选记录只供查看，不在写入时启动旧流程")
+    return _write_v2(config,run,log,cancel,path,plan)
+
 
 def run_step(step,config,log=None,cancel=None,progress=None):
     log=log or (lambda message:None);cancel=cancel or threading.Event();run=None

@@ -376,18 +376,20 @@ class 模板维度取数测试(unittest.TestCase):
         config={'output_dir':str(case.folder/'正式入口'),'gold_path':str(gold),'a_mapping':str(paths[0]),'b_mapping':str(paths[1]),'update_purpose':purpose}
         matched=run_step('match',config);self.assertEqual(matched['status'],'complete',matched)
         written=run_step('write',{**config,'update_plan':matched['files']['update_plan']});self.assertEqual(written['status'],'complete',written)
-        saved=load_fact_mapping(written['files']['a_prime_mapping'],read_standard_v2(gold))
-        result=next(r for r in saved['facts'] if r['id']=='明细!C2')
-        self.assertEqual(result['dimensions'],dims);self.assertIsNone(result['raw_value'])
-        self.assertEqual(result['raw_value_state'],'blank')
+        saved=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertNotIn('facts',saved)
+        self.assertEqual(saved['collections']['A']['mapping_path'],str(paths[0]))
+        book=load_workbook(written['files']['a_prime'])
+        self.assertIsNone(book['明细']['C2'].value);book.close()
         trace=load_workbook(written['files']['trace']);self.assertIn('B未提供字段',trace.sheetnames);trace.close()
         marked_config={**config,'output_dir':str(case.folder/'缺字段标注正式入口'),'update_purpose':marked}
         matched=run_step('match',marked_config);self.assertEqual(matched['status'],'complete',matched)
         written=run_step('write',{**marked_config,'update_plan':matched['files']['update_plan']})
         self.assertEqual(written['status'],'complete',written);self.assertEqual(written['updated_cells'],1)
-        saved=load_fact_mapping(written['files']['a_prime_mapping'],read_standard_v2(gold))
-        result=next(r for r in saved['facts'] if r['id']=='明细!C2')
-        self.assertEqual(result['dimensions'],dims);self.assertEqual(result['raw_value'],'B未提供')
+        saved=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertNotIn('facts',saved)
+        book=load_workbook(written['files']['a_prime'])
+        self.assertEqual(book['明细']['C2'].value,'B未提供');book.close()
         trace=load_workbook(written['files']['trace'])
         self.assertEqual(trace['更新记录'].max_row,2)
         self.assertEqual(trace['B未提供字段']['D2'].value,'标注B未提供，未计为取数更新');trace.close()
@@ -631,19 +633,14 @@ class 模板维度取数测试(unittest.TestCase):
         self.assertEqual([[sheet.cell(r,c).value for c in (1,2)] for r in range(2,6)],
                          [['甲类设备',77],['乙类设备',77],['丙类设备',77],['合计',231]])
         self.assertEqual(sheet['A9'].value,'后方说明');self.assertEqual(sheet['D9'].value,'旁侧说明');book.close()
-        saved=load_fact_mapping(written['files']['a_prime_mapping'],read_standard_v2(gold))
-        self.assertEqual(len(saved['facts']),4)
-        self.assertEqual(next(r for r in saved['facts'] if r['id']=='明细!B4')['dimensions']['asset_selection']['members'],['丙类设备'])
-        total=next(r for r in saved['facts'] if r['id']=='明细!B5')
-        reference=total['dimension_evidence']['asset_selection'][-1]
-        if word_table:self.assertEqual(reference,old_reference)
-        else:self.assertNotEqual(reference,old_reference)
-        catalog=context_catalog(saved['source_context'],saved['source_path'])
-        self.assertEqual(resolve_context(reference,catalog,'明细!B5')['scope']['bounds'],[1,1,5,2])
-        with self.assertRaises(ValueError):resolve_context(reference,catalog,'明细!B6')
+        saved=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertNotIn('facts',saved)
+        self.assertEqual(saved['collections']['A']['mapping_path'],str(paths[0]))
+        self.assertEqual(saved['collections']['B']['mapping_path'],str(paths[1]))
+        self.assertEqual(next(r for r in saved['updates'] if r['cell']=='B4')['actual_value'],77)
         self.assertEqual(case.target['source_context'][0]['row_count'],4)
 
-    def test_类别及年度更新通过正式入口且派生语义保持槽位(self):
+    def test_类别及年度更新只记执行动作而不拼出新身份(self):
         case=夹具.MatchTests();case.setUp()
         root,gold,old_paths=case.file_fixture();paths=[]
         for side,old_path,name,year,period_cell,label_cell in (
@@ -680,12 +677,13 @@ class 模板维度取数测试(unittest.TestCase):
         self.assertEqual(matched['status'],'complete',matched)
         written=run_step('write',{**config,'update_plan':matched['files']['update_plan']})
         self.assertEqual(written['status'],'complete',written)
-        result=load_fact_mapping(written['files']['a_prime_mapping'],standard)
+        result=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
         book=load_workbook(written['files']['a_prime']);sheet=book['附注']
         self.assertEqual([sheet[a].value for a in ['A8','D7','D8']],['乙运输工具','2025年12月31日\n年末余额',900]);book.close()
-        self.assertEqual(result['facts'][0]['metric_id'],a['facts'][0]['metric_id'])
-        expected=copy.deepcopy(b['facts'][0]['dimensions']);expected['entity']=a['facts'][0]['dimensions']['entity']
-        self.assertEqual(result['facts'][0]['dimensions'],expected)
+        self.assertNotIn('facts',result)
+        self.assertNotIn('recognition_provenance',result)
+        self.assertEqual(result['collections']['A']['mapping_hash'],hashes[paths[0]])
+        self.assertEqual(result['collections']['B']['mapping_hash'],hashes[paths[1]])
         self.assertEqual(a,before)
         self.assertEqual({p:file_hash(p) for p in hashes},hashes)
         missing_labels=copy.deepcopy(purpose);missing_labels['labels']=[]

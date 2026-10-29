@@ -152,14 +152,17 @@ internal static class Program
         foreach (var row in layout.Cells.GroupBy(c => c.XmlRowIndex).OrderBy(g => g.Key))
         {
             var first = row.First();
-            if (first.GridBefore == 0) continue;
-            var columns = Array.IndexOf(edges, first.GridBefore);
-            if (columns <= 0) throw new InvalidDataException("行首省略范围不能对应到提取后的网格。");
             var number = region.FirstRow + first.WordRowIndex - 1;
-            var start = ClosedXML.Excel.XLHelper.GetColumnLetterFromNumber(region.FirstColumn) + number;
-            var end = ClosedXML.Excel.XLHelper.GetColumnLetterFromNumber(region.FirstColumn + columns - 1) + number;
-            omitted.Add(new { sheet = region.Sheet, range = start == end ? start : start + ":" + end,
-                reason = "Word 原表该位置没有单元格" });
+            var left = Array.IndexOf(edges, first.GridBefore);
+            var right = Array.IndexOf(edges, first.RowEndColumn);
+            foreach (var (begin, stop) in new[] { (0, left), (right, edges.Length - 1) })
+            {
+                if (begin == stop) continue;
+                var start = ClosedXML.Excel.XLHelper.GetColumnLetterFromNumber(region.FirstColumn + begin) + number;
+                var end = ClosedXML.Excel.XLHelper.GetColumnLetterFromNumber(region.FirstColumn + stop - 1) + number;
+                omitted.Add(new { sheet = region.Sheet, range = start == end ? start : start + ":" + end,
+                    reason = "Word 原表该位置没有单元格" });
+            }
         }
         return omitted.ToArray();
     }
@@ -199,8 +202,9 @@ internal static class Program
                     if (previous is W.Paragraph paragraph && paragraph.InnerText.Trim() == before) matches.Add(paragraph);
                 if (matches.Count != 1) throw new InvalidDataException("所属表前标题原文不存在或不唯一：" + name);
                 var caption = matches[0];
-                if (caption.ChildElements.Any(e => e is not W.ParagraphProperties && e is not W.Run && e is not W.ProofError)
-                    || caption.Elements<W.Run>().Any(r => r.ChildElements.Any(e => e is not W.RunProperties && e is not W.Text)))
+                if (caption.ChildElements.Any(e => e is not W.ParagraphProperties && e is not W.Run && e is not W.ProofError
+                        && e is not W.BookmarkStart && e is not W.BookmarkEnd)
+                    || caption.Elements<W.Run>().Any(r => r.ChildElements.Any(e => e is not W.RunProperties && e is not W.Text && e is not W.LastRenderedPageBreak)))
                     throw new InvalidDataException("标题包含域、链接或其他对象，不能直接替换：" + name);
                 var path = new List<int>();
                 for (DocumentFormat.OpenXml.OpenXmlElement element = caption; element != body; element = element.Parent!)

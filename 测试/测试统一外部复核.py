@@ -49,10 +49,10 @@ class ExternalReviewTests(unittest.TestCase):
         config={'gold_path':str(gold),'a_mapping':saved['files']['a_mapping'],'b_mapping':saved['files']['a_mapping'],'output_dir':str(root/'正式流程')}
         matched=run_step('match',config)
         written=run_step('write',{**config,'update_plan':matched['files']['update_plan']})
-        derived=load_fact_mapping(written['files']['a_prime_mapping'],read_standard_v2(gold))
-        self.assertEqual(derived['facts'][0]['raw_value'],'人工保留原文')
-        self.assertNotIn('external_review_v2',derived)
-        self.assertIn('derivation',derived)
+        record=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertEqual(record['updates'][0]['actual_value'],'人工保留原文')
+        self.assertNotIn('external_review_v2',record)
+        self.assertNotIn('facts',record)
         self.assertTrue(all(file_hash(p)==h for p,h in frozen.items()))
         # 已确认格只能明确绑定原事实后更正；未绑定及无原文证据的意见均不能采纳。
         for suffix,change in [('原值注入',{'raw_value':99}),('数值作证据',{'dimension_evidence':{k:['B2'] for k in item['dimensions']}})]:

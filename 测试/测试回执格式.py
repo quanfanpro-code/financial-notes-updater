@@ -12,6 +12,24 @@ def scope_payload():
 
 
 class ResponseFormatTests(unittest.TestCase):
+    def test_候选详看与旧指标详看的结构分别符合实际校验器(self):
+        from 附注更新.表格编排 import validate_detail
+        payload={'task':'subtable_detail','metrics':[{'id':'m'}],'targets':[{'id':'A目标'}],
+            'source_text':{'原表':[{'row':1,'cells':[['A1','项目']]}]},
+            'positions':{'原表':['A1','B1']},'mechanical_comparison':{}}
+        answer={'structure':'原表行列','evidence':['原表!A1'],
+            'targets':[{'id':'A目标','candidates':['原表!B1'],'reason':'原文行列'}]}
+        self.schema(payload).validate(answer)
+        with self.assertRaises(ValidationError):self.schema(payload).validate({**answer,'allowed_metrics':[]})
+        snapshot={'sheets':[{'name':'原表','max_row':1,'max_column':2,
+            'cells':{'A1':{'row':1,'column':1,'value':'项目'},'B1':{'row':1,'column':2,'value':0}}}]}
+        table={'ranges':[{'sheet':'原表','range':'A1:B1'}],'evidence':['原表!A1']}
+        outline={'method':'b_required_location','context_ranges':[]}
+        self.assertEqual(validate_detail(answer,table,payload['targets'],snapshot,{'metric':{}},outline),answer)
+        legacy=copy.deepcopy(payload);del legacy['mechanical_comparison']
+        self.schema(legacy).validate({**answer,'allowed_metrics':['m']})
+        with self.assertRaises(ValidationError):self.schema(legacy).validate(answer)
+
     def schema(self,payload):
         result=response_format(payload)
         self.assertEqual(result["type"],"json_schema")

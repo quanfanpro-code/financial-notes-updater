@@ -454,10 +454,104 @@ def normalize_response(payload,result):
     return normalized
 
 
+def _a_review(payload):
+    areas={**_array(_text()),'minItems':1};evidence=copy.deepcopy(areas)
+    definitions={}
+    if 'text_evidence' in payload:
+        references=[ref for table in payload['text_evidence'].values() for ref in table]
+        references.extend(payload.get('source',{}).get('context',{}))
+        definitions['source_evidence']={**_ids(references),'minItems':1}
+        evidence={'$ref':'#/$defs/source_evidence'}
+    location=_text()
+    if 'review_focus' in payload:
+        from openpyxl.utils.cell import range_boundaries,get_column_letter
+        spans=[s for row in payload['review_focus'].values() for s in row]
+        cells=[f'{get_column_letter(c)}{r}' for span in spans for left,top,right,bottom in [range_boundaries(span)]
+               for r in range(top,bottom+1) for c in range(left,right+1)]
+        location=_enum(cells+spans);areas={**_array(location),'minItems':1}
+    patches=[]
+    for index,dimension in enumerate(payload['standards']['dimensions']):
+        name='dimension_'+str(index);definitions[name]=_unified_dimension(dimension)
+        patches.append(_object({'id':_enum([dimension['id']]),'ranges':areas,
+                                'value':{'$ref':'#/$defs/'+name},'evidence':evidence}))
+    changes=_array({'anyOf':patches}) if patches else {**_array(_object({})),'maxItems':0}
+    metric=_object({'id':_enum(m['id'] for m in payload['standards']['metrics']),'ranges':areas})
+    metrics=_array(metric)
+    if not payload['standards']['metrics']:metrics['maxItems']=0
+    role=_object({'range':location,'category':_enum(['label','annotation']),'reason':_text(),'evidence':evidence})
+    removed=_object({'id':_enum(d['id'] for d in payload['standards']['dimensions']),'ranges':areas})
+    corrections=_object({'metrics':metrics,'patches':changes,'resolved_ranges':_array(location),
+                         'non_business':_array(role),'remove_dimensions':_array(removed)})
+    issue=_object({'range':location,'reason':_text(),'evidence':evidence})
+    row=_object({'id':_enum(t['id'] for t in payload['reading']),'corrections':corrections,'issues':_array(issue)})
+    if payload.get('identity_collection_version')==1:
+        scope=_object({'table_id':_enum(t['id'] for t in payload['reading']),'ranges':_array(_text())})
+        exception=_object({**scope['properties'],'content':_text()})
+        relation=_object({'content':_text(),'record_ranges':_array(scope),'exceptions':_array(exception),'evidence':_array(_text())})
+        corrections['properties']['relations']=_array(_object({'index':{'type':'integer','minimum':0},'value':relation}))
+        corrections['required'].append('relations')
+        row['properties']['checked_relations']=_array({'type':'integer','minimum':0})
+        row['required'].append('checked_relations')
+    schema=_object({'tables':_array(row,count=len(payload['reading']))})
+    if definitions:schema['$defs']=definitions
+    return schema
+
+
 def response_format(payload):
     """只返回HTTP格式参数；输入对象和现有成功任务的身份保持不变。"""
     task=payload.get("task") if isinstance(payload,dict) else None
-    if task=="workbook_outline":
+    if task=='a_semantic_read' and payload.get('reading_ranges'):
+        from openpyxl.utils.cell import range_boundaries, get_column_letter, coordinate_to_tuple
+        branches=[];groups={}
+        for area in payload['reading_ranges']:
+            groups.setdefault(area['sheet'],[]).append(area)
+        for name,areas in groups.items():
+            patterns=[];bounds=[]
+            for area in areas:
+                left,top,right,bottom=range_boundaries(area['range']);bounds.append((left,top,right,bottom))
+                column='(?:'+'|'.join(get_column_letter(c) for c in range(left,right+1))+')'
+                row='(?:'+'|'.join(str(r) for r in range(top,bottom+1))+')'
+                cell=column+row;patterns.append(cell+'(?::'+cell+')?')
+            candidates=[]
+            for ref in payload['candidate_locations']:
+                sheet,address=ref.rsplit('!',1)
+                if sheet!=name:continue
+                r,c=coordinate_to_tuple(address)
+                if any(left<=c<=right and top<=r<=bottom for left,top,right,bottom in bounds):candidates.append(address)
+            # 原生结构回执总enum上限1000；位置用等价的精确正则保留全部候选。
+            data=_array({'type':'string','pattern':'^(?:'+'|'.join(candidates)+')$'}) if candidates else _ids([])
+            branches.append(_object({'id':_text(),'sheet':_enum([name]),
+                'range':{'type':'string','pattern':'^(?:'+'|'.join(patterns)+')$'},
+                'subject':_text(),'meaning':_text(),'data_ranges':data,
+                'context_ranges':_ids(span for area in areas for span in area.get('context_ranges',[]))}))
+            if payload.get('identity_collection_version')==1:
+                branches[-1]['properties']['context_references']=_array(_object({
+                    'sheet':_enum(s['sheet'] for s in payload['source']['sheets']),'range':_text()}))
+                branches[-1]['required'].append('context_references')
+        schema=_object({'tables':_array({'anyOf':branches}),'notes':{'type':'string'}})
+    elif task=='a_semantic_review':
+        schema=_a_review(payload)
+    elif task in {'b_locate','b_candidate_followup'}:
+        ranges=_array(_object({'sheet':_enum(s['sheet'] for s in payload['sheets']),'range':_text()}))
+        references=[]
+        for sections,field in ((payload['sheets'],'preview_text'),(payload.get('local_text',[]),'text')):
+            references.extend(part['sheet']+'!'+cell[0] for part in sections for row in part.get(field,[])
+                              for cell in row['cells'] if isinstance(cell[1],str) and cell[1].strip())
+        references.extend(ref for area in (payload.get('previous_result') or {}).get('areas',[]) for ref in area['evidence'])
+        references.extend((payload.get('previous_result') or {}).get('evidence',[]))
+        evidence=_ids(references)
+        if task=='b_locate':
+            evidence['minItems']=1
+            groups=_ids(g['id'] for g in payload['requirements']);groups['minItems']=1
+            schema=_object({'areas':_array(_object({'id':_text(),'subject':_text(),'purpose':_text(),
+                'ranges':ranges,'evidence':evidence,'group_ids':groups,'reason':_text()})),
+                'unresolved_groups':_array(_object({'id':_enum(g['id'] for g in payload['requirements']),'reason':_text()})),
+                'read_ranges':ranges})
+        else:
+            targets=_array(_object({'id':_enum(t['id'] for t in payload['targets']),
+                'candidates':_array(_text()),'reason':_text()}),count=len(payload['targets']))
+            schema=_object({'read_ranges':ranges,'ranges':ranges,'structure':_text(),'evidence':evidence,'targets':targets})
+    elif task=="workbook_outline":
         ranges=_array(_object({"sheet":_enum(s["sheet"] for s in payload["sheets"]),"range":_text()}))
         evidence=_ids(s['sheet']+'!'+cell[0] for s in payload['sheets'] for row in s.get('title_clues',[]) for cell in row['cells'])
         schema=_object({"subjects":_array(_text()),"subtables":_array(_object({
@@ -475,6 +569,9 @@ def response_format(payload):
         schema=_object({"allowed_metrics":_ids(m["id"] for m in payload["metrics"]),"structure":_text(),
             "evidence":evidence,"targets":_array(_object({"id":_enum(t["id"] for t in payload["targets"]),
             "candidates":candidates,"reason":_text()}),count=len(payload["targets"]))})
+        if 'mechanical_comparison' in payload:
+            # 此阶段只找候选，选标准由后续A/B共用阅读执行。
+            schema['properties'].pop('allowed_metrics');schema['required'].remove('allowed_metrics')
     elif task in {"source_scope","source_scope_batch"} and _fixed_scope_mode(payload):
         schema=_fixed_scope_schema(payload)
     elif task=="source_scope":

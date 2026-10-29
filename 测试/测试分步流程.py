@@ -176,6 +176,21 @@ class StepFlowTests(unittest.TestCase):
             b = self.complete(self.run_step(api, "recognize_b", a_mapping=a))["b_mapping"]
         return a, b
 
+    def saved_legacy_mapping(self, api, carrier, **config):
+        """合成历史格式的已有结果，仅供兼容读取和保存测试，不启动旧识别入口。"""
+        config={**self.config,**config}
+        source=config['a_path' if carrier=='A' else 'b_path'];gold=config['gold_path']
+        link=config.get('a_link') if carrier=='A' else None
+        context=api._load_link(link,source)['context']['tables'] if link else []
+        snapshot=api.read_workbook(source,context=context)
+        reply=StepEngine({},gold,self.work).recognize(snapshot,
+            reference=read_json(config['a_mapping']) if carrier=='B' and config.get('a_mapping') else None)
+        record=api._record(snapshot,reply,carrier,gold,source,context,link)
+        return api.save_json(self.work/(carrier+'已有结果_'+uuid.uuid4().hex[:8]+'.json'),record)
+
+    def saved_legacy_pair(self, api):
+        return self.saved_legacy_mapping(api,'A'),self.saved_legacy_mapping(api,'B')
+
     def mapping_copy(self, path, **changes):
         record = read_json(path)
         record.update(changes)
@@ -267,7 +282,7 @@ class StepFlowTests(unittest.TestCase):
                 self.assertEqual(bad_record,original)
 
     def test_old_and_new_metric_records_match_without_rewriting_old_files(self):
-        api=self.api();am,bm=self.recognized_pair(api)
+        api=self.api();am,bm=self.saved_legacy_pair(api)
         legacy=[]
         for path in (am,bm):
             record=read_json(path)
@@ -286,7 +301,10 @@ class StepFlowTests(unittest.TestCase):
                     self.assertEqual(len(plan["updates"]),1)
             written=self.complete(self.run_step(api,"write",update_plan=files["update_plan"]))
         book=load_workbook(written["a_prime"]);self.assertEqual(book.active["B2"].value,125);book.close()
-        self.assertNotIn("metric",read_json(written["a_prime_mapping"])["mappings"][0]["dimensions"])
+        execution=read_json(written["a_prime_mapping"])
+        self.assertNotIn("mappings",execution)
+        self.assertEqual(execution["collections"]["A"]["mapping_path"],am)
+        self.assertEqual(execution["collections"]["B"]["mapping_path"],legacy[1])
         self.assertEqual({path:digest(path) for path in originals},originals)
         wrong=read_json(am)["mappings"];wrong[0]["dimensions"]["metric"]="坏账准备"
         invalid=self.mapping_copy(am,mappings=wrong);before=digest(invalid)
@@ -574,10 +592,10 @@ class StepFlowTests(unittest.TestCase):
         self.assertEqual(StepEngine.calls, [])
         original_a = digest(extracted["a_path"])
         with patch.object(api, "SemanticEngine", StepEngine):
-            a_map = self.complete(self.run_step(api, "recognize_a", **extracted))["a_mapping"]
+            a_map = self.saved_legacy_mapping(api,"A",**extracted)
             self.assertEqual(len(StepEngine.calls), 1)
             self.assertNotIn("b_mapping", read_json(a_map))
-            b_map = self.complete(self.run_step(api, "recognize_b", a_mapping=a_map))["b_mapping"]
+            b_map = self.saved_legacy_mapping(api,"B",a_mapping=a_map)
             self.assertEqual(len(StepEngine.calls), 2)
             self.assertTrue(StepEngine.calls[-1]["reference"])
             before_match = set(self.output.rglob("*.xlsx"))
@@ -600,24 +618,15 @@ class StepFlowTests(unittest.TestCase):
         self.assertEqual(digest(word), original_word)
         self.assertEqual(digest(extracted["a_path"]), original_a)
         updated_mapping = read_json(written["a_prime_mapping"])
-        self.assertEqual(updated_mapping["source_hash"], digest(written["a_prime"]))
-        self.assertEqual(Path(updated_mapping["source_path"]), Path(written["a_prime"]))
-        self.assertEqual(updated_mapping["carrier"], "A")
+        self.assertEqual(updated_mapping["output_hash"], digest(written["a_prime"]))
+        self.assertEqual(Path(updated_mapping["output_path"]), Path(written["a_prime"]))
+        self.assertEqual(updated_mapping["schema"], "附注更新执行记录-v1")
         self.assertEqual(Path(updated_mapping["a_link"]), Path(written["word_link"]))
 
-        # 下一轮直接复用A′映射与位置关联，只识别新的B。
-        new_b=self.work/"第二轮B.xlsx";book=Workbook();book.active.append(["项目","库存现金"]);book.active.append(["期末余额",250]);book.save(new_b);book.close()
-        with patch.object(api,"SemanticEngine",StepEngine):
-            second_b=self.complete(self.run_step(api,"recognize_b",b_path=str(new_b),a_mapping=written["a_prime_mapping"]))["b_mapping"]
-        self.assertEqual(len(StepEngine.calls),3)
-        with patch.object(api,"SemanticEngine",side_effect=AssertionError("下一轮不应再次识别A")):
-            second_plan=self.complete(self.run_step(api,"match",a_path=written["a_prime"],b_path=str(new_b),
-                a_mapping=written["a_prime_mapping"],b_mapping=second_b))
-            second_write=self.complete(self.run_step(api,"write",a_path=written["a_prime"],b_path=str(new_b),
-                update_plan=second_plan["update_plan"]))
-        self.assertEqual(Document(second_write["word"]).tables[0].cell(1,1).text,"250.00")
-        self.assertEqual(Document(written["word"]).tables[0].cell(1,1).text,"125.00")
-
+        self.assertNotIn("mappings",updated_mapping)
+        self.assertEqual(set(updated_mapping["collections"]),{"A","B"})
+        self.assertEqual(len(StepEngine.calls),2)
+        # 下一轮复用原判断的入口由当前直接识别测试覆盖；执行记录不是新的A身份。
 
     def test_missing_chapter_never_falls_back_to_extracting_whole_word(self):
         api=self.api();word=self.work/"只有其他章节.docx"
@@ -709,13 +718,13 @@ class StepFlowTests(unittest.TestCase):
 
     def test_saved_mappings_can_match_and_write_without_recognizing_again(self):
         api = self.api()
-        a_map, b_map = self.recognized_pair(api)
+        a_map, b_map = self.saved_legacy_pair(api)
         originals = {str(path): digest(path) for path in (self.a, self.b, Path(a_map), Path(b_map))}
         with patch.object(api, "SemanticEngine", side_effect=AssertionError("普通对应与写入无需模型")):
             matched = self.complete(self.run_step(api, "match", a_mapping=a_map, b_mapping=b_map))
             written = self.complete(self.run_step(api, "write", update_plan=matched["update_plan"]))
         self.assertEqual(load_workbook(written["a_prime"]).active["B2"].value, 125)
-        self.assertEqual(read_json(written["a_prime_mapping"])["source_hash"], digest(written["a_prime"]))
+        self.assertEqual(read_json(written["a_prime_mapping"])["output_hash"], digest(written["a_prime"]))
         for path, expected in originals.items():
             self.assertEqual(digest(path), expected)
 
@@ -854,16 +863,17 @@ class StepFlowTests(unittest.TestCase):
     def test_added_gold_keeps_old_a_mapping_usable_for_new_b_and_next_round(self):
         api=self.api()
         with patch.object(api,"SemanticEngine",StepEngine):
-            a_map=self.complete(self.run_step(api,"recognize_a"))["a_mapping"]
+            a_map=self.saved_legacy_mapping(api,"A")
             newer=self.new_gold()
-            b_map=self.complete(self.run_step(api,"recognize_b",a_mapping=a_map,gold_path=newer))["b_mapping"]
+            b_map=self.saved_legacy_mapping(api,"B",a_mapping=a_map,gold_path=newer)
         with patch.object(api,"SemanticEngine",side_effect=AssertionError("复用旧A映射不得重新识别")):
             plan=self.complete(self.run_step(api,"match",a_mapping=a_map,b_mapping=b_map,gold_path=newer))
             output=self.complete(self.run_step(api,"write",update_plan=plan["update_plan"],gold_path=newer))
         self.assertEqual(len(StepEngine.calls),2)
-        self.assertEqual(read_json(output["a_prime_mapping"])["gold_hash"],digest(newer))
-        self.assertNotEqual(Path(read_json(output["a_prime_mapping"])["gold_path"]),Path(newer))
-        self.assertEqual(digest(read_json(output["a_prime_mapping"])["gold_path"]),digest(newer))
+        execution=read_json(output["a_prime_mapping"])
+        self.assertEqual(execution["collections"]["A"]["gold_hash"],digest(self.gold))
+        self.assertEqual(execution["collections"]["B"]["gold_hash"],digest(newer))
+        self.assertNotIn("facts",execution)
         self.assertEqual(read_json(a_map)["gold_hash"],digest(self.gold))
         self.assertEqual(load_workbook(output["a_prime"]).active["B2"].value,125)
 
@@ -925,8 +935,8 @@ class StepFlowTests(unittest.TestCase):
         context=read_json(extracted["a_link"])["context"]["tables"]
         self.assertEqual(context[0]["structural_omissions"][0]["range"],"B3")
         with patch.object(api,"SemanticEngine",StepEngine):
-            a_map=self.complete(self.run_step(api,"recognize_a",**extracted))["a_mapping"]
-            b_map=self.complete(self.run_step(api,"recognize_b",a_mapping=a_map))["b_mapping"]
+            a_map=self.saved_legacy_mapping(api,"A",**extracted)
+            b_map=self.saved_legacy_mapping(api,"B",a_mapping=a_map)
         record=read_json(a_map)
         self.assertEqual([(m["sheet"],m["cell"]) for m in record["mappings"]],[("sheet1","C3")])
         self.assertNotIn("B3",api._snapshot(record)["sheets"][0]["cells"])
@@ -934,10 +944,12 @@ class StepFlowTests(unittest.TestCase):
             plan=self.complete(self.run_step(api,"match",a_mapping=a_map,b_mapping=b_map,a_path=""))
             written=self.complete(self.run_step(api,"write",update_plan=plan["update_plan"],a_path=""))
         updated=read_json(written["a_prime_mapping"])
-        _,restored=api._load_mapping(written["a_prime_mapping"],"A")
+        association=read_json(written["word_link"])
+        restored=api.read_workbook(written["a_prime"],context=association["context"]["tables"])
         self.assertNotIn("B3",restored["sheets"][0]["cells"])
         self.assertEqual(restored["sheets"][0]["cells"]["C3"]["value"],125)
-        self.assertEqual(updated["context"][0]["structural_omissions"][0]["range"],"B3")
+        self.assertEqual(association["context"]["tables"][0]["structural_omissions"][0]["range"],"B3")
+        self.assertNotIn("mappings",updated)
         output=Document(written["word"]).tables[0]._tbl
         self.assertEqual(len(output.tr_lst[1].tc_lst),len(document.tables[0]._tbl.tr_lst[1].tc_lst))
         self.assertEqual("".join(t.text for t in output.tr_lst[1].tc_lst[0].xpath(".//w:t")),"125.00")

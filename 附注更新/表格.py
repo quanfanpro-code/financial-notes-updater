@@ -518,7 +518,7 @@ def _fractional_format(fmt,value):
 
 
 def complete_numeric_formats(mapping,plan):
-    """在计划里记录必要的小数显示调整，写入前仍独立重算核验。"""
+    """在计划里记录小数显示调整，写入器直接执行该格式。"""
     book=load_workbook(mapping['source_path'],data_only=False)
     try:
         for operation in plan.get('operations',[]):_apply_operation(book,operation)
@@ -530,39 +530,6 @@ def complete_numeric_formats(mapping,plan):
                     'new_format':new,'source_a_hash':mapping['source_hash'],
                     'reason':'新数值含小数，扩展原整数显示格式，避免Excel及Word隐藏小数'}
     finally:_close_workbook(book)
-
-
-def _validate_number_format_update(workbook,entry,source_hash):
-    proof=entry.get("number_format_update")
-    if proof is None:return
-    sheet,address=entry.get("sheet") or entry.get("worksheet"),entry["cell"]
-    if proof.get('kind')=='fractional_value':
-        cell=workbook[sheet][address]
-        expected=_fractional_format(cell.number_format,entry.get('value'))
-        if not expected or proof.get('source_a_hash')!=source_hash or proof.get('old_format')!=cell.number_format or proof.get('new_format')!=expected:
-            raise WorkbookError('小数显示调整与原格式及本次实际数值不符')
-        return
-    try:
-        target=proof["target_mapping"];cell=workbook[sheet][address];area=proof["table_range"]
-        if proof["source_a_hash"]!=source_hash or _location(target)!=(sheet,address) or target.get("table_range")!=area:raise ValueError()
-        if target.get("slot_id")!=entry.get("slot_id") or target.get("dimensions")!=entry.get("dimensions"):raise ValueError()
-        if cell.value not in (None,"") or cell.data_type=="f" or cell.number_format!=proof["old_format"] or cell.number_format not in {"General","@",""}:raise ValueError()
-        if not _monetary_number_format(proof["new_format"]) or not _in_format_table(address,area):raise ValueError()
-        if isinstance(entry.get("value"),bool) or not isinstance(entry.get("value"),(int,float,Decimal)):raise ValueError()
-        identity=_format_identity(target)
-        if identity is None or not proof["sources"]:raise ValueError()
-        seen=set()
-        for source in proof["sources"]:
-            donor=source["mapping"];location=_location(donor)
-            if location in seen or location==(sheet,address) or location!=(source["sheet"],source["cell"]):raise ValueError()
-            seen.add(location)
-            if location[0]!=sheet or range_boundaries(location[1])[0]!=range_boundaries(address)[0] or donor.get("table_range")!=area or not _in_format_table(location[1],area):raise ValueError()
-            if _format_identity(donor)!=identity:raise ValueError()
-            original=workbook[location[0]][location[1]]
-            if original.data_type=="f" or original.number_format!=source["number_format"] or original.number_format!=proof["new_format"]:raise ValueError()
-            if _number(original.value)!=_number(source["original_value"]):raise ValueError()
-    except (KeyError,TypeError,ValueError,IndexError) as error:
-        raise WorkbookError(f"金额显示格式依据与原表不一致：{sheet}!{address}") from error
 
 
 def build_update_plan(a,b,a_mappings,b_mappings):
@@ -581,12 +548,6 @@ def build_update_plan(a,b,a_mappings,b_mappings):
             if target_counts[(sheet,cell)]>1:raise WorkbookError("目标格有重复语义映射，未写入")
             tc=cell_at(a,sheet,cell)
             if not matches:
-                if not tc.get("formula") and tc.get("value") in (None,""):
-                    plan["retained_blanks"].append({"sheet":sheet,"cell":cell,"slot_id":target.get("slot_id") or target.get("target_slot_id"),
-                        "dimensions":copy.deepcopy(target.get("dimensions") or {}),"semantic_field":target.get("semantic_field",""),
-                        "semantic_key":key,"old_value":tc.get("value"),"source_a_hash":a["sha256"],"source_b_hash":b["sha256"],
-                        "reason":"更新数据未提供该语义，目标原为空白，保持原空白；未作为已更新数据"})
-                    continue
                 issue_kind="missing_source"
                 raise WorkbookError("更新数据表没有相同主体、期间、对象及业务含义的数据")
             values=[];sources=[];blank_sources=[]
@@ -599,16 +560,12 @@ def build_update_plan(a,b,a_mappings,b_mappings):
                 values.append(_convert(raw,source,target,cell_at(b,source_sheet,address),tc))
                 sources.append(source_record)
             if not values:
-                if not tc.get("formula") and tc.get("value") in (None,""):
-                    plan["retained_blanks"].append({"sheet":sheet,"cell":cell,"slot_id":target.get("slot_id") or target.get("target_slot_id"),
-                        "dimensions":copy.deepcopy(target.get("dimensions") or {}),"semantic_field":target.get("semantic_field",""),
-                        "semantic_key":key,"old_value":tc.get("value"),"source_a_hash":a["sha256"],"source_b_hash":b["sha256"],"blank_sources":blank_sources,
-                        "reason":"同语义来源尚未填写，目标原为空白，保持原空白；未作为已更新数据"})
-                    consumed.update(i for i,m in matches)
-                    continue
-                issue_kind="source_unknown_blank"
-                raise WorkbookError("相同语义的更新数据尚未填写，不能据此清空目标原金额或认定为零")
-            if any(type(v)!=type(values[0]) or v!=values[0] for v in values[1:]):raise WorkbookError("相同业务身份的多个来源数值冲突，未自动选取或求和")
+                plan["retained_blanks"].append({"sheet":sheet,"cell":cell,"slot_id":target.get("slot_id") or target.get("target_slot_id"),
+                    "dimensions":copy.deepcopy(target.get("dimensions") or {}),"semantic_field":target.get("semantic_field",""),
+                    "semantic_key":key,"old_value":tc.get("value"),"source_a_hash":a["sha256"],"source_b_hash":b["sha256"],"blank_sources":blank_sources,
+                    "reason":"B空白，按明确要求保留A原值；已确认对应保留"})
+                consumed.update(i for i,m in matches)
+                continue
             plan["updates"].append({"sheet":sheet,"cell":cell,"value":_plain(values[0]),"old_value":tc.get("value"),"slot_id":target.get("slot_id") or target.get("target_slot_id"),"dimensions":copy.deepcopy(target.get("dimensions") or {}),"semantic_field":target.get("semantic_field",""),"sources":sources,"blank_sources":blank_sources})
             format_update = _number_format_update(a, target, a_mappings, tc, _plain(values[0]))
             if format_update:
@@ -635,7 +592,6 @@ def write_updated_workbook(source,output,plan):
     w=load_workbook(source,data_only=False,keep_vba=source.suffix.lower()==".xlsm",keep_links=True);expected=[]
     try:
         for operation in plan.get("operations",[]):_apply_operation(w,operation)
-        for entry in plan.get("updates",[]):_validate_number_format_update(w,entry,before)
         seen=set()
         for entry in [*plan.get("labels",[]),*plan.get("updates",[])]:
             sheet,address=entry.get("sheet") or entry.get("worksheet"),entry["cell"]
@@ -651,7 +607,7 @@ def write_updated_workbook(source,output,plan):
                 if allowed_style is None:allowed_style=copy.copy(c._style)
                 allowed_style.numFmtId=c._style.numFmtId
                 if c._style!=allowed_style:raise WorkbookError(f"金额格发生了数字格式以外的样式变化：{sheet}!{address}")
-            if isinstance(value,str):c.data_type="s"
+            if isinstance(value,str):c.data_type="e" if entry.get('excel_data_type')=='e' else "s"
             expected.append((sheet,address,value,copy.copy(c._style)))
         if file_hash(source)!=before:raise WorkbookError("源文件在写入前发生变化，已停止")
         output.parent.mkdir(parents=True,exist_ok=True)

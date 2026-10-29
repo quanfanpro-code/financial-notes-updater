@@ -11,6 +11,56 @@ from 附注更新.统一识别 import UnifiedSemanticEngine
 
 
 class B范围定位测试(unittest.TestCase):
+    def test_共用阅读保留定位预览说明但不扩大数据范围(self):
+        from 附注更新.A语义阅读 import semantic_read_input, validate_scoped_reading
+        from 测试.测试引用来源语义 import 原格
+        snapshot={'path':'另一材料.xlsx','sha256':'原件哈希','semantic_formula_sources':4,'sheets':[
+            {'name':'明细','max_row':30,'max_column':3,'merges':[], 'cells':{
+                'A1':原格(1,1,'说明：本期期末为2023年12月31日'),
+                'A20':原格(20,1,'实际业务'), 'A21':原格(21,1,'项目'),
+                'B21':原格(21,2,'期末余额'), 'A22':原格(22,1,'分类甲'),
+                'B22':原格(22,2,12), 'A30':原格(30,1,'尚未阅读区域')}}]}
+        # 预览取前八个内容行；补足正文行，确保表尾并未预读。
+        snapshot['sheets'][0]['cells'].update({f'A{r}':原格(r,1,'正文') for r in range(2,10)})
+        scope={'candidate_locations':['明细!B22'],'targets':[], 'details':[{'subtable_id':'原表','structure':'期末分类'}]}
+        outline={'subtables':[{'id':'原表','ranges':[{'sheet':'明细','range':'A20:C22'}]}]}
+        payload=semantic_read_input(snapshot,[],scope,outline)
+        self.assertIn('本期期末为2023年12月31日',payload['source']['sheets'][0]['rows'])
+        self.assertEqual(payload['candidate_locations'],['明细!B22'])
+        self.assertEqual(payload['reading_ranges'],[{'sheet':'明细','range':'A20:C22','context_ranges':['A1:C8']}])
+        self.assertIn('不并入或扩大',payload['range_rule'])
+        table={'id':'业务','sheet':'明细','range':'A20:C22','subject':'业务','meaning':'分类余额',
+               'data_ranges':['B22'],'context_ranges':['A1']}
+        validate_scoped_reading({'tables':[table]},snapshot,scope,outline)
+        scope['candidate_locations'].append('明细!A22')
+        semantic_read_input(snapshot,[],scope,outline)
+        validate_scoped_reading({'tables':[table]},snapshot,scope,outline)
+        from 附注更新.A语义阅读 import table_packet, reading_questions
+        self.assertIn('A22',table_packet(table,snapshot,[])['candidate_cells'])
+        self.assertNotIn('A22',table['data_ranges'])
+        scope['candidate_locations'].append('明细!A30')
+        with self.assertRaisesRegex(ValueError,'遗漏候选=.*明细!A30'):
+            validate_scoped_reading({'tables':[table]},snapshot,scope,outline)
+        scope['candidate_locations'].remove('明细!A30')
+        table['data_ranges'].append('B21')
+        with self.assertRaisesRegex(ValueError,'多出数据=.*明细!B21'):
+            validate_scoped_reading({'tables':[table]},snapshot,scope,outline)
+        table['data_ranges'].remove('B21')
+        table['data_ranges']=[]
+        self.assertEqual(reading_questions({'tables':[table]},snapshot)[0]['数据范围外的数值'],['B22'])
+        table['data_ranges']=['B22']
+        scope['candidate_locations'].remove('明细!A22')
+        table['context_ranges']=['A30']
+        with self.assertRaisesRegex(ValueError,'公共说明超出已展示范围'):
+            validate_scoped_reading({'tables':[table]},snapshot,scope,outline)
+        table['context_ranges']=['A1'];table['range']='A1:C22'
+        with self.assertRaisesRegex(ValueError,'B阅读超出已定位范围：明细!A1:C22'):
+            validate_scoped_reading({'tables':[table]},snapshot,scope,outline)
+        snapshot['semantic_formula_sources']=3
+        legacy=semantic_read_input(snapshot,[],scope,outline)
+        self.assertNotIn('reading_ranges',legacy)
+        self.assertNotIn('本期期末为2023年12月31日',legacy['source']['sheets'][0]['rows'])
+
     def test_定位概要保留跨表槽位含义且不同成员不拆组(self):
         from 附注更新.B范围定位 import requirement_groups, location_payload
         from 附注更新.表格 import read_workbook
@@ -73,6 +123,41 @@ class B范围定位测试(unittest.TestCase):
                            'ranges': [{'sheet': '综合', 'range': 'A1:C3'}], 'evidence': ['综合!A2'],
                            'group_ids': groups, 'reason': '期末原值披露在该区域'}],
                 'unresolved_groups': [], 'read_ranges': []}
+
+    def test_候选行名必须共同分类复核并正式回读(self):
+        def respond(engine,system,payload):
+            answer=self.response(engine,system,payload)
+            if payload['task']=='subtable_detail':
+                for row in answer['targets']:row['candidates'].append('综合!A3')
+            return answer
+        with patch.object(UnifiedSemanticEngine,'_http',respond):
+            target=self.case.target();self.case.requests.clear()
+            engine=self.case.engine()
+            result=engine.recognize_workbook(self.case.source,target_mapping=target)
+        self.assertEqual(result['recognition_scope']['candidate_locations'],['综合!A3','综合!B3'])
+        self.assertEqual(len(result['facts']),1)
+        self.assertIn('A3',[r['cell'] for r in result['excluded']])
+        self.assertTrue(result['recognition_scope']['coverage']['complete'])
+        self.assertEqual(result['recognition_scope']['coverage']['confirmed_candidate_count'],2)
+        self.assertIn('a_semantic_review',[p['task'] for p in self.case.requests])
+        from 附注更新.统一勾稽 import load_fact_mapping
+        self.assertEqual(load_fact_mapping(result['mapping_path'],engine.standard)['excluded'],result['excluded'])
+
+    def test_身份核查中断不当成身份不同补查(self):
+        from 附注更新.语义 import SemanticError
+        def reply(engine,system,payload):
+            if payload['task']=='a_semantic_review':raise SemanticError('本轮核查中断')
+            if payload['task']=='b_candidate_followup':raise AssertionError('未核查不能补查')
+            return self.response(engine,system,payload)
+        with patch.object(UnifiedSemanticEngine,'_http',reply):
+            target=self.case.target()
+            engine=self.case.engine()
+            result=engine.recognize_workbook(self.case.source,target_mapping=target)
+        self.assertFalse(result['b_identity_coverage']['complete'])
+        self.assertFalse(result['recognition_scope']['coverage']['complete'])
+        from 附注更新.统一勾稽 import load_fact_mapping
+        saved=load_fact_mapping(result['mapping_path'],engine.standard)
+        self.assertEqual(saved['unresolved'],result['unresolved'])
 
     def test_普通入口按概要定位且保存可回读(self):
         from 附注更新.表格编排 import validate_saved_scope

@@ -107,8 +107,9 @@ class MeaningAndValueTests(unittest.TestCase):
         self.assertEqual(result.tables[0].cell(1, 1).text, literal)
         self.assertEqual(result.tables[0].style.style_id, table.style.style_id)
         self.assertEqual([p.text for p in result.paragraphs], [p.text for p in doc.paragraphs])
-        derived = load_fact_mapping(written['files']['a_prime_mapping'], read_standard_v2(gold))
-        self.assertEqual(derived['facts'][0]['raw_value'], literal)
+        saved = json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertEqual(saved['updates'][0]['actual_value'], literal)
+        self.assertNotIn('facts', saved)
         self.assertTrue(all(file_hash(p) == h for p, h in protected.items()))
 
 

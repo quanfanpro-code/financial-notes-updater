@@ -16,7 +16,7 @@ LOCATION_PROMPT = '''根据A需求概要，快速找到B中可能承载这些披
 每次返回累计已经找到的areas及unresolved_groups，read_ranges只列下一次必需补读。最终每个需求组都要有相关区域或明确未定位原因。
 区域可重叠、可有多个来源；不要把同一披露的承接表当作已确认独立来源。不用金额相等证明对应，不按文件名覆盖主体或年度原文。
 严格返回 {"areas":[{"id":"区域编号","subject":"科目","purpose":"披露内容","ranges":[{"sheet":"原名","range":"A1:D20"}],"evidence":["原名!A1"],"group_ids":["需求组编号"],"reason":"定位依据"}],"unresolved_groups":[{"id":"需求组编号","reason":"未定位原因"}],"read_ranges":[]}。
-evidence必须引用已经展示的文字原格。ranges保留承载数据的区域而非仅标题。只定位可能来源，不声称组内每个A格都有B来源。'''
+evidence必须引用已经展示的文字原格；只从preview_text、local_text列出的文字地址或上次已核实引用中选取。合并区域须引用实际存放文字的首格，不引用其空白延续格；数值格及未展示位置也不能作文字依据。ranges保留承载数据的区域而非仅标题。只定位可能来源，不声称组内每个A格都有B来源。'''
 
 
 def requirement_groups(target, standard, *, slot_correspondence=False):

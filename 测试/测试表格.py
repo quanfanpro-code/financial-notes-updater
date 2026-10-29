@@ -9,6 +9,12 @@ ROOT=Path(__file__).resolve().parents[1]
 WORK=ROOT/"测试结果"/("表格_"+uuid.uuid4().hex[:8])
 WORK.mkdir(parents=True,exist_ok=True)
 class WorkbookTests(unittest.TestCase):
+    def test_公式错误原值搬运保留Excel错误类型(self):
+        api=self.api();source=WORK/'错误值搬运样例.xlsx';output=WORK/'错误值搬运结果.xlsx'
+        workbook=Workbook();workbook.active.title='样例';workbook.active['B2']=8;workbook.save(source);workbook.close()
+        api.write_updated_workbook(source,output,{'updates':[{'sheet':'样例','cell':'B2','value':'#DIV/0!','excel_data_type':'e'}]})
+        result=load_workbook(output);self.assertEqual((result['样例']['B2'].value,result['样例']['B2'].data_type),('#DIV/0!','e'));result.close()
+
     def test_formula_empty_string_cache_is_not_missing_result(self):
         import zipfile
         from xml.etree import ElementTree as ET
@@ -136,15 +142,23 @@ class WorkbookTests(unittest.TestCase):
         entry=next(e for e in api.build_update_plan(snapshot,sb,am,bm)["updates"] if e["cell"]=="D5")
         self.assertNotIn("number_format_update",entry)
 
-    def test_writer_rejects_format_proof_that_disagrees_with_original_target_styles(self):
+    def test_写入器直接执行已保存格式不复判业务身份(self):
         import copy
+        from unittest.mock import patch
         api=self.api();a,b,sa,sb,am,bm=self.cash_format_fixture();plan=api.build_update_plan(sa,sb,am,bm)
         entry=next(e for e in plan["updates"] if e["cell"]=="D5");self.assertIn("number_format_update",entry)
         for fmt in ("0.00%","0.0000"):
             altered=copy.deepcopy(plan)
-            next(e for e in altered["updates"] if e["cell"]=="D5")["number_format_update"]["new_format"]=fmt
-            with self.assertRaisesRegex(ValueError,"格式"):
-                api.write_updated_workbook(a,WORK/("拒绝格式_"+uuid.uuid4().hex[:8]+".xlsx"),altered)
+            next(e for e in altered["updates"] if e["cell"]=="D5")["number_format_update"]={"new_format":fmt}
+            output=WORK/("直接格式_"+uuid.uuid4().hex[:8]+".xlsx")
+            with patch.object(api,'_format_identity',side_effect=AssertionError('写入不复判业务身份')):
+                api.write_updated_workbook(a,output,altered)
+            book=load_workbook(output)
+            try:
+                self.assertEqual(book['附注']['D5'].number_format,fmt)
+                self.assertEqual(book['附注']['D5'].value,entry['value'])
+            finally:book.close()
+            self.assertEqual(api.file_hash(a),sa['sha256'])
 
     def test_source_grid_adds_unformatted_blank_without_claiming_business(self):
         import copy
@@ -168,7 +182,8 @@ class WorkbookTests(unittest.TestCase):
         # 进入候选并不把来源空白变成可清除旧金额的零。
         target=copy.deepcopy(snapshot);target["sheets"][0]["cells"]["B3"]["value"]=7
         plan=api.build_update_plan(target,snapshot,[self.mapping("B3")],[self.mapping("B3")])
-        self.assertEqual([x["kind"] for x in plan["issues"]],["source_unknown_blank"])
+        self.assertFalse(plan['issues'])
+        self.assertEqual(plan['retained_blanks'][0]['old_value'],7)
         self.assertFalse(plan["updates"])
 
     def test_source_grid_respects_word_omissions_physical_range_merges_and_hidden(self):
@@ -340,12 +355,24 @@ class WorkbookTests(unittest.TestCase):
         api=self.api();a=self.make("冲突A.xlsx",8);b=self.make("冲突B.xlsx",2)
         w=load_workbook(b);w.active["B3"]=3;w.save(WORK/"冲突B2.xlsx")
         plan=api.build_update_plan(api.read_workbook(a),api.read_workbook(WORK/"冲突B2.xlsx"),[self.mapping()],[self.mapping(),self.mapping(cell="B3")])
-        self.assertEqual(plan["updates"],[]);self.assertTrue(plan["issues"])
+        self.assertEqual(plan['updates'][0]['value'],2)
+        self.assertEqual([r['value'] for r in plan['updates'][0]['sources']],[2,3])
+        self.assertFalse(plan['issues'])
     def test_blank_is_not_zero(self):
         api=self.api();a=self.make("空白A.xlsx",4);b=self.make("空白B.xlsx",None)
         plan=api.build_update_plan(api.read_workbook(a),api.read_workbook(b),[self.mapping()],[self.mapping()])
         self.assertFalse(plan["updates"])
-        self.assertEqual(plan["issues"][0]["kind"],"source_unknown_blank")
+        self.assertFalse(plan['issues'])
+        self.assertEqual(plan['retained_blanks'][0]['old_value'],4)
+    def test_没有同义来源时不按目标金额是否空白改变判断(self):
+        api=self.api()
+        for value in (None,4):
+            a=self.make('无来源目标'+str(value)+'.xlsx',value)
+            snapshot=api.read_workbook(a)
+            plan=api.build_update_plan(snapshot,snapshot,[self.mapping()],[])
+            self.assertEqual([r['kind'] for r in plan['issues']],['missing_source'])
+            self.assertFalse(plan['updates'])
+
     def test_unknown_source_and_original_blank_are_preserved_without_update(self):
         api=self.api();a=self.make("双方原空白A.xlsx",None);b=self.make("双方原空白B.xlsx",None)
         plan=api.build_update_plan(api.read_workbook(a),api.read_workbook(b),[self.mapping()],[self.mapping()])

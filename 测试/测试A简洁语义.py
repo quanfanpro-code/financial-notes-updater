@@ -72,7 +72,7 @@ class 简洁语义检查(unittest.TestCase):
         self.assertIn('语义待核实 0 格',shown['text'])
         self.assertIn('标准对应有差别 2 格',shown['text'])
 
-    def test_A原文已懂不因标准缺字段追问且普通入口保存回读(self):
+    def test_新A拒绝原文身份代替标准绑定并保留旧协议审计(self):
         from copy import deepcopy
         from openpyxl import Workbook,load_workbook
         from 附注更新.统一识别 import UnifiedSemanticEngine
@@ -112,21 +112,18 @@ class 简洁语义检查(unittest.TestCase):
         with patch('附注更新.分步流程.validate_settings',return_value=settings),patch.object(UnifiedSemanticEngine,'_http',fake), \
              patch('附注更新.统一勾稽.calculate_mapping_formulas',side_effect=AssertionError('A识别不计算金额')):
             report=_recognize_v2({'a_path':str(source),'gold_path':str(gold),'output_dir':str(work)},'A',work,lambda _:None,None,progress.append)
-        self.assertEqual(calls,['a_semantic_read','a_semantic_select','a_semantic_bind','a_semantic_review'])
-        self.assertEqual(report['status'],'complete')
+        self.assertEqual(calls,['a_semantic_read','a_semantic_select','a_semantic_select','a_semantic_bind'])
         self.assertNotIn('a_standard_review',report['files'])
         loaded=load_fact_mapping(report['files']['a_mapping'],standard)
-        self.assertTrue(loaded['a_identity_coverage']['complete'])
-        self.assertEqual(loaded['a_identity_coverage']['financial_cells'],2)
+        self.assertFalse(loaded['a_identity_coverage']['complete'])
         self.assertFalse(loaded['complete'],'接近标准不能冒充完全一致的标准身份')
-        self.assertEqual(len(loaded['source_identities']),2)
-        self.assertEqual(loaded['source_identities'][0]['meaning'],declarations[0]['meaning'])
-        self.assertEqual(progress[-1]['counts']['unresolved'],0)
+        self.assertEqual(loaded['source_identities'],[])
+        self.assertTrue({'B2','B3'}<={row['cell'] for row in loaded['unresolved']})
+        original=json.loads(loaded['未通过答复'][0]['text'].lstrip('\ufeff'))['result']
+        self.assertEqual(original['tables'][0]['source_identities'],declarations)
         self.assertEqual((file_hash(source),file_hash(gold)),before)
-        review=load_workbook(report['files']['a_review'],data_only=False)
-        self.assertEqual(review.active.title,'A原文身份证');review.close()
         tampered=deepcopy(loaded);tampered.pop('_validated_standard_hash',None)
-        tampered['source_identities'][0]['meaning']='编造了公司和年度'
+        tampered['source_identities']=[{'meaning':'编造了公司和年度'}]
         bad=work/'篡改副本.json';bad.write_text(json.dumps(tampered,ensure_ascii=False),encoding='utf-8-sig')
         with self.assertRaises(ValueError):load_fact_mapping(bad,standard)
         # 同一最小表检查真正的漏读、错误依据和矛盾仍不能冒充完成。
@@ -153,12 +150,6 @@ class 简洁语义检查(unittest.TestCase):
         focused=focused_review_payload({'reading':[table],'recognized':restored,'standards':standard_material([],standard)}, {'t':['B2']},standard)
         self.assertEqual(len(focused['recognized']['tables'][0]['source_identities']),1)
         self.assertEqual(focused['standards']['metrics'][0]['id'],'metric.prepayment.gross_balance')
-        from 附注更新.A语义阅读 import review_material
-        legacy={'tables':[{'id':'t','metrics':[{'ranges':['B2'],'id':'metric.prepayment.gross_balance'}],'dimensions':[]}]}
-        followup=review_material({},legacy,[table],snapshot,[],standard)
-        reasons=[issue['reason'] for issue in followup['program_issues']]
-        self.assertTrue(all('source_identities' in reason for reason in reasons))
-        self.assertFalse(any('缺少维度' in reason for reason in reasons))
 
     def test_一格引用错误不吞掉其他完整身份(self):
         from 附注更新.A语义阅读 import source_material,table_packet,checked_records
@@ -427,9 +418,10 @@ class 简洁语义检查(unittest.TestCase):
                     metrics.append({'ranges':[col+'5:'+col+'6'],'id':'metric.prepayment.'+kind})
                     dimensions.append({'ranges':[col+'5:'+col+'6'],'id':'period',**dim({'kind':'instant','date':'2025-12-31' if col in 'BCD' else '2024-12-31'})})
                 next(d for d in dimensions if d['id']=='currency')['ranges']=['B5:B6','D5:E6','G5:G6']
-                dimensions.extend([{'ranges':['C5:C6','F5:F6'],'id':'prepayment_denominator_selection',**dim({'mode':'all'},'A6')},
-                    {'ranges':['B5:G5'],'id':'prepayment_selection',**dim({'mode':'predicate','predicate':'账龄一年以内含一年'},'A5')},
-                    {'ranges':['B6:G6'],'id':'prepayment_selection',**dim({'mode':'all'},'A6')}])
+                next(d for d in dimensions if d['id']=='unit_scale')['ranges']=['B5:B6','D5:E6','G5:G6']
+                dimensions.extend([{'ranges':['C5:C6','F5:F6'],'id':'prepayment_denominator_selection',**dim({'domain':'预付款项','mode':'all','completeness':'complete'},'A6')},
+                    {'ranges':['B5:G5'],'id':'prepayment_selection',**dim({'domain':'预付款项','mode':'predicate','predicate':'账龄一年以内含一年','completeness':'complete'},'A5')},
+                    {'ranges':['B6:G6'],'id':'prepayment_selection',**dim({'domain':'预付款项','mode':'all','completeness':'complete'},'A6')}])
                 dimensions.append({'ranges':['B5'],'id':'临时备注','value':'错误新增字段','evidence':['A5']})
                 return {'tables':[{'id':'t1','metrics':metrics,'dimensions':dimensions,'unresolved':[]}]}
             self.assertEqual(task,'a_semantic_review')
@@ -441,55 +433,27 @@ class 简洁语义检查(unittest.TestCase):
                 'non_business':[{'range':'A5','category':'label','reason':'账龄是解释金额属于哪类的身份标签','evidence':['A2','A5']}]},'issues':[]}]}
         with patch.object(engine,'_http',side_effect=fake):
             result=engine.recognize_workbook(scope['原表'],context=context,artifact_metadata={'carrier':'A','original_path':scope['原表'],'original_hash':file_hash(scope['原表'])})
-        self.assertTrue(result['complete'])
+        self.assertTrue(result['complete'],[json.loads(r['text'].lstrip('\ufeff'))['error'] for r in result.get('未通过答复',[])])
         loaded=load_fact_mapping(result['mapping_path'],engine.standard)
         self.assertEqual(len(loaded['facts']),12)
         self.assertEqual(sum(f['raw_value_state']=='blank' for f in loaded['facts']),6)
         self.assertEqual(loaded['facts'],result['facts'])
         self.assertEqual(len(state),5)
-        from 附注更新.A语义阅读 import _stage_receipt as actual_receipt
         from copy import deepcopy
-        def changed_notes(reference,mapping,task_name):
-            task,answer=actual_receipt(reference,mapping,task_name)
-            if task_name=='a_semantic_bind':
-                task=deepcopy(task);task['payload']['reading_notes']='并非整体阅读所得的内容'
-            return task,answer
-        with patch('附注更新.A语义阅读._stage_receipt',side_effect=changed_notes):
-            with self.assertRaises(ValueError):load_fact_mapping(result['mapping_path'],engine.standard)
+        with patch('附注更新.A语义阅读._stage_receipt',side_effect=AssertionError('新合集不能重读外部历史回执')):
+            self.assertEqual(load_fact_mapping(result['mapping_path'],engine.standard)['facts'],result['facts'])
+        from 附注更新.A合集 import validate_collection,FIELDS
+        from 附注更新.统一语义 import definition_hash
+        changed=deepcopy(loaded)
+        doc=next(d for d in changed['原判断与核查'].values() if json.loads(d['task_text'].lstrip('\ufeff'))['payload']['task']=='a_semantic_bind')
+        doc['task_text']=doc['task_text'].replace('本地代答故意漏掉金额列','并非整体阅读所得的内容')
+        changed['封存校验']=definition_hash({k:changed.get(k) for k in FIELDS})
+        with self.assertRaisesRegex(ValueError,'原任务或回执'):validate_collection(changed)
         with patch.object(engine,'_http',side_effect=AssertionError('已通过结果不应再请求模型')):
             reused=engine.recognize_workbook(scope['原表'],context=context,previous_result=result['mapping_path'],artifact_metadata={'carrier':'A','original_path':scope['原表'],'original_hash':file_hash(scope['原表'])})
         self.assertEqual(reused['facts'],result['facts'])
         self.assertEqual(reused['usage']['reused_confirmed_tables'],1)
-        with patch('附注更新.A语义阅读.semantic_questions',return_value=[{'id':'t1','dimension':'prepayment_selection','ranges':['B5:G6'],'reason':'父项范围通用提醒'}]),patch.object(engine,'_http',side_effect=AssertionError('已核查维度不因提醒措辞不同而重查')):
-            same=engine.recognize_workbook(scope['原表'],context=context,previous_result=result['mapping_path'],artifact_metadata={'carrier':'A','original_path':scope['原表'],'original_hash':file_hash(scope['原表'])})
-        self.assertEqual(same['facts'],result['facts'])
-        def review_existing(system,payload):
-            self.assertEqual(payload['task'],'a_semantic_review')
-            row=payload['recognized']['tables'][0]
-            self.assertNotIn('临时备注',[d['id'] for d in row['dimensions']])
-            self.assertEqual(next(d['value'] for d in row['dimensions'] if d['id']=='currency'),'CNY')
-            self.assertEqual(row['non_business'][0]['range'],'A5')
-            return {'tables':[{'id':'t1','corrections':{'patches':[]},'issues':[]}]}
-        with patch('附注更新.A语义阅读.semantic_questions',return_value=[{'id':'t1','reason':'检验续作保留已核查修正'}]),patch.object(engine,'_http',side_effect=review_existing):
-            continued=engine.recognize_workbook(scope['原表'],context=context,previous_result=result['mapping_path'],artifact_metadata={'carrier':'A','original_path':scope['原表'],'original_hash':file_hash(scope['原表'])})
-        self.assertTrue(continued['complete'])
-        self.assertEqual(len(continued['a_semantic_reading']['batches'][0]['prior_reviews']),1)
-        self.assertEqual(load_fact_mapping(continued['mapping_path'],engine.standard)['facts'],result['facts'])
-        def review_uncertain(system,payload):
-            return {'tables':[{'id':'t1','corrections':{},'issues':[{'range':'B5','reason':'原文范围仍未明确','evidence':['A5']}]} ,'{']}
-        with patch('附注更新.A语义阅读.semantic_questions',return_value=[{'id':'t1','reason':'检验已有未决不反复付费'}]):
-            with patch.object(engine,'_http',side_effect=review_uncertain):
-                partial=engine.recognize_workbook(scope['原表'],context=context,previous_result=continued['mapping_path'],artifact_metadata={'carrier':'A','original_path':scope['原表'],'original_hash':file_hash(scope['原表'])})
-            with patch.object(engine,'_http',side_effect=AssertionError('相同材料的已知未决不应自动重跑')):
-                carried=engine.recognize_workbook(scope['原表'],context=context,previous_result=partial['mapping_path'],artifact_metadata={'carrier':'A','original_path':scope['原表'],'original_hash':file_hash(scope['原表'])})
-        self.assertFalse(carried['complete'])
-        self.assertEqual(carried['unresolved'],partial['unresolved'])
-        self.assertEqual(load_fact_mapping(carried['mapping_path'],engine.standard)['facts'],partial['facts'])
-        with patch('附注更新.A语义阅读.semantic_questions',return_value=[{'id':'t1','reason':'检验后轮漏报不清除旧问题'}]),patch.object(engine,'_http',side_effect=review_existing):
-            not_resolved=engine.recognize_workbook(scope['原表'],context=context,previous_result=carried['mapping_path'],artifact_metadata={'carrier':'A','original_path':scope['原表'],'original_hash':file_hash(scope['原表'])})
-        self.assertFalse(not_resolved['complete'])
-        self.assertEqual([u['cell'] for u in not_resolved['unresolved']],['B5'])
-        self.assertEqual(load_fact_mapping(not_resolved['mapping_path'],engine.standard)['unresolved'],not_resolved['unresolved'])
+        # 新A不再接受程序按标题或同文生成后续语义轮；未决及停止重答另由封存边界反例覆盖。
         loaded.pop('_validated_standard_hash',None)
         loaded['facts'][0]['dimensions']['entity']='伪造主体'
         bad=work/'篡改副本.json';bad.write_text(json.dumps(loaded,ensure_ascii=False),encoding='utf-8-sig')

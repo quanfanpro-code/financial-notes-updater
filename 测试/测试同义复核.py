@@ -308,9 +308,9 @@ class EquivalenceTests(unittest.TestCase):
         with patch.object(UnifiedSemanticEngine,'_http',side_effect=AssertionError('写入不能重调模型')):
             written=run_step('write',{**config,**matched['files']})
         self.assertEqual(written['status'],'complete',written['message'])
-        loaded=load_fact_mapping(written['files']['a_prime_mapping'],engine.standard)
-        self.assertEqual(loaded['facts'][0]['raw_value'],250)
-        self.assertEqual(loaded['facts'][0]['dimensions'],self.left['dimensions'])
+        saved=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertEqual(saved['updates'][0]['actual_value'],250)
+        self.assertNotIn('facts',saved)
 
     def test_routing_restricts_candidates_to_matched_b_tables(self):
         """A端导向表级路由：A端格只与路由到的B端逻辑表内事实组合，路由外同指标格不进复核。"""

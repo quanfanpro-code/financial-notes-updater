@@ -11,6 +11,98 @@ from 附注更新.统一识别 import UnifiedSemanticEngine
 
 
 class 两项缺陷测试(unittest.TestCase):
+    def _空白换期合集(self,year,label='本期'):
+        import json
+        from 附注更新.A合集 import direct_digest
+        from 附注更新.统一语义 import definition_hash
+        result={'collection_version':2,'gold_hash':'a'*64,'source_hash':'b'*64,
+                'source_path':'合成.xlsx','识别答复':'合成原判断','答复指纹':definition_hash('合成原判断'),
+                '封存定义原文':[json.dumps(row,ensure_ascii=False) for row in records()
+                                  if row['record_type'] in {'metric','dimension'}],
+                'facts':[],'unresolved':[],'机械记录':{'sheets':[{'name':'合成表','merges':[],
+                    'cells':{'B2':{'value':label},'B3':{'value':None},'B4':{'value':None}}}]},
+                'outline':{'subtables':[{'sheet':'合成表','range':'A2:B4','metrics':[
+                    {'id':'固定资产原值','ranges':['B3:B4'],'template_period_role':'closing'}]}]}}
+        for cell in ('B3','B4'):
+            row=fact();row['source_reference']['location']='合成表!'+cell
+            row['dimensions']['period']['date']=str(year)+'-12-31'
+            row['dimensions']['asset_selection'].update(mode='members',members=[cell])
+            row['dimension_evidence']['period']=['合成表!B2']
+            row.update(raw_value=None,raw_value_state='blank');result['facts'].append(row)
+        result['封存校验']=direct_digest(result)
+        return result
+
+    def test_双方空白沿用确定新身份且不计金额写入(self):
+        from pathlib import Path
+        from 附注更新.模板更新编排 import direct_update_plan
+        from 附注更新.分步流程 import _write_direct
+        a=self._空白换期合集(2025);b=self._空白换期合集(2024)
+        before=copy.deepcopy((a,b));plan=direct_update_plan(a,b)
+        self.assertEqual((a,b),before)
+        self.assertEqual(plan['issues'],[]);self.assertEqual(plan['updates'],[])
+        self.assertEqual(plan['labels'],[]);self.assertEqual(len(plan['retained_blanks']),2)
+        self.assertEqual([r['source_locations'] for r in plan['identity_matches']],
+                         [['合成表!B3'],['合成表!B4']])
+        plan['inputs']={}
+        # 只走至副本调用边界，测试不真正写表。
+        with patch('附注更新.分步流程.file_hash',return_value='c'*64), \
+             patch('附注更新.分步流程.write_updated_workbook',side_effect=RuntimeError('已到副本入口')) as write:
+            with self.assertRaisesRegex(RuntimeError,'已到副本入口'):
+                _write_direct({},Path('.'),lambda _:None,None,Path('合成计划.json'),plan,a,b)
+            write.assert_called_once()
+            same=direct_update_plan(a,a);same['inputs']={};write.reset_mock()
+            self.assertEqual(_write_direct({},Path('.'),lambda _:None,None,
+                Path('合成计划.json'),same,a,a)['status'],'partial')
+            write.assert_not_called()
+            changed=copy.deepcopy(plan);changed['identity_matches'][0]['source_locations']=['合成表!B4']
+            with self.assertRaisesRegex(ValueError,'identity_matches'):
+                _write_direct({},Path('.'),lambda _:None,None,Path('合成计划.json'),changed,a,b)
+            write.assert_not_called()
+
+    def test_空白换期不清金额不跳来源及共享标签(self):
+        from 附注更新.A合集 import direct_digest
+        from 附注更新.模板更新编排 import direct_update_plan
+        for value,formula in ((10,None),('', '=""')):
+            a=self._空白换期合集(2025);b=self._空白换期合集(2024)
+            a['机械记录']['sheets'][0]['cells']['B3'].update(value=value,formula=formula)
+            a['facts'][0].update(raw_value=value,raw_value_state='formula' if formula else 'value')
+            a['封存校验']=direct_digest(a)
+            plan=direct_update_plan(a,b)
+            self.assertEqual([r['cell'] for r in plan['identity_matches']],['B4'])
+            self.assertTrue(any(r.get('cell')=='B3' and '来源空白' in r['reason'] for r in plan['issues']))
+        a=self._空白换期合集(2025,'2025年末');b=self._空白换期合集(2024,'2024年末')
+        b['facts'].pop();b['封存校验']=direct_digest(b)
+        plan=direct_update_plan(a,b)
+        self.assertEqual(plan['identity_matches'],[]);self.assertEqual(plan['retained_blanks'],[])
+        self.assertEqual(plan['labels'],[])
+        self.assertTrue(any(r.get('cell')=='B4' and '没有唯一' in r['reason'] for r in plan['issues']))
+        self.assertTrue(any(r.get('cell')=='B3' and '共享标签' in r['reason'] for r in plan['issues']))
+        b['facts']=[];b['封存校验']=direct_digest(b)
+        self.assertEqual(direct_update_plan(a,b)['identity_matches'],[])
+
+    def test_空白搬运记录不改两边原身份(self):
+        from 附注更新.A合集 import direct_digest, direct_output_record
+        from 附注更新.模板更新编排 import direct_update_plan
+        a=self._空白换期合集(2025);b=self._空白换期合集(2024)
+        a['coverage']={'financial_cells':2,'complete':True}
+        a['outline']['subtables'][0]['data_ranges']=['B3:B4']
+        for mapping,origin in ((a,'A原答复'),(b,'B原答复')):
+            for row in mapping['facts']:row['recognition_provenance']['record_id']=origin
+            mapping['封存校验']=direct_digest(mapping)
+        before=copy.deepcopy((a,b))
+        plan=direct_update_plan(a,b,scope={kind:[{'sheet':'合成表','range':'B3'}]
+                                          for kind in ('target','source')})
+        self.assertEqual(plan['updates'],[]);self.assertEqual(len(plan['identity_matches']),1)
+        with patch('附注更新.表格.read_workbook',return_value=copy.deepcopy(a['机械记录'])), \
+             patch('附注更新.表格.file_hash',return_value='c'*64):
+            result=direct_output_record(a,b,'合成副本.xlsx',plan,'合成清单.json')
+        self.assertEqual(result['identity_matches'],plan['identity_matches'])
+        self.assertEqual(result['template_layout'],plan['template_layout'])
+        self.assertTrue(all(row['actual_value'] is None for row in result['retained_blanks']))
+        self.assertNotIn('facts',result)
+        self.assertNotIn('recognition_provenance',result)
+        self.assertEqual((a,b),before)
+
     def test_共用识别保留公式引用且不暴露数值作匹配(self):
         from 附注更新.A语义阅读 import source_material
         snapshot={'path':'原件.xlsx','semantic_formula_sources':True,'sheets':[{'name':'附注','merges':[],

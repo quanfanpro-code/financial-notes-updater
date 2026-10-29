@@ -53,13 +53,13 @@ class ContextTests(unittest.TestCase):
         requests=[]
         def respond(request,timeout):
             body=json.loads(request.data);payload=json.loads(body['messages'][1]['content']);requests.append(payload)
-            self.assertEqual(payload['response_contract'],'unified_dimension_refs_v1')
+            self.assertEqual(payload['response_contract'],'unified_structure_v1')
             self.assertNotIn('chat_template_kwargs',body)
             full=self.response(payload);row=full['cells']['B2'];pool=[]
             for key,value in row.pop('dimensions').items():
                 pool.append({'dimension_id':key,'value':value,'evidence':row['dimension_evidence'][key]})
             row.pop('dimension_evidence');row['dimension_refs']=list(range(len(pool)))
-            wire={**full,'dimension_values':pool}
+            wire={**full,'dimension_values':pool,'regions':[]}
             return BytesIO(json.dumps({'choices':[{'finish_reason':'stop','message':{'content':json.dumps(wire)}}],
                                       'usage':{'prompt_tokens':10,'completion_tokens':20,'total_tokens':30}}).encode())
         with patch('附注更新.语义.urllib.request.build_opener') as opener:
@@ -140,14 +140,13 @@ class ContextTests(unittest.TestCase):
             if '$ref' in evidence:evidence=schema['$defs'][evidence['$ref'].rsplit('/',1)[-1]]
             self.assertIn(reference,evidence['items']['enum'])
 
-    def test_independent_rounds_overlap_and_keep_their_own_receipts_and_usage(self):
-        from threading import Barrier
+    def test_independent_rounds_run_serially_and_keep_their_own_receipts_and_usage(self):
         from unittest.mock import patch
-        barrier=Barrier(2)
+        calls=[]
         def respond(instance,system,payload):
             instance.usage['requests']+=1
             instance.usage['prompt_tokens']+=7 if payload['round']==1 else 11
-            barrier.wait(timeout=2)
+            calls.append(payload['round'])
             return self.response(payload)
         with patch.object(UnifiedSemanticEngine,'_http',respond):
             result=self.engine.classify_packet(self.packet)
@@ -155,6 +154,7 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(result['facts'][0]['raw_value'],-125)
         self.assertEqual(self.engine.usage['requests'],2)
         self.assertEqual(self.engine.usage['prompt_tokens'],18)
+        self.assertEqual(calls,[1,2])
         self.assertEqual(len(result['request_receipts']),2)
         rounds=[];identities=[]
         for record in result['request_receipts']:
@@ -166,14 +166,11 @@ class ContextTests(unittest.TestCase):
         saved=next(self.engine.work_dir.glob('逐格语义映射_*.json'))
         self.assertEqual(load_fact_mapping(saved,self.engine.standard)['facts'],result['facts'])
 
-    def test_failed_parallel_round_keeps_other_receipt_without_confirming_a_fact(self):
-        from threading import Barrier
+    def test_failed_second_round_keeps_first_receipt_without_confirming_a_fact(self):
         from unittest.mock import patch
         from 附注更新.语义 import SemanticError
-        barrier=Barrier(2)
         def respond(instance,system,payload):
             instance.usage['requests']+=1
-            barrier.wait(timeout=2)
             if payload['round']==2:raise SemanticError('受控连接失败')
             return self.response(payload)
         with patch.object(UnifiedSemanticEngine,'_http',respond):
@@ -285,10 +282,16 @@ class ContextTests(unittest.TestCase):
             originals[str(source)]=file_hash(source)
             engine=UnifiedSemanticEngine(self.engine.settings,self.engine.gold_path,self.folder/(side+'识别'))
             def respond(system,payload,side=side):
+                if payload['task']=='workbook_outline':
+                    return {'subjects':['固定资产'],'subtables':[{'id':'本表','subject':'固定资产','purpose':'固定资产原值',
+                        'ranges':[{'sheet':'附注','range':'A1:B2'}],'evidence':['附注!A2']}],
+                        'unlocated_ranges':[],'context_ranges':[]}
+                if payload['task']=='subtable_detail':
+                    return {'allowed_metrics':['固定资产原值'],'structure':'项目行及期末金额列',
+                        'evidence':['附注!A2'],'targets':[]}
+                self.assertEqual(payload['task'],'unified_classify')
                 raw=self.response(payload)
-                if side=='更新数据':
-                    raw['cells']['B2']['dimensions']['asset_selection']={'domain':'固定资产','mode':'predicate',
-                            'predicate':'全部固定资产','completeness':'complete'}
+                # 两端各自形成同一身份证，只改变原值；此例验证说明随正式更新保存，不再追加A/B语义比较。
                 for address in payload['candidate_cells']:
                     if address!='B2':raw['cells'][address]={'kind':'non_business','category':'header','reason':'原表标题',
                                                          'evidence_cells':[address]}
@@ -297,22 +300,20 @@ class ContextTests(unittest.TestCase):
             mapping=engine.recognize_workbook(source,context=self.context)
             self.assertTrue(mapping['complete']);load_fact_mapping(mapping['mapping_path'],engine.standard)
             mappings.append(mapping)
-        def review(instance,system,payload):
-            return {'pairs':{key:{'decision':'equivalent','reason':'双方说明都为全部固定资产',
-                    'left_evidence':list(row['left']['evidence']),'right_evidence':list(row['right']['evidence'])}
-                    for key,row in payload['pairs'].items()}}
         config={**self.engine.settings,'mode':'online','gold_path':self.engine.gold_path,
                 'a_mapping':mappings[0]['mapping_path'],'b_mapping':mappings[1]['mapping_path'],
                 'output_dir':str(self.folder/'正式入口'),'api_key':''}
-        with patch.object(UnifiedSemanticEngine,'_http',review):matched=run_step('match',config)
+        with patch.object(UnifiedSemanticEngine,'_http',side_effect=AssertionError('身份证已确认，对应只用代码')):
+            matched=run_step('match',config)
         self.assertEqual(matched['status'],'complete',matched)
         with patch.object(UnifiedSemanticEngine,'_http',side_effect=AssertionError('写入只搬运人工提供的值')):
             written=run_step('write',{**config,**matched['files']})
         self.assertEqual(written['status'],'complete',written)
-        updated=load_fact_mapping(written['files']['a_prime_mapping'],self.engine.standard)
-        self.assertEqual(updated['facts'][0]['raw_value'],-125)
-        self.assertEqual(updated['facts'][0]['dimensions'],mappings[0]['facts'][0]['dimensions'])
-        self.assertEqual(updated['source_context'],self.context)
+        saved=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertEqual(saved['updates'][0]['actual_value'],-125)
+        self.assertEqual(saved['collections']['A']['mapping_path'],mappings[0]['mapping_path'])
+        self.assertEqual(mappings[0]['source_context'],self.context)
+        self.assertNotIn('facts',saved)
         self.assertTrue(all(file_hash(path)==digest for path,digest in originals.items()))
 
 

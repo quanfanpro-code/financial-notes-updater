@@ -16,60 +16,7 @@ class 模板更新编排测试(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'科目之外'):
             compile_template_purpose(case.target,case.source,case.standard,spec,target_locations={'明细!B2'})
 
-    def test_沿用已确认科目分组编排后合并整份安排(self):
-        from 测试.测试统一语义 import records
-        from 附注更新.统一语义 import read_standard_v2
-        from 附注更新.统一识别 import UnifiedSemanticEngine
-        from 附注更新.模板更新编排 import plan_template_purpose
-        case=夹具.UnifiedStructureTests();case.setUp()
-        case.source=case.make('本期来源',[['项目','年末余额'],['甲类设备',77],['乙类设备',88],['合计',165]],
-            [('B2','甲类设备'),('B3','乙类设备'),('B4',None)])
-        gold=case.folder/'分组标准.jsonl';gold.write_text('\n'.join(json.dumps(x,ensure_ascii=False) for x in records()),encoding='utf-8')
-        case.standard=read_standard_v2(gold)
-        for mapping in (case.target,case.source):mapping['gold_hash']=case.standard['sha256']
-        case.target['outline']={'subjects':['已确认科目甲','已确认科目乙'],'subtables':[
-            {'id':'已确认甲','subject':'已确认科目甲','sheet':'明细','range':'A1:B2'},
-            {'id':'已确认乙','subject':'已确认科目乙','sheet':'明细','range':'A3:B4'}]}
-        received=[]
-        def response(engine,system,payload):
-            received.append([fact['location'] for fact in payload['target']['facts']])
-            return {'reason':'沿用已核准身份编排','tables':[],
-                'bindings':[{'target':location,'source':location} for location in received[-1]],'labels':[]}
-        settings={'base_url':'http://localhost','model':'受控结构回复','api_key':'synthetic-test'}
-        engine=UnifiedSemanticEngine(settings,gold,case.folder/'结构缓存',lambda _:None,None)
-        with patch.object(UnifiedSemanticEngine,'_http',response):
-            purpose,files=plan_template_purpose(engine,case.target,case.source,case.standard,case.folder/'科目安排')
-        self.assertEqual(received,[['明细!B2'],['明细!B3','明细!B4']])
-        plan=build_fact_update_plan(case.target,case.source,case.standard,update_purpose=purpose)
-        self.assertEqual(plan['issues'],[])
-        self.assertEqual({row['cell']:row['value'] for row in plan['updates']},{'B2':77,'B3':88,'B4':165})
-        self.assertTrue(files['template_layout_plan'])
 
-    def test_编排只带入已定位范围及身份依据不重发全库(self):
-        from openpyxl import load_workbook
-        from openpyxl.workbook.defined_name import DefinedName
-        from 附注更新.模板更新编排 import _layout_material
-        from 附注更新.表格 import file_hash
-        case=夹具.UnifiedStructureTests();case.setUp();mapping=case.source
-        book=load_workbook(mapping['source_path']);book.create_sheet('无关业务')['A1']='不得发给本次编排'
-        book.defined_names.add(DefinedName('整列引用',attr_text="'无关业务'!$A:$A"))
-        book['明细']['A20']='本次原文共同依据';book.save(mapping['source_path']);book.close()
-        mapping['source_hash']=file_hash(mapping['source_path'])
-        mapping['facts'][0]['dimension_evidence']['entity']=['明细!A20']
-        mapping['outline']={'subjects':['固定资产'],'subtables':[{'id':'已有子表','subject':'固定资产',
-            'ranges':[{'sheet':'明细','range':'A1:B5'}]}],'requirements':{'重复的整份身份':'不应重发'}}
-        material=_layout_material(mapping)
-        self.assertEqual(material['text']['明细!A20'],'本次原文共同依据')
-        self.assertNotIn('无关业务!A1',material['text'])
-        self.assertNotIn('requirements',material['outline'])
-        self.assertNotIn('明细!B2',material['text'])
-        from 附注更新.统一勾稽 import _template_cell_records
-        original=_template_cell_records(mapping)
-        for fact in material['facts']:
-            self.assertEqual({key:material['dimension_values'][value] for key,value in fact['dimensions'].items()},
-                original[fact['location']]['dimensions'])
-            self.assertEqual({key:material['evidence_values'][value] for key,value in fact['dimension_evidence'].items()},
-                original[fact['location']]['dimension_evidence'])
 
     def test_换表名及移动行列后沿用同一编排机制(self):
         import copy

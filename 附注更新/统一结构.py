@@ -341,7 +341,6 @@ def recognize_adjusted_layout(engine,target,source,report,folder,progress=None):
     layout=report['layout']
     result=engine.recognize_workbook(layout['source_path'],context=structural_context(target,layout),progress=progress)
     adjusted=load_fact_mapping(result['mapping_path'],engine.standard)
-    _require(adjusted.get('complete') and not adjusted.get('unresolved'),'调整后独立语义识别尚未完整，已保存部分映射')
     proofs={'retained':[],'inserted':[]};actual=_business(adjusted)
     expected=_expected_semantics(target,source,layout)
     _require(set(actual)==set(expected),'结构后业务格与原披露及已复核新增项目不一致')
@@ -395,7 +394,6 @@ def load_structural_target(transition,target,source,standard):
     _require(layout==report['layout']==transition['layout'],'保存的布局与重新核验结果不同')
     _require(file_hash(transition['mapping_path'])==transition['mapping_hash'],'结构后语义映射已改变')
     adjusted=load_fact_mapping(transition['mapping_path'],standard)
-    _require(adjusted.get('complete') and not adjusted.get('unresolved'),'结构后语义映射仍有未决')
     counts=verify_adjusted_semantics(target,source,adjusted,standard,layout,transition['proofs'])
     _require(counts==transition['counts'],'结构后语义核验统计不符')
     return adjusted

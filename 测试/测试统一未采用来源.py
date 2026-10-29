@@ -100,7 +100,9 @@ class UnusedSourceTests(unittest.TestCase):
         book=load_workbook(written['files']['a_prime']);self.assertEqual(book['sheet1']['C3'].value,50);book.close()
         doc=Document(written['files']['word']);self.assertEqual(doc.tables[0].cell(1,1).text,'50')
         self.assertEqual(len(doc.tables[0].rows),2);self.assertEqual(doc.paragraphs[-1].text,'范围外文字保持。')
-        self.assertEqual(len(load_fact_mapping(written['files']['a_prime_mapping'],self.standard)['facts']),1)
+        saved=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertEqual(len(saved['updates']),1)
+        self.assertNotIn('facts',saved)
         self.assertTrue(all(file_hash(p)==digest for p,digest in self.frozen.items()))
 
     def test_same_metric_without_scope_limit_or_two_round_agreement_stays_pending(self):

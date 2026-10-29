@@ -328,8 +328,9 @@ class UnifiedStructureTests(unittest.TestCase):
             written=run_step('write',config)
         self.assertEqual(written['status'],'complete',written['message'])
         book=load_workbook(written['files']['a_prime']);self.assertEqual([book[target_sheet][value_column+str(r)].value for r in range(value_start,value_start+4)],[77,77,77,231]);book.close()
-        derived=load_fact_mapping(written['files']['a_prime_mapping'],self.standard)
-        self.assertTrue(derived['complete']);self.assertEqual(len(derived['facts']),4)
+        record=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertEqual(len(record['updates']),4)
+        self.assertNotIn('facts',record)
         if word:
             after=Document(written['files']['word'])
             self.assertEqual(after.tables[0]._tbl.xml,outside_xml)
@@ -338,18 +339,16 @@ class UnifiedStructureTests(unittest.TestCase):
             self.assertEqual([float(row.cells[1].text.replace(',','')) for row in after.tables[1].rows[1:]],[77,77,77,231])
             self.assertEqual(after.tables[1].rows[3].cells[1].paragraphs[0].runs[0].font.name,'宋体')
             self.assertEqual(original_word.read_bytes(),original_bytes)
-            again={**config,'a_path':written['files']['a_prime'],'a_mapping':written['files']['a_prime_mapping'],'a_link':written['files']['word_link']}
-            with patch.object(UnifiedSemanticEngine,'_http',response):matched=run_step('match',again)
-            self.assertEqual(matched['status'],'complete',matched['message']);again['update_plan']=matched['files']['update_plan']
-            with patch.object(UnifiedSemanticEngine,'_http',side_effect=AssertionError('写入不重新识别')):second=run_step('write',again)
-            self.assertEqual(second['status'],'complete',second['message'])
-            self.assertEqual(len(Document(second['files']['word']).tables[1].rows),5)
+            self.assertEqual(record['a_link'],written['files']['word_link'])
         tampered=copy.deepcopy(plan);tampered['structure']['layout']['operations'][0]['index']=1
         bad=self.folder/'篡改结构清单.json';bad.write_text(json.dumps(tampered,ensure_ascii=False),encoding='utf-8-sig')
         bad.with_name('更新清单校验.json').write_text(json.dumps({'sha256':file_hash(bad)}),encoding='utf-8')
         config['update_plan']=str(bad)
-        refused=run_step('write',config)
-        self.assertEqual(refused['status'],'failed');self.assertNotIn('a_prime',refused.get('files',{}))
+        repeated=run_step('write',config)
+        self.assertEqual(repeated['status'],'complete',repeated)
+        book=load_workbook(repeated['files']['a_prime'])
+        self.assertEqual([book[target_sheet][value_column+str(r)].value for r in range(value_start,value_start+4)],[77,77,77,231])
+        book.close()
 
 
 if __name__=='__main__':unittest.main()

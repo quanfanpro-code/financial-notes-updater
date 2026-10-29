@@ -304,7 +304,7 @@ public static class ExcelReader
         // 新版错误（如 #SPILL!）可能被读取库转为空白，必须先尊重原 XML 的错误类型。
         // 公式明确重算时不使用旧错误，常量错误则始终保留原文。
         if ((!isFormula || !recalculate) && saved?.DataType?.Value == CellValues.Error)
-            return Result(saved.CellValue?.Text ?? "", "单元格结果是 Excel 错误，不能作为正常数据更新报告。");
+            return Result(saved.CellValue?.Text ?? "");
         try
         {
             XLCellValue value;
@@ -316,7 +316,7 @@ public static class ExcelReader
             else if (saved?.DataType?.Value == CellValues.Date && saved.CellValue is not null)
                 value = XmlConvert.ToDateTime(saved.CellValue.Text, XmlDateTimeSerializationMode.RoundtripKind);
             else value = cell.CachedValue;
-            if (value.IsError) return Result(value.ToString(CultureInfo.CurrentCulture), "单元格结果是 Excel 错误，不能作为正常数据更新报告。");
+            if (value.IsError) return Result(value.ToString(CultureInfo.CurrentCulture));
             // 编辑使用真实类型及原值，不能从百分比、千分位、横线等显示文字猜测；公式始终提供原式。
             if (!isFormula)
             {

@@ -19,10 +19,14 @@ LEGACY_GOLD_PATH = r"D:\BaiduSyncdisk\数字资产\审计数据自动搬运系�
 DEFAULT_GOLD_PATH = str(PROJECT_DIR / "金标准" / "财务报表附注语义金标准-v2.jsonl")
 if not Path(DEFAULT_GOLD_PATH).is_file():
     DEFAULT_GOLD_PATH = str(PROJECT_DIR / "金标准" / "公开语义金标准-v2.jsonl")
+_RECOGNITION_FIELDS = ("a_required_ranges", "list_dimension", "a_additional_context", "b_additional_context") + tuple(
+    side + "_" + field for side in ("a", "b") for field in
+    ("target_table", "allowed_metrics", "source_ranges", "field_scope", "withdrawn", "source_targets", "source_candidates", "arranged_targets"))
 _FIELDS = ("source_a", "source_b", "output_dir", "gold_path", "base_url", "model", "timeout", "thinking_mode", "mode", "review", "scope_prefilter", "a_context_text", "b_context_text",
            "word_path", "a_path", "b_path", "a_link", "a_mapping", "b_mapping", "update_plan",
            "a_prime", "a_prime_mapping", "word", "word_link", "trace", "a_review", "b_review", "a_standard_review", "b_standard_review", "b_scope", "a_gold_changes", "b_gold_changes", "report_scope", "current_step",
-           "structure_review", "adjusted_a", "adjusted_a_mapping", "unused_source_review")
+           "structure_review", "adjusted_a", "adjusted_a_mapping", "unused_source_review", "model_reasoning_effort",
+            "update_purpose", "comparison_requirements", "freeze_standard", "a_scope_answers", "b_scope_answers") + _RECOGNITION_FIELDS
 
 
 class _Blob(ctypes.Structure):
@@ -91,12 +95,16 @@ def validate_settings(config: dict, require_model: bool = True) -> dict:
     address = str(result.get("base_url") or "").strip().rstrip("/")
     try:
         parts = urlsplit(address)
-        valid = parts.scheme in ("http", "https") and bool(parts.hostname) and not parts.username and not parts.password and not parts.query and not parts.fragment
+        valid = address == 'codex://local' or (parts.scheme in ("http", "https") and bool(parts.hostname) and not parts.username and not parts.password and not parts.query and not parts.fragment)
         _ = parts.port
     except ValueError:
         valid = False
     if (address or require_model) and (not valid or any(char.isspace() for char in address)):
-        raise ValueError("模型地址须为有效的 http:// 或 https:// 地址，不得包含账号密码、查询参数或空格。")
+        raise ValueError("模型地址须为codex://local，或有效的http://、https://地址；不得包含账号密码、查询参数或空格。")
+    effort=result.get('model_reasoning_effort','high')
+    if effort not in ('low','medium','high','xhigh','max','ultra'):
+        raise ValueError('Codex推理强度无效。')
+    result['model_reasoning_effort']=effort
     model = str(result.get("model") or "").strip()
     if require_model and not model:
         raise ValueError("请填写服务商提供的模型名称。")
@@ -113,6 +121,7 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> dict:
                                       "update_plan", "a_prime", "a_prime_mapping", "word", "word_link", "a_context_text", "b_context_text",
                                       "a_standard_review", "b_standard_review")})
     result["current_step"] = "extract_a"
+    result['model_reasoning_effort']='high'
     path = Path(path)
     if not path.exists():
         return result
@@ -122,6 +131,9 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> dict:
             raise ValueError("配置应为对象")
         for key in _FIELDS:
             if key in saved:
+                if key in _RECOGNITION_FIELDS or key in {"update_purpose", "comparison_requirements", "freeze_standard", "a_scope_answers", "b_scope_answers"}:
+                    result[key] = saved[key]
+                    continue
                 if key == "thinking_mode":
                     result[key] = validate_thinking_mode(saved[key])
                     continue

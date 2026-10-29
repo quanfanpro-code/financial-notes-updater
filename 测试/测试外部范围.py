@@ -25,7 +25,7 @@ class ExternalScopeTests(unittest.TestCase):
         book.defined_names.add(DefinedName("TA1",attr_text="'附注'!$A$1:$B$2"));book.save(self.target);book.close()
         word=self.work/"虚构Word原件.docx";word.write_bytes(b"local fixture only")
         linked=self.work/"虚构Word连接.docx";linked.write_bytes(b"local fixture linked only")
-        ctx={"scope":{"chapter_title":flow.CHAPTER_TITLE},"tables":[{"sheet":"附注","table_id":"t1","range_name":"TA1","title":"货币资金","chapter_context":[flow.CHAPTER_TITLE,"人民币元"]}]}
+        ctx={"scope":{"chapter_title":"财务报表重要项目的说明"},"tables":[{"sheet":"附注","table_id":"t1","range_name":"TA1","title":"货币资金","chapter_context":["财务报表重要项目的说明","人民币元"]}]}
         self.link=self.save("位置关联",{"schema":flow.LINK_SCHEMA,"scope":ctx["scope"],"context":ctx,"a_path":str(self.target),"a_hash":file_hash(self.target),"word_path":str(word),"word_hash":file_hash(word),"linked_word":str(linked),"linked_word_hash":file_hash(linked)})
         self.gold=self.work/"本地标准.jsonl";self.gold.write_text(json.dumps({"id":"C-N087-T001-S001","status":"active","scope":"consolidated","note":{"id":"C-N087","name":"货币资金"},"table":{"id":"C-N087-T001","name":"资金"},"slot":{"name":"余额"},"value_type":"monetary","dimensions":[]},ensure_ascii=False),encoding="utf-8-sig")
         self.original={str(p):file_hash(p) for p in [self.source,self.target,self.link,self.gold,word,linked]}

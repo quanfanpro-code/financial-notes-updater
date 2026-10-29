@@ -20,6 +20,80 @@ W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
 class WordBridgeTests(unittest.TestCase):
+    def test_替换文字保留段落制表位并更新文字制表符(self):
+        from docx.shared import Inches
+        doc=Document();table=doc.add_table(rows=2,cols=2)
+        table.cell(0,0).text='项目';table.cell(0,1).text='金额'
+        table.cell(1,0).text='原项目'
+        paragraph=table.cell(1,1).paragraphs[0]
+        paragraph.paragraph_format.tab_stops.add_tab_stop(Inches(0.5))
+        paragraph.paragraph_format.tab_stops.add_tab_stop(Inches(1))
+        paragraph.add_run('旧\t文字')
+        properties=paragraph._p.pPr.xml
+        word=self.folder/'含制表位.docx';doc.save(word);before=word.read_bytes()
+        excel=self.folder/'制表位.xlsx';linked=self.folder/'制表位关联.docx'
+        self.call('extract',word=word,excel=excel,linked_word=linked,context=self.folder/'制表位原文.json')
+        book=load_workbook(excel);book['sheet1']['C3']='新文字';changed=self.folder/'制表位修改.xlsx';book.save(changed);book.close()
+        output=self.folder/'制表位副本.docx';self.call('update',word=linked,excel=changed,output=output)
+        actual=Document(output).tables[0].cell(1,1).paragraphs[0]
+        self.assertEqual(actual._p.pPr.xml,properties)
+        self.assertEqual(actual.text,'新文字')
+        self.assertEqual(word.read_bytes(),before)
+
+    def test_原文读取不预先要求可替换写回(self):
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        doc=Document();table=doc.add_table(rows=2,cols=2)
+        table.cell(0,0).text='项目';table.cell(0,1).text='金额'
+        table.cell(1,0).text='原文项目'
+        cell=table.cell(1,1);field=OxmlElement('w:fldSimple');field.set(qn('w:instr'),'DATE')
+        run=OxmlElement('w:r');text=OxmlElement('w:t');text.text='2025';run.append(text);field.append(run)
+        cell.paragraphs[0]._p.append(field)
+        word=self.folder/'含原始域.docx';doc.save(word);before=word.read_bytes()
+        excel=self.folder/'原文读取.xlsx';linked=self.folder/'原文关联.docx';context=self.folder/'原文.json'
+        self.call('extract',word=word,excel=excel,linked_word=linked,context=context)
+        book=load_workbook(excel);self.assertEqual(str(book['sheet1']['C3'].value),'2025');book.close()
+        self.assertEqual(word.read_bytes(),before)
+        self.assertTrue(Document(linked).tables[0]._tbl.xpath('.//w:fldSimple'))
+
+    def test_两侧纵向续接不当作行首行尾省略(self):
+        doc=Document();table=doc.add_table(rows=3,cols=4)
+        table.cell(0,0).merge(table.cell(1,0)).text='左侧'
+        table.cell(0,3).merge(table.cell(1,3)).text='右侧'
+        table.cell(0,1).merge(table.cell(0,2)).text='中间'
+        table.cell(1,1).text='本期';table.cell(1,2).text='上期'
+        word=self.folder/'纵向续接.docx';doc.save(word)
+        excel=self.folder/'续接.xlsx';linked=self.folder/'续接关联.docx';context=self.folder/'续接原文.json'
+        self.call('extract',word=word,excel=excel,linked_word=linked,context=context)
+        self.assertEqual(json.loads(context.read_text(encoding='utf-8-sig'))['tables'][0]['structural_omissions'],[])
+        output=self.folder/'续接副本.docx';self.call('update',word=linked,excel=excel,output=output)
+        actual=Document(output).tables[0]
+        self.assertEqual([[c.text for c in r.cells] for r in actual.rows],[[c.text for c in r.cells] for r in table.rows])
+
+    def test_行尾省略网格提取与副本写回不补造单元格(self):
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        for all_rows in (False,True):
+            with self.subTest(all_rows=all_rows):
+                doc=Document();table=doc.add_table(rows=2,cols=3)
+                for row,values in zip(table.rows,[['项目','期末','期初'],['原项目','10','20']]):
+                    for cell,value in zip(row.cells,values):cell.text=value
+                for row in table._tbl.tr_lst if all_rows else table._tbl.tr_lst[1:]:
+                    row.remove(row.tc_lst[-1]);tail=OxmlElement('w:gridAfter');tail.set(qn('w:val'),'1');row.get_or_add_trPr().append(tail)
+                suffix=str(all_rows);word=self.folder/('行尾省略'+suffix+'.docx');doc.save(word);before=word.read_bytes()
+                excel=self.folder/('行尾省略'+suffix+'.xlsx');linked=self.folder/('行尾关联'+suffix+'.docx');context=self.folder/('行尾原文'+suffix+'.json')
+                self.call('extract',word=word,excel=excel,linked_word=linked,context=context)
+                stored=json.loads(context.read_text(encoding='utf-8-sig'))['tables'][0]
+                self.assertEqual(stored['column_count'],2 if all_rows else 3)
+                self.assertEqual([r['range'] for r in stored['structural_omissions']],[] if all_rows else ['D3'])
+                book=load_workbook(excel);book['sheet1']['C3']=125;changed=self.folder/('行尾修改'+suffix+'.xlsx');book.save(changed);book.close()
+                output=self.folder/('行尾副本'+suffix+'.docx');self.call('update',word=linked,excel=changed,output=output)
+                actual=Document(output).tables[0]
+                self.assertEqual([len(r.tc_lst) for r in actual._tbl.tr_lst],[2,2] if all_rows else [3,2])
+                self.assertEqual(''.join(t.text or '' for t in actual._tbl.tr_lst[1].tc_lst[1].xpath('.//w:t')),'125')
+                self.assertEqual(actual._tbl.tr_lst[1].trPr.find(qn('w:gridAfter')).get(qn('w:val')),'1')
+                self.assertEqual(word.read_bytes(),before)
+
     def setUp(self):
         base = ROOT / "Word桥接" / "测试结果"
         base.mkdir(exist_ok=True)
@@ -68,6 +142,28 @@ class WordBridgeTests(unittest.TestCase):
         self.assertEqual(result["table_count"], 1)
         return excel, linked, context
 
+    def test_Excel错误值原样搬入Word不阻断其他内容(self):
+        excel, linked, context = self.extract()
+        table = json.loads(context.read_text(encoding='utf-8-sig'))['tables'][0]
+        book = load_workbook(excel)
+        sheet = book[table['sheet']]
+        errors = ['#DIV/0!', '#N/A', '#SPILL!']
+        for offset, value in enumerate(errors, 1):
+            cell = sheet.cell(table['first_row'] + offset, table['first_column'] + 1)
+            cell.value = value
+            cell.data_type = 'e'
+        changed = self.folder / '包含错误原值.xlsx'
+        book.save(changed)
+        book.close()
+        output = self.folder / '错误原值保留.docx'
+        result = self.call('update', word=linked, excel=changed, output=output)
+        self.assertTrue(result['output_verified'])
+        actual = Document(output)
+        self.assertEqual([actual.tables[0].cell(row, 1).text for row in range(1, 4)], errors)
+        self.assertEqual(actual.tables[0].cell(1, 2).text, '90.00')
+        self.assertEqual(actual.paragraphs[-1].text, '表后说明必须保留。')
+        self.assertEqual(self.word.read_bytes(), self.original)
+
     def test_表外标题随所属表更新且同名其他段落保留(self):
         word = self.folder / '两张同名标题原件.docx'
         doc = Document()
@@ -114,6 +210,53 @@ class WordBridgeTests(unittest.TestCase):
         actual=next(p for p in Document(output).paragraphs if p.text=='新设备范围')
         self.assertTrue(actual.runs[0].bold)
         self.assertEqual([node.get(qn('w:type')) for node in actual._p if node.tag==qn('w:proofErr')],['gramStart','gramEnd'])
+        with zipfile.ZipFile(linked) as before,zipfile.ZipFile(output) as after:
+            for name in before.namelist():
+                if name!='word/document.xml':self.assertEqual(before.read(name),after.read(name),name)
+
+    def test_标题分页标记及文字格式保留而局部说明追加(self):
+        from docx.oxml import OxmlElement
+        doc=Document();doc.add_heading('六、合并财务报表项目注释',level=1)
+        caption=doc.add_paragraph();run=caption.add_run();run.bold=True
+        run._r.append(OxmlElement('w:lastRenderedPageBreak'));run.add_text('资产总表')
+        table=doc.add_table(rows=1,cols=1);table.cell(0,0).text='77'
+        word=self.folder/'带分页标记标题.docx';doc.save(word);original=word.read_bytes()
+        excel,linked,context=(self.folder/name for name in ('分页表.xlsx','分页连接.docx','分页上下文.json'))
+        self.call('extract',word=word,excel=excel,linked_word=linked,context=context,chapter_title='合并财务报表项目注释')
+        output=self.folder/'分页标题说明副本.docx'
+        self.call('update',word=linked,excel=excel,output=output,
+            caption_updates=[{'range_name':'TA_001','old_text':'资产总表','text':'资产总表 期末为已明确日期'}])
+        actual=next(p for p in Document(output).paragraphs if p.text=='资产总表 期末为已明确日期')
+        self.assertEqual(len(actual._p.xpath('.//w:lastRenderedPageBreak')),1)
+        self.assertTrue(actual.runs[0].bold)
+        self.assertEqual(word.read_bytes(),original)
+        with zipfile.ZipFile(linked) as before,zipfile.ZipFile(output) as after:
+            for name in before.namelist():
+                if name!='word/document.xml':self.assertEqual(before.read(name),after.read(name),name)
+
+    def test_标题书签起止标记和跨段终点保留(self):
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        doc=Document();doc.add_heading('六、合并财务报表项目注释',level=1)
+        caption=doc.add_paragraph()
+        for number in ('10','11'):
+            marker=OxmlElement('w:bookmarkStart');marker.set(qn('w:id'),number);marker.set(qn('w:name'),'范围'+number);caption._p.append(marker)
+        caption.add_run('账龄组合').bold=True
+        marker=OxmlElement('w:bookmarkEnd');marker.set(qn('w:id'),'10');caption._p.append(marker)
+        table=doc.add_table(rows=1,cols=1);table.cell(0,0).text='77'
+        end=doc.add_paragraph();marker=OxmlElement('w:bookmarkEnd');marker.set(qn('w:id'),'11');end._p.append(marker)
+        word=self.folder/'标题带书签.docx';doc.save(word);original=word.read_bytes()
+        excel,linked,context=(self.folder/name for name in ('书签表.xlsx','书签连接.docx','书签上下文.json'))
+        self.call('extract',word=word,excel=excel,linked_word=linked,context=context,chapter_title='合并财务报表项目注释')
+        output=self.folder/'书签标题说明副本.docx'
+        self.call('update',word=linked,excel=excel,output=output,
+            caption_updates=[{'range_name':'TA_001','old_text':'账龄组合','text':'账龄组合 本次来源期间已明确'}])
+        actual=Document(output);title=next(p for p in actual.paragraphs if p.text=='账龄组合 本次来源期间已明确')
+        self.assertTrue(title.runs[0].bold);self.assertEqual(word.read_bytes(),original)
+        def marks(document):
+            return [(i,node.tag,dict(node.attrib)) for i,part in enumerate(document._element.body)
+                    for node in part.iter() if node.tag in {qn('w:bookmarkStart'),qn('w:bookmarkEnd')}]
+        self.assertEqual(marks(actual),marks(Document(linked)))
         with zipfile.ZipFile(linked) as before,zipfile.ZipFile(output) as after:
             for name in before.namelist():
                 if name!='word/document.xml':self.assertEqual(before.read(name),after.read(name),name)

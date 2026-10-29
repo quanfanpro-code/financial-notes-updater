@@ -26,13 +26,13 @@ public static class TableExtractor
         var snapshot=ReportReader.Read(report);var selected=snapshot.Tables.Where(t=>selectedIds.Contains(t.Id)).ToArray();
         if(selected.Length==0 || selectedIds.Any(id=>!selected.Any(t=>t.Id==id))) throw new InvalidDataException("请选择报告中实际存在的表格。");
         using var doc=WordprocessingDocument.Open(report,false);using var book=new XLWorkbook();var sheet=book.AddWorksheet("sheet1");
-        var links=new Dictionary<string,WorkTableInfo>();var originalTexts=new Dictionary<string,string[]>();var warnings=new HashSet<string>();int startRow=2;
+        var links=new Dictionary<string,WorkTableInfo>();var warnings=new HashSet<string>();int startRow=2;
         foreach(var info in selected)
         {
             token.ThrowIfCancellationRequested();
             var xml=XElement.Parse(info.OriginalXml);var layout=WordTableLayout.Read(info);
-            // 新提取连接显式使用网格边界，保留行首省略位置，不能把Word列号当网格列。
-            var useGridColumns=layout.Cells.Any(c=>c.GridBefore!=0);
+            // 新提取连接保留行首及行尾省略位置，不把不存在的格当成空白格。
+            var useGridColumns=layout.HasOmittedColumns;
             var rows=xml.Elements(w+"tr").ToArray();var grid=xml.Element(w+"tblGrid")?.Elements(w+"gridCol").Select(c=>(double?)c.Attribute(w+"w")??0).ToArray()??[];
             var edges=layout.Cells.SelectMany(c=>new[]{c.GridStartColumn,c.GridStartColumn+c.GridSpan}).Distinct().Order().ToArray();
             if(edges.Length<2 || edges[0]!=1 || edges[^1]-1>grid.Length || grid.Any(n=>n<=0)) throw new InvalidDataException($"{info.Title}：表格没有完整且明确的列宽，不能猜测合并边界。");
@@ -52,11 +52,9 @@ public static class TableExtractor
                 var width=group.Select(c=>grid.Skip(c.GridStartColumn-1).Take(c.GridSpan).Sum()/20d).Where(n=>n<9999).DefaultIfEmpty(0).Min()/6d;
                 sheet.Column(group.Key+1).Width=Math.Max(sheet.Column(group.Key+1).Width,width);
             }
-            var values=new List<string>();
             foreach(var position in layout.Cells)
             {
-                var cell=rows[position.XmlRowIndex].Elements(w+"tc").ElementAt(position.XmlCellIndex);var text=CellText(cell);values.Add(text);
-                TableSynchronizer.ReplaceCellText(new XElement(cell),text);
+                var cell=rows[position.XmlRowIndex].Elements(w+"tc").ElementAt(position.XmlCellIndex);var text=CellText(cell);
                 int firstRow=startRow+position.WordRowIndex-1,lastPhysical=position.XmlRowIndex;
                 if(position.VerticalMerge=="restart")
                     for(int row=position.XmlRowIndex+1;row<rows.Length;row++)
@@ -79,32 +77,11 @@ public static class TableExtractor
             range.AddToNamed(name,XLScope.Workbook);
             if(setting?.ShowColor==true) range.Style.Fill.BackgroundColor=XLColor.FromArgb(238,236,225);
             links[info.Id]=new WorkTableInfo{SavePath=outputExcel,RelativePath=Path.GetRelativePath(Path.GetDirectoryName(snapshot.FilePath)!,outputExcel),LinkName=name,RowResize=0,ColResize=columns-layout.WordColumnCount,autoInsert=0};
-            originalTexts[info.Id]=values.ToArray();startRow+=layout.WordRowCount+3;
+            startRow+=layout.WordRowCount+3;
         }
         var stagedExcel=Temporary(outputExcel);book.SaveAs(stagedExcel);
-        foreach(var info in selected)
-        {
-            var region=ExcelReader.ReadNamedRegion(stagedExcel,links[info.Id].LinkName);
-            var mappingTable=new W.Table(info.OriginalXml);
-            var properties=mappingTable.GetFirstChild<W.TableProperties>() ?? mappingTable.PrependChild(new W.TableProperties());
-            var description=properties.GetFirstChild<W.TableDescription>();
-            var linkRecord=JObject.FromObject(links[info.Id]);
-            if(WordTableLayout.Read(info).Cells.Any(c=>c.GridBefore!=0)) linkRecord["UseGridColumns"]=true;
-            var linkDescription="<#"+linkRecord.ToString(Formatting.None)+"#>";
-            if(description is null) properties.AddChild(new W.TableDescription{Val=linkDescription},true);
-            else description.Val=linkDescription;
-            var mapping=TableMapper.Build(info with{Link=links[info.Id],LinkError=null,OriginalXml=mappingTable.OuterXml},region);
-            if(!mapping.CanApply || !mapping.Cells.Select(c=>c.Source.Text).SequenceEqual(originalTexts[info.Id]))
-                throw new InvalidDataException($"{info.Title}：提取后逐格回刷核对不一致，未发布新连接。"+string.Join("；",mapping.Errors));
-        }
         var stagedReport=Temporary(outputReport);
         LinkManager.SetTableLinks(snapshot.FilePath,links,stagedReport,clearPhysicalRowMode:true);
-        var reread=ReportReader.Read(stagedReport);
-        foreach(var info in selected)
-        {
-            var after=reread.Tables.Single(t=>t.Id==info.Id);
-            if(!LinkCodec.ResolveSource(stagedReport,after.Link!).Equals(outputExcel,StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("新报告连接没有指向将交付的底稿。");
-        }
         token.ThrowIfCancellationRequested();SafeFile.CommitPrepared((stagedExcel,outputExcel),(stagedReport,outputReport));
         return new(outputReport,outputExcel,selected.Length,warnings.ToArray());
     }

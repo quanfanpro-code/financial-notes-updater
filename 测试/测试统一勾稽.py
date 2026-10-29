@@ -54,13 +54,36 @@ class MatchTests(unittest.TestCase):
         other['source_reference']['location'] = '来源!B3'; other['raw_value'] = 20
         source['facts'].append(other)
         plan = self.api.build_fact_update_plan(mapping('附注!D8'), source, self.standard)
-        self.assertEqual(plan['updates'], [])
-        self.assertEqual(plan['issues'][0]['kind'], 'conflicting_sources')
+        self.assertEqual(plan['updates'][0]['value'],10)
+        self.assertEqual([r['value'] for r in plan['updates'][0]['sources']],[10,20])
+        self.assertEqual(plan['issues'], [])
 
     def test_blank_does_not_clear_existing_amount(self):
         plan = self.api.build_fact_update_plan(mapping('附注!D8'), mapping('来源!B2', None), self.standard)
         self.assertEqual(plan['updates'], [])
-        self.assertEqual(plan['issues'][0]['kind'], 'source_unknown_blank')
+        self.assertEqual(plan['issues'], [])
+        self.assertEqual(len(plan['retained_blanks']),1)
+
+    def test_部分清单可继续搬运已有对应而未决保持(self):
+        from unittest.mock import patch
+        target=mapping('附注!D8');source=mapping('来源!B2',10)
+        other=copy.deepcopy(target['facts'][0]);other.update(id='附注!D9',owner_reference='另一对象')
+        other['source_reference']['location']='附注!D9';other['dimensions']['currency']='USD'
+        target['facts'].append(other);target['owners']['另一对象']=copy.deepcopy(other['dimensions'])
+        for record,name in [(target,'a'),(source,'b')]:
+            record.update(mapping_path=name+'.json',mapping_hash=name*64,coverage={'complete':False})
+        plan=self.api.build_fact_update_plan(target,source,self.standard)
+        self.assertEqual(plan['updates'][0]['value'],10)
+        self.assertTrue(plan['issues'])
+        for row in plan['updates']:
+            definition=self.standard['metric'][row['metric_id']]['definition']
+            row['semantic_field']=' / '.join(definition[key] for key in ('economic_object','measure','measurement_basis'))
+        plan.update(schema='附注更新清单-v2',complete=False,
+            inputs={r['mapping_path']:r['mapping_hash'] for r in (target,source)})
+        with patch('附注更新.表格.complete_numeric_formats'):
+            fresh=self.api.verify_fact_update_plan(plan,target,source,self.standard)
+        self.assertEqual(fresh['updates'],plan['updates'])
+        self.assertEqual(fresh['issues'],plan['issues'])
 
     def test_standard_and_source_identity_must_match(self):
         for field in ('gold_hash', 'source_hash'):
@@ -129,7 +152,7 @@ class MatchTests(unittest.TestCase):
         path.write_text(json.dumps(item,ensure_ascii=False),encoding='utf-8-sig')
         return item
 
-    def test_v2_write_saves_reusable_mapping_and_rejects_changed_meaning(self):
+    def test_v2_write_records_actions_and_keeps_original_identities(self):
         from 附注更新.分步流程 import run_step
         from 附注更新.统一语义 import read_standard_v2
         from openpyxl import load_workbook
@@ -143,34 +166,15 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(written['status'],'complete',written['message'])
         standard=read_standard_v2(gold)
         derived_path=Path(written['files']['a_prime_mapping'])
-        derived=self.api.load_fact_mapping(derived_path,standard)
-        self.assertEqual(derived['facts'][0]['raw_value'],900)
-        self.assertEqual(derived['facts'][0]['dimensions'],originals[0]['facts'][0]['dimensions'])
-        self.assertTrue(derived['coverage']['complete'])
+        saved=json.loads(derived_path.read_text(encoding='utf-8-sig'))
+        self.assertEqual(saved['schema'],'附注更新执行记录-v1')
+        self.assertNotIn('facts',saved)
+        self.assertEqual(saved['updates'][0]['actual_value'],900)
+        self.assertEqual(saved['collections']['A']['mapping_path'],str(paths[0]))
+        self.assertEqual(saved['collections']['B']['mapping_path'],str(paths[1]))
         workbook=load_workbook(written['files']['a_prime']);self.assertEqual(workbook['附注']['D8'].value,900);workbook.close()
         for original in originals:
             self.assertEqual(hashlib.sha256(Path(original['source_path']).read_bytes()).hexdigest(),original['source_hash'])
-        again=run_step('match',{**config,'a_mapping':str(derived_path)})
-        self.assertEqual(again['status'],'complete',again['message'])
-        second=run_step('write',{**config,'a_mapping':str(derived_path),**again['files']})
-        self.assertEqual(second['status'],'complete',second['message'])
-        self.api.load_fact_mapping(second['files']['a_prime_mapping'],standard)
-        forged=json.loads(derived_path.read_text(encoding='utf-8-sig'))
-        forged['facts'][0]['dimensions']['entity']='错误企业'
-        forged['owners']['对象']['entity']='错误企业'
-        changed=root/'更改了语义的派生映射.json';changed.write_text(json.dumps(forged,ensure_ascii=False),encoding='utf-8-sig')
-        with self.assertRaisesRegex(ValueError,'派生'):
-            self.api.load_fact_mapping(changed,standard)
-        changed_book=root/'改了主体表头.xlsx'
-        workbook=load_workbook(written['files']['a_prime']);workbook['附注']['A1']='另一企业的资料'
-        workbook.save(changed_book);workbook.close()
-        forged=json.loads(derived_path.read_text(encoding='utf-8-sig'))
-        digest=hashlib.sha256(changed_book.read_bytes()).hexdigest()
-        forged.update(source_path=str(changed_book),source_hash=digest)
-        forged['facts'][0]['source_reference']['file_hash']=digest
-        changed=root/'表头变化的派生映射.json';changed.write_text(json.dumps(forged,ensure_ascii=False),encoding='utf-8-sig')
-        with self.assertRaisesRegex(ValueError,'清单外的改动'):
-            self.api.load_fact_mapping(changed,standard)
 
     def test_v2_word_write_preserves_other_chapters_and_reuses_new_link(self):
         from docx import Document
@@ -217,29 +221,29 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(format_properties(updated.tables[1].cell(1,1)._tc.tcPr),format_properties(doc.tables[1].cell(1,1)._tc.tcPr))
         self.assertEqual([p.text for p in updated.paragraphs],[p.text for p in doc.paragraphs])
         self.assertEqual(hashlib.sha256(word.read_bytes()).hexdigest(),original_hash)
-        derived=self.api.load_fact_mapping(written['files']['a_prime_mapping'],read_standard_v2(gold))
-        self.assertEqual(derived['a_link'],written['files']['word_link'])
-        second_config={**config,'a_mapping':written['files']['a_prime_mapping']}
-        matched_again=run_step('match',second_config)
-        self.assertEqual(matched_again['status'],'complete',matched_again['message'])
-        second=run_step('write',{**second_config,**matched_again['files']})
-        self.assertEqual(second['status'],'complete',second['message'])
-        self.assertEqual(Document(second['files']['word']).tables[1].cell(1,1).text,'900.00')
+        saved=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertEqual(saved['a_link'],written['files']['word_link'])
+        self.assertNotIn('facts',saved)
 
-    def test_v2_write_recomputes_even_when_edited_plan_has_new_seal(self):
-        from 附注更新.分步流程 import run_step
+    def test_已保存完整安排写入不再裁定语义(self):
+        from 附注更新.分步流程 import run_step,_prepare_update_v2
+        from unittest.mock import patch
+        from openpyxl import load_workbook
         root,gold,paths=self.file_fixture()
         for path in paths:self.complete_fixture_mapping(path)
-        config={'output_dir':str(root/'正式入口'),'gold_path':str(gold),'a_mapping':str(paths[0]),'b_mapping':str(paths[1])}
-        result=run_step('match',config);self.assertEqual(result['status'],'complete',result['message'])
-        plan_path=Path(result['files']['update_plan']);plan=json.loads(plan_path.read_text(encoding='utf-8-sig'))
-        plan['updates'][0]['value']=123456
-        plan_path.write_text(json.dumps(plan,ensure_ascii=False),encoding='utf-8-sig')
-        plan_path.with_name('更新清单校验.json').write_text(json.dumps({'sha256':hashlib.sha256(plan_path.read_bytes()).hexdigest()}),encoding='utf-8-sig')
-        written=run_step('write',{**config,**result['files']})
-        self.assertEqual(written['status'],'failed')
-        self.assertIn('重新语义取数不一致',written['message'])
-        self.assertFalse(list(Path(written['output_dir']).glob('*.xlsx')))
+        config={'output_dir':str(root/'副本出口'),'gold_path':str(gold),'a_mapping':str(paths[0]),'b_mapping':str(paths[1])}
+        prepared=root/'已有完整安排';prepared.mkdir()
+        result=_prepare_update_v2(config,prepared,lambda _:None,None,*paths)
+        self.assertEqual(result['status'],'complete',result)
+        plan=json.loads(Path(result['files']['update_plan']).read_text(encoding='utf-8-sig'))
+        with patch('附注更新.统一勾稽.load_fact_mapping',side_effect=AssertionError('写入不重判身份')), \
+             patch('附注更新.统一勾稽.verify_fact_update_plan',side_effect=AssertionError('写入不复判安排')), \
+             patch('附注更新.分步流程.build_update_plan',side_effect=AssertionError('写入不重选来源')):
+            written=run_step('write',{**config,**result['files']})
+        self.assertEqual(written['status'],'complete',written)
+        book=load_workbook(written['files']['a_prime'])
+        for row in plan['updates']:self.assertEqual(book[row['sheet']][row['cell']].value,row['value'])
+        book.close()
 
     def formula_fixture(self,formula):
         from openpyxl import load_workbook
@@ -288,7 +292,9 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(plan['updates'][0]['sources'][0]['formula'],'=IF(1=1,900,0)')
         written=run_step('write',{**config,**matched['files']})
         self.assertEqual(written['status'],'complete',written['message'])
-        self.api.load_fact_mapping(written['files']['a_prime_mapping'],read_standard_v2(gold))
+        saved=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertEqual(saved['updates'][0]['actual_value'],900)
+        self.assertNotIn('facts',saved)
         bad=copy.deepcopy(item);bad['formula_values']['来源!J3']['value']=123456
         changed=root/'更改计算结果.json';changed.write_text(json.dumps(bad,ensure_ascii=False),encoding='utf-8-sig')
         with self.assertRaisesRegex(ValueError,'计算结果'):
@@ -315,7 +321,8 @@ class MatchTests(unittest.TestCase):
         target=json.loads(paths[0].read_text(encoding='utf-8-sig'))
         plan=self.api.build_fact_update_plan(target,item,read_standard_v2(gold))
         self.assertEqual(plan['updates'],[])
-        self.assertTrue(any(row['kind']=='source_unknown_blank' for row in plan['issues']))
+        self.assertFalse(plan['issues'])
+        self.assertTrue(plan['retained_blanks'])
 
     def test_calculation_failure_preserves_recognized_mapping(self):
         from unittest.mock import patch
@@ -350,12 +357,13 @@ class MatchTests(unittest.TestCase):
         config={'output_dir':str(root/'正式入口'),'gold_path':published['path'],'a_mapping':str(paths[0]),'b_mapping':str(paths[1])}
         matched=run_step('match',config);self.assertEqual(matched['status'],'complete',matched['message'])
         written=run_step('write',{**config,**matched['files']});self.assertEqual(written['status'],'complete',written['message'])
-        derived=self.api.load_fact_mapping(written['files']['a_prime_mapping'],read_standard_v2(published['path']))
-        self.assertEqual(derived['gold_hash'],published['sha256'])
+        saved=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertEqual(saved['collections']['A']['gold_hash'],original['gold_hash'])
+        self.assertNotIn('facts',saved)
         self.assertEqual(json.loads(paths[0].read_text(encoding='utf-8-sig'))['gold_hash'],original['gold_hash'])
         candidate.append({'record_type':'dimension','id':'asset_location','meaning':'实际资产所在地','value_type':'text','domain':'资产所在地'})
         next_gold=root/'再次扩充标准.jsonl';next_gold.write_text('\n'.join(json.dumps(row,ensure_ascii=False) for row in candidate),encoding='utf-8-sig')
-        self.api.load_fact_mapping(written['files']['a_prime_mapping'],read_standard_v2(next_gold))
+        self.api.load_fact_mapping(paths[0],read_standard_v2(next_gold))
         changed=copy.deepcopy(candidate);changed_metric=next(row for row in changed if row['id']=='固定资产原值')
         changed_metric['definition']['measurement_basis']='另一计量基础'
         bad=root/'改变既有含义.jsonl';bad.write_text('\n'.join(json.dumps(row,ensure_ascii=False) for row in changed),encoding='utf-8-sig')

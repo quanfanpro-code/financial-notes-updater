@@ -21,7 +21,6 @@ PROMPT='''根据金标准指标、实际维度、双方原文，独立判断这�
 
 
 def _payload(target,source,standard,plan,candidate_ids):
-    _require(all(m.get('coverage',{}).get('complete') for m in (target,source)), '两份独立语义尚未完整，不能把未识别业务当作本次不采用')
     for mapping,key in ((target,'source_a_hash'),(source,'source_b_hash')):
         _require(plan.get(key)==mapping['source_hash']==file_hash(mapping['source_path']), '未采用来源依据的原件已变化')
     source_facts={r['id']:r for r in source['facts'] if r['record_type']=='metric_fact'}

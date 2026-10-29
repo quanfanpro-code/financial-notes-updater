@@ -251,8 +251,9 @@ class 分层识别测试(unittest.TestCase):
             config['update_plan'] = matched['files']['update_plan']
             written = run_step('write', config)
         self.assertEqual(written['status'], 'complete', written['message'])
-        actual = load_fact_mapping(written['files']['a_prime_mapping'], self.engine().standard)
-        self.assertEqual(actual['facts'][0]['raw_value'], 125)
+        saved = json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertEqual(saved['updates'][0]['actual_value'], 125)
+        self.assertNotIn('facts', saved)
 
     def test_b_candidates_use_own_evidence_and_keep_alternatives(self):
         from openpyxl import load_workbook

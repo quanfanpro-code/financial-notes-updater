@@ -75,7 +75,12 @@ class ProgressPayloadTests(unittest.TestCase):
                 'base_url':'http://127.0.0.1:1/v1','model':'受控本地测试','api_key':'','a_context_text':'合成企业甲；单户；人民币元；2025年12月31日'}
         extracted=run_step('extract_a',config);self.assertEqual(extracted['status'],'complete')
         config.update(extracted['files']);cancel=threading.Event()
-        with patch('附注更新.统一识别.UnifiedSemanticEngine._request',side_effect=AssertionError('取消前不应调用模型')):
+        def read_first(instance,system,payload):
+            self.assertEqual(payload['task'],'a_semantic_read','首个进度取消后不能继续选标准或识别')
+            return {'tables':[{'id':'固定资产表','sheet':'sheet1','range':'B1:C3','subject':'固定资产',
+                'meaning':'项目行及期末原值列','data_ranges':['C3']}],'notes':'来自本例原Word'}
+        # 当前流程在首轮原文阅读后发布首个可核验进度，实际保存阅读请求和回执后再取消。
+        with patch('附注更新.统一识别.UnifiedSemanticEngine._http',read_first):
             stopped=run_step('recognize_a',config,cancel=cancel,progress=lambda event:cancel.set())
         self.assertEqual(stopped['status'],'cancelled')
         mapping=stopped['files']['a_mapping']

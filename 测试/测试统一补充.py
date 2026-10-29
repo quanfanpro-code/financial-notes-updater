@@ -22,6 +22,14 @@ class ControlledEngine(UnifiedSemanticEngine):
 
     def _http(self, system, payload):
         self.calls.append(copy.deepcopy(payload))
+        if payload['task']=='workbook_outline':
+            from openpyxl.utils import get_column_letter
+            return {'subjects':['固定资产'],'subtables':[{'id':'固定资产表','subject':'固定资产','purpose':'原值和累计折旧',
+                'ranges':[{'sheet':s['sheet'],'range':f"A1:{get_column_letter(s['max_column'])}{s['max_row']}"} for s in payload['sheets']],
+                'evidence':[s['sheet']+'!A1' for s in payload['sheets']]}],'unlocated_ranges':[],'context_ranges':[]}
+        if payload['task']=='subtable_detail':
+            return {'allowed_metrics':[m['id'] for m in payload['metrics']],'structure':'项目行对应当前日期的金额列',
+                    'evidence':['表!A1'],'targets':[]}
         if payload['task'] == 'unified_classify':
             available = {row['id'] for row in payload['metrics']}; cells = {}
             for address in payload['candidate_cells']:
@@ -81,7 +89,7 @@ class SupplementTests(unittest.TestCase):
         second = ControlledEngine(self.engine.settings, result['path'], self.root/'接续'); second.calls = []
         updated = second.recognize_workbook(self.source, previous_result=self.mapping['mapping_path'])
         self.assertTrue(updated['complete'])
-        self.assertEqual([p['candidate_cells'] for p in second.calls], [['B3'], ['B3']])
+        self.assertEqual([p['candidate_cells'] for p in second.calls if p['task']=='unified_classify'], [['B3'], ['B3']])
         self.assertEqual(updated['facts'][0], self.mapping['facts'][0])
         self.assertEqual(next(f['raw_value'] for f in updated['facts'] if f['metric_id'] == '固定资产累计折旧'), 25)
         load_fact_mapping(updated['mapping_path'], current)
@@ -136,7 +144,50 @@ class SupplementTests(unittest.TestCase):
         self.assertEqual(result['new_ids'], [])
         self.assertFalse((self.root/'金标准/版本').exists())
         self.assertTrue(result['reviews'])
+        self.assertEqual(sum(p['task']=='unified_standard_proposal' for p in self.engine.calls),2)
+        self.assertEqual(sum(p['task']=='unified_standard_review' for p in self.engine.calls),4)
         for path, digest in self.original.items(): self.assertEqual(file_hash(path), digest)
+
+    def test_必要指标与不必要维度混在一批时仅允许一次按拒绝意见修正(self):
+        class CorrectingEngine(ControlledEngine):
+            def _http(self,system,payload):
+                answer=super()._http(system,payload)
+                if payload['task']=='unified_standard_proposal' and not payload.get('previous_rejection'):
+                    dimension=copy.deepcopy(self.standard['dimension']['asset_selection'])
+                    dimension['meaning']='没有必要的简化改写'
+                    answer['records'].append(dimension)
+                    for item in answer['decisions']:item['record_ids'].append('asset_selection')
+                elif payload['task']=='unified_standard_review':
+                    for item in answer['checks']:
+                        if item['record_id']=='asset_selection':
+                            item.update(accepted=False,reason='已有维度完整，不需要改写')
+                return answer
+        engine=CorrectingEngine(self.engine.settings,self.gold,self.root/'拒绝后修正');engine.calls=[]
+        result=self.api.review_missing_standard(engine,self.mapping,self.root/'拒绝后复核',publish_root=self.root)
+        self.assertEqual(result['new_ids'],['固定资产累计折旧'])
+        self.assertEqual(result['changed_ids'],[])
+        proposals=[p for p in engine.calls if p['task']=='unified_standard_proposal']
+        self.assertEqual(len(proposals),2)
+        self.assertTrue(proposals[1]['previous_rejection']['rounds'])
+        self.assertEqual(len(result['reviews'][0]['rejected_proposals']),1)
+        self.assertEqual(read_standard_v2(result['path'])['dimension'],engine.standard['dimension'])
+
+    def test_标准复核仅携带候选适用说明但保留完整定义(self):
+        context=['适用于整份材料的说明',
+                 {'sheet':'表','first_row':3,'first_column':1,'row_count':1,'column_count':2,'text':'当前候选局部说明'},
+                 {'sheet':'表','first_row':1,'first_column':1,'row_count':1,'column_count':2,'text':'仅标题范围的其他说明'}]
+        engine=ControlledEngine(self.engine.settings,self.gold,self.root/'适用说明识别');engine.calls=[]
+        mapping=engine.recognize_workbook(self.source,context=context)
+        self.api.review_missing_standard(engine,mapping,self.root/'适用说明复核',publish_root=self.root)
+        from 附注更新.统一证据 import context_catalog
+        catalog=context_catalog(context,self.source)
+        expected={key for key,row in catalog.items() if row['content'] in context[:2]}
+        for request in (p for p in engine.calls if p['task'].startswith('unified_standard_')):
+            self.assertEqual(set(request['context_evidence']),expected)
+            self.assertEqual([r['content'] for r in request['context_evidence'].values()],context[:2])
+            self.assertNotIn('document_context',request)
+            self.assertNotIn('standard_expressions',request)
+            self.assertEqual({m['id'] for m in request['existing_metrics']},{'固定资产原值'})
 
     def test_complete_dimension_disagreement_is_reviewed_without_treating_missing_context_as_new_definition(self):
         class DisagreementEngine(ControlledEngine):
@@ -150,6 +201,7 @@ class SupplementTests(unittest.TestCase):
                          'record_ids': [], 'evidence_cells': ['A1']}
                         for cell in payload['candidate_cells']]}
                 answer = super()._http(system, payload)
+                if payload['task']!='unified_classify':return answer
                 row = answer['cells'].get('B2')
                 if row and row['kind'] == 'metric_fact':
                     if self.missing_context:
@@ -195,7 +247,7 @@ class SupplementTests(unittest.TestCase):
         self.assertTrue(any(row.get('error') for row in result['reviews']))
         for path, digest in self.original.items(): self.assertEqual(file_hash(path), digest)
 
-    def test_formal_recognition_step_returns_new_standard_and_completed_mapping(self):
+    def test_B_without_A_saves_outline_without_publishing_standard(self):
         from 附注更新.分步流程 import run_step
         from 附注更新.金标准 import publish_revision
         ControlledEngine.calls = []
@@ -206,12 +258,13 @@ class SupplementTests(unittest.TestCase):
         with patch('附注更新.统一识别.UnifiedSemanticEngine', ControlledEngine), \
              patch('附注更新.统一补充.publish_revision', isolated_publish):
             result = run_step('recognize_b', config)
-        self.assertEqual(result['status'], 'complete', result)
-        self.assertIn('gold_path', result['files'])
-        self.assertIn('b_gold_changes', result['files'])
-        mapped = load_fact_mapping(result['files']['b_mapping'], read_standard_v2(result['files']['gold_path']))
-        self.assertTrue(mapped['complete'])
-        self.assertEqual(len(mapped['facts']), 2)
+        self.assertEqual(result['status'], 'partial', result)
+        self.assertNotIn('gold_path', result['files'])
+        self.assertNotIn('b_gold_changes', result['files'])
+        mapped = load_fact_mapping(result['files']['b_mapping'], read_standard_v2(self.gold))
+        self.assertTrue(mapped['outline']['complete'])
+        self.assertFalse(mapped['complete'])
+        self.assertEqual(len(mapped['facts']), 0)
         self.assertTrue(Path(result['files']['b_review']).is_file())
 
     def test_changed_dimension_cannot_reuse_legacy_conversion_approval(self):

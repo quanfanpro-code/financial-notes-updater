@@ -1,5 +1,5 @@
 ﻿# coding: utf-8
-"""统一金标准逐格识别；复用既有模型连接和回执，双轮独立识别后保存事实。"""
+"""统一金标准直接识别；历史格式辅助函数只用于读取已有成果。"""
 from __future__ import annotations
 
 import collections
@@ -204,8 +204,13 @@ def validate_response(response, packet, standard, *, isolate_errors=False, conte
         _texts(addresses)
         references=[]
         for address in addresses:
+            if address in packet.get('source_evidence',{}):
+                _require(not financial or address!=packet['sheet']+'!'+current_cell,'财务值本身不能作为语义证据')
+                references.append(address)
+                continue
             if address.startswith('@context:'):
-                resolve_context(address,catalog,packet['sheet']+'!'+current_cell)
+                if packet.get('identity_collection_version')==1:_require(address in catalog,'说明引用不在已提供原文中')
+                else:resolve_context(address,catalog,packet['sheet']+'!'+current_cell)
                 references.append(address)
                 continue
             _require(address in packet["cells"], "证据不在实际原格范围：" + address)
@@ -620,151 +625,7 @@ class UnifiedSemanticEngine(SemanticEngine):
         self._save(self.work_dir/('逐格语义映射_'+definition_hash(packet)+'.json'),result)
         return result
 
-    def recognize_workbook(self, source, context=None, progress=None, previous_result=None, artifact_metadata=None, sheets=None, allowed_metrics=None, target_mapping=None):
-        """sheets 为可选工作表名单：局部验证只识别所选表，其余格保持未决，不冒充整份完成。
-
-        allowed_metrics 为可选相关指标名单，只缩减随请求携带的标准定义，不改变任何校验。
-        """
-        if artifact_metadata and artifact_metadata.get('carrier')=='A':
-            from .A语义阅读 import recognize_a
-            _require(sheets is None and allowed_metrics is None, 'A按整份原文理解后查标准，不预设工作表或指标名单')
-            return recognize_a(self,source,context or [],progress,artifact_metadata,previous_result)
-        _require(sheets is None or (isinstance(sheets, list) and sheets and all(isinstance(name, str) and name for name in sheets)),
-                 '工作表范围须为非空字符串名单或不选')
-        snapshot=read_workbook(source,context=context or [])
-        materialize_candidate_blanks(snapshot)
-        if artifact_metadata:
-            _require(set(artifact_metadata)<={'carrier','original_path','original_hash','additional_context','a_link'},'进度附属信息不能覆盖语义或证据')
-            _require(artifact_metadata.get('carrier') in {'A','B'} and
-                     Path(artifact_metadata['original_path']).resolve()==Path(source).resolve() and
-                     artifact_metadata['original_hash']==snapshot['sha256'],'进度附属信息与本次载体不符')
-        from .表格编排 import read_outline, plan_recognition, required_coverage
-        outline=read_outline(self,snapshot,context or [],target_mapping)
-        if artifact_metadata and artifact_metadata.get('carrier')=='B':
-            path=self.work_dir/'整表进度'/uuid.uuid4().hex/'B初识目录.json'
-            initial={'schema_version':2,'gold_path':self.gold_path,'gold_hash':self.gold_hash,
-                     'source_path':snapshot['path'],'source_hash':snapshot['sha256'],'source_context':context or [],
-                     'facts':[],'owners':{},'excluded':[],'unresolved':[],'request_receipts':[], 'packet_mappings':[],
-                     **copy.deepcopy(artifact_metadata),'outline':outline,'recognition_scope':{'mode':'b_outline'},
-                     'complete':False,'mapping_path':str(path),'usage':dict(self.usage)}
-            self._save(path,initial)
-            if progress:progress(initial)
-            if target_mapping is None: return initial
-        jobs,recognition_scope=plan_recognition(self,snapshot,outline,context or [],target_mapping,sheets,allowed_metrics)
-        if outline.get('method') == 'b_required_location':
-            from .A语义阅读 import recognize_a
-            result=recognize_a(self,source,context or [],progress,artifact_metadata,previous_result,
-                               b_scope=recognition_scope,b_outline=outline)
-            from .表格编排 import search_after_binding
-            while True:
-                followup=search_after_binding(self,snapshot,outline,context or [],result)
-                if followup is None:return result
-                if followup['candidate_locations']!=result['recognition_scope']['candidate_locations']:
-                    result=recognize_a(self,source,context or [],progress,artifact_metadata,result['mapping_path'],
-                                       b_scope=followup,b_outline=outline)
-                    continue
-                # 仅新增来源才继续绑定；无进展保存全部需要及真实未完成状态。
-                result['recognition_scope']=followup
-                result['recognition_scope']['coverage']=required_coverage(result,self.standard)
-                result['mapping_path']=str(Path(result['mapping_path']).with_name('B身份补查后映射.json'))
-                self._save(Path(result['mapping_path']),result)
-                if progress:progress(result)
-                return result
-        checkpoint_dir=self.work_dir/'整表进度'/uuid.uuid4().hex
-        result={'schema_version':2,'gold_path':self.gold_path,'gold_hash':self.gold_hash,
-                'source_path':snapshot['path'],'source_hash':snapshot['sha256'],'source_context':context or [],
-                'facts':[],'owners':{},'excluded':[],'unresolved':[],'request_receipts':[],'packet_mappings':[],
-                'outline':outline,'recognition_scope':recognition_scope}
-        if artifact_metadata:
-            result.update(copy.deepcopy(artifact_metadata))
-        processed=set()
-        checkpoint=0
-        if previous_result:
-            from .统一勾稽 import load_fact_mapping, _location
-            from .统一语义 import compatible_classification
-            try:
-                original_record=json.loads(Path(previous_result).read_text(encoding='utf-8-sig'))
-                previous=load_fact_mapping(previous_result,read_standard_v2(original_record['gold_path']))
-                _require(previous['source_hash']==snapshot['sha256'],'本次原表与原映射不同')
-                _require(previous.get('source_context',[])==(context or []),'本次说明或Word上下文与原映射不同')
-                retained=compatible_classification(previous,self.standard)
-            except (ValueError,OSError,KeyError) as error:
-                self.log('原映射暂不能复用，将按当前资料重新识别：'+self._redact(str(error)))
-            else:
-                result.update(retained)
-                result['reused_mapping']={'path':previous['mapping_path'],'sha256':previous['mapping_hash'],
-                                          'selection':'unchanged_definitions'}
-                processed.update(_location(row) for row in retained['facts'])
-                processed.update((row['sheet'],row['cell']) for row in retained['excluded'])
-                self.log(f'已核实并复用{len(processed)}格，只继续处理定义受影响、未决或未处理格')
-        def publish(final=False):
-            nonlocal checkpoint
-            _require(file_hash(source)==snapshot['sha256'],'识别期间原工作簿已变化')
-            _require(file_hash(self.gold_path)==self.gold_hash,'识别期间金标准已变化')
-            current=copy.deepcopy(result)
-            for sheet in snapshot['sheets']:
-                for address in sheet['cells']:
-                    if (sheet['name'],address) not in processed and (target_mapping is None or
-                            sheet['name']+'!'+address in recognition_scope['candidate_locations']):
-                        current['unresolved'].append({'sheet':sheet['name'],'cell':address,'reason':'该格尚未完成识别'})
-            current['coverage']=workbook_coverage(current,snapshot)
-            current['complete']=current['coverage']['complete']
-            if target_mapping is not None:
-                current['recognition_scope']['coverage']=required_coverage(current,self.standard)
-            current['usage']=dict(self.usage)
-            # 进度和依据按本次运行独立保存，后续缓存重试不能改写先前成果的依据。
-            for key in ('request_receipts','packet_mappings'):
-                frozen=[]
-                for item in current[key]:
-                    content=Path(item['path']).read_bytes()
-                    _require(hashlib.sha256(content).hexdigest()==item['sha256'],'保存进度前识别依据已变化')
-                    destination=checkpoint_dir/'识别依据'/(item['sha256']+'.json')
-                    destination.parent.mkdir(parents=True,exist_ok=True)
-                    if not destination.exists():
-                        with destination.open('xb') as handle:handle.write(content)
-                    _require(file_hash(destination)==item['sha256'],'识别依据副本校验失败')
-                    frozen.append({'path':str(destination),'sha256':item['sha256']})
-                current[key]=frozen
-            checkpoint+=1
-            path=checkpoint_dir/('整份表格语义映射.json' if final else f'整份表格语义映射_进度{checkpoint:05d}.json')
-            current['mapping_path']=str(path)
-            self._save(path,current)
-            if progress:progress(current)
-            return current
-        publish()
-        for job in jobs:
-            sheet=job['sheet']
-            text_cells={a:c for a,c in job['shown'].items() if isinstance(c['value'],str) and c['value'].strip() and not c.get('formula')}
-            pending=[address for address in job['candidates'] if (sheet['name'],address) not in processed]
-            if not job['metrics']:
-                self.log('子表未找到相关金标准，保留具体缺口，不恢复全库逐格识别：'+job['subtable']['purpose'])
-                continue
-            # 复用已有240格分包及Word物理表隔离；不按位置决定任何格子的语义。
-            for candidates,physical in _layout_packets(sheet,pending):
-                self._check_cancel()
-                shown={**text_cells,**{a:sheet['cells'][a] for a in candidates}}
-                packet={'source_path':snapshot['path'],'source_hash':snapshot['sha256'],'sheet':sheet['name'],
-                        'cells':shown,'candidate_cells':candidates,'merges':sheet['merges'],
-                        'physical_table':physical,'document_context':context or []}
-                if job.get('structure'):
-                    packet['subtable_reading']={'ranges':job['subtable']['ranges'],
-                                                'structure':job['structure'],'evidence':job['evidence']}
-                if artifact_metadata and artifact_metadata.get('carrier')=='A':
-                    packet['recognition_method']='first_then_review'
-                try:
-                    part=self.classify_packet(packet, allowed_metrics=job['metrics'])
-                except SemanticCancelled:raise
-                except Exception as error:
-                    part={'facts':[],'owners':{},'excluded':[],
-                          'unresolved':[{'cell':a,'reason':'识别包未通过：'+self._redact(str(error))} for a in candidates],
-                          'request_receipts':[]}
-                result['facts'].extend(part['facts']); result['owners'].update(part['owners'])
-                for kind in ('excluded','unresolved'):
-                    result[kind].extend({'sheet':sheet['name'],**row} for row in part.get(kind,[]))
-                result['request_receipts'].extend(part['request_receipts'])
-                part_path=self.work_dir/('逐格语义映射_'+definition_hash(packet)+'.json')
-                if part_path.is_file():result['packet_mappings'].append({'path':str(part_path),'sha256':file_hash(part_path)})
-                processed.update((sheet['name'],a) for a in candidates)
-                validate_facts(result['facts'],self.standard,result['owners'])
-                publish()
-        return publish(final=True)
+    def recognize_workbook(self, source, context=None, progress=None, previous_result=None, artifact_metadata=None, sheets=None, allowed_metrics=None, target_mapping=None, target_table=None):
+        from .A语义阅读 import recognize_a
+        return recognize_a(self, source, context or [], progress, artifact_metadata, previous_result,
+                           target_mapping=target_mapping, sheets=sheets, allowed_metrics=allowed_metrics, target_table=target_table)

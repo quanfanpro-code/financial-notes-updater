@@ -36,7 +36,7 @@ public static class LinkManager
             {
                 record.Remove("UsePhysicalRows");
                 // 仅新提取表使用新网格对应；换源继续保留标记，不改变旧连接的编号含义。
-                if(WordTableLayout.Read(info).Cells.Any(c=>c.GridBefore!=0)) record["UseGridColumns"]=true;
+                if(WordTableLayout.Read(info).HasOmittedColumns) record["UseGridColumns"]=true;
                 else record.Remove("UseGridColumns");
             }
             if((bool?)record["UsePhysicalRows"]==true && link.autoInsert!=0)

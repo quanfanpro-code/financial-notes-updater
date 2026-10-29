@@ -34,11 +34,22 @@ class 新增标准接续测试(unittest.TestCase):
             engine = UnifiedSemanticEngine({'model': '合成检查', 'base_url': 'http://unused.local'}, gold, folder / uuid.uuid4().hex)
             def reply(system, payload):
                 task = payload['task']
-                if task == 'a_semantic_read': return {'tables': tables, 'notes': '两张表分别列示，无相互包含。'}
+                if task == 'a_semantic_read':
+                    self.assertNotEqual(gold,new,'相同原件及阅读材料不能因更新标准而重新阅读并改写表号')
+                    return {'tables': tables, 'notes': '两张表分别列示，无相互包含。'}
                 if task == 'a_semantic_select':
-                    return {'tables': [{'id': t['id'], 'metric_ids': [t['subject']] if t['id']=='原值' or gold==new else [],
-                                        'missing': '' if t['id']=='原值' or gold==new else '标准缺少减值准备余额'} for t in tables]}
-                if task == 'a_semantic_review': return {'tables': [{'id': t['id'], 'corrections': {}, 'issues': []} for t in payload['reading']]}
+                    return {'tables': [{'id': t['id'], 'metric_ids': ([t['subject']]+(['固定资产减值准备'] if t['id']=='原值' and gold==new else [])) if t['id']=='原值' or gold==new else [],
+                                        'missing': '' if t['id']=='原值' or gold==new else '标准缺少减值准备余额'} for t in payload['reading']['tables']]}
+                if task == 'a_semantic_review':
+                    reviewed=[]
+                    for t in payload['reading']:
+                        corrections={}
+                        if gold==new and t['id']=='准备' and not next(r for r in payload['recognized']['tables'] if r['id']==t['id'])['metrics']:
+                            cell=t['data_ranges'][0]
+                            corrections={'metrics':[{'ranges':[cell],'id':t['subject']}],'resolved_ranges':[cell],
+                                         'patches':[{'ranges':[cell],'id':d,'value':v,'evidence':['A3','A4']} for d,v in fact()['dimensions'].items()]}
+                        reviewed.append({'id':t['id'],'corrections':corrections,'issues':[]})
+                    return {'tables':reviewed}
                 self.assertEqual(task, 'a_semantic_bind')
                 result = []
                 for t in payload['reading']:
@@ -54,7 +65,7 @@ class 新增标准接续测试(unittest.TestCase):
             return result, engine.standard
         first, _ = run(old)
         second, standard = run(new, first['mapping_path'])
-        self.assertEqual([t for g,t in calls if g==new.name], ['准备'])
+        self.assertEqual([t for g,t in calls if g==new.name], [])
         loaded = load_fact_mapping(second['mapping_path'], standard)
         self.assertEqual(len(loaded['facts']), 2)
         self.assertFalse(loaded['unresolved'])
@@ -77,10 +88,11 @@ class 新增标准接续测试(unittest.TestCase):
             self.assertEqual(matched['status'],'complete',matched)
             written=run_step('write',{**config,**matched['files']})
         self.assertEqual(written['status'],'complete',written)
-        derived=load_fact_mapping(written['files']['a_prime_mapping'],standard)
-        self.assertNotIn('a_semantic_reading',derived)
-        self.assertEqual(len(derived['facts']),2)
-        self.assertIn('derivation',derived)
+        saved=json.loads(Path(written['files']['a_prime_mapping']).read_text(encoding='utf-8-sig'))
+        self.assertNotIn('a_semantic_reading',saved)
+        self.assertNotIn('facts',saved)
+        self.assertEqual(saved['collections']['A']['mapping_path'],third['mapping_path'])
+        self.assertEqual(saved['collections']['B']['mapping_path'],second['mapping_path'])
 
 
 if __name__ == '__main__': unittest.main()

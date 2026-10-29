@@ -40,7 +40,7 @@ FILE_FIELDS = {
     "adjusted_a": ("调整行列后的附注表格（待填数）", "*.xlsx *.xlsm"),
     "adjusted_a_mapping": ("调整行列后的独立语义映射", "*.json"),
     "a_prime": ("更新后附注表格", "*.xlsx *.xlsm"),
-    "a_prime_mapping": ("更新后附注表格语义映射", "*.json"),
+    "a_prime_mapping": ("更新执行记录", "*.json"),
     "word": ("更新后附注 Word", "*.docx"),
     "word_link": ("更新后附注表格与Word位置关联", "*.json"),
     "trace": ("逐格对应与更新核对", "*.xlsx"),
@@ -49,7 +49,7 @@ FILE_FIELDS = {
 STEPS = {
     "extract_a": {
         "number": "01", "title": "提取附注表格", "short": "提取附注表格",
-        "description": "只提取“财务报表重要项目的说明”章节中的表格，并保存与 Word 的位置关联。",
+        "description": "读取 Word 原始表格并保存位置关联；下一步由模型结合正文和明确要求确定参与更新的范围。",
         "required": ("word_path",), "inputs": ("word_path",), "optional": (),
         "outputs": ("a_path", "a_link"), "button": "提取附注表格与位置关联",
         "hint": "已有附注表格时，可直接进入第 2 步；已有位置关联也可在下方选择复用。",
@@ -58,14 +58,14 @@ STEPS = {
         "number": "02", "title": "识别附注表格语义", "short": "识别附注表格语义",
         "description": "先了解文件编排、科目和子表，再逐层理解行列及适用说明，确认全部待更新格的指标与实际维度；未确认内容保留具体原因。",
         "required": ("a_path",), "inputs": ("a_path",), "optional": ("a_link",),
-        "outputs": ("a_mapping", "a_review", "a_gold_changes", "a_standard_review"), "button": "识别附注表格并保存映射",
-        "hint": "已有完整语义映射可直接用于建立对应；部分成果可选择后继续识别，已确认格会先核验再复用。",
+        "outputs": ("a_mapping",), "button": "识别附注表格并保存答复",
+        "hint": "保存模型实际答复，不另作核查或自动重答。已有成果文件保留。",
     },
     "recognize_b": {
         "number": "03", "title": "识别更新数据语义", "short": "识别更新数据语义",
-        "description": "先完整了解更新数据的全部科目及子表，再根据附注需要详看，仅确认必要候选格的完整语义。",
+        "description": "依据A需要了解B编排、缩小候选并直接识别；只阅读相关内容。",
         "required": ("b_path",), "inputs": ("b_path",), "optional": ("a_mapping",),
-        "outputs": ("b_mapping", "b_review", "b_scope", "b_gold_changes", "b_standard_review"), "button": "识别更新数据并保存映射",
+        "outputs": ("b_mapping", "a_mapping"), "button": "识别更新数据并保存答复",
         "hint": "未选择有效附注映射时只保存初识目录。附注需要变化后重新选表，已有合法更新数据身份保留并接续。",
     },
     "match": {
@@ -74,14 +74,14 @@ STEPS = {
         "required": ("a_mapping", "b_mapping"), "inputs": ("a_mapping", "b_mapping"),
         "optional": ("a_path", "b_path", "a_link"),
         "outputs": ("update_plan", "trace", "structure_review", "unused_source_review", "adjusted_a", "adjusted_a_mapping"), "button": "建立对应并保存清单",
-        "hint": "需要增减行列时，先保存调整后的表格并重新识别语义，核对原格和新增格的含义后再形成清单。此步不填写新增金额。",
+        "hint": "只读取两份合集及本次明确要求，机械形成金额、期间标签和名单的更新安排；未明确内容照实保留。",
     },
     "write": {
         "number": "05", "title": "生成更新后的附注", "short": "生成更新后的附注",
-        "description": "按清单更新“财务报表重要项目的说明”章节；其余章节保持原样，同时保存更新后附注表格和语义映射。",
+        "description": "按已保存的安排生成 Excel 和 Word 副本，记录实际搬运内容；原件与原识别结果保留。",
         "required": ("update_plan",), "inputs": ("update_plan",), "optional": ("a_link",),
         "outputs": ("a_prime", "a_prime_mapping", "word", "word_link", "trace"), "button": "生成更新后的附注",
-        "hint": "此步不重新识别语义。未提供 Word 位置关联时，可独立生成更新后附注表格。",
+        "hint": "本步不识别或裁定来源，只执行已有安排。未提供 Word 位置关联时，可独立生成更新后附注表格。",
     },
 }
 MODEL_STEPS = {"recognize_a", "recognize_b"}
@@ -118,9 +118,10 @@ def _read_record(path, schema, carrier=None):
     except (OSError, ValueError) as exc:
         raise ValueError("无法读取所选成果文件：" + str(exc)) from exc
     accepted=(schema,) if isinstance(schema,str) else schema
-    unified=isinstance(record,dict) and schema=='附注语义映射-v1' and record.get('schema_version')==2 and all(
+    unified=isinstance(record,dict) and '附注语义映射-v1' in accepted and record.get('schema_version')==2 and all(
         key in record for key in ('facts','owners','source_path','source_hash','gold_path','gold_hash'))
-    if not isinstance(record, dict) or not (record.get("schema") in accepted or unified):
+    direct = isinstance(record, dict) and '附注语义映射-v1' in accepted and record.get('recognition_method') == 'direct' and isinstance(record.get('识别答复'), str)
+    if not isinstance(record, dict) or not (record.get("schema") in accepted or unified or direct):
         raise ValueError("请选择本程序保存的相应成果文件")
     if carrier and record.get("carrier") != carrier:
         raise ValueError("选择的文件不是" + {"A": "附注表格", "B": "更新数据"}.get(carrier, "所选资料") + "的语义映射")
@@ -326,7 +327,14 @@ class Application:
             error = str(exc)
             saved = {}
         defaults = {"gold_path": DEFAULT_GOLD_PATH, "output_dir": str(PROJECT_DIR / "输出"), "timeout": DEFAULT_TIMEOUT, "thinking_mode": "default"}
-        fields = tuple(FILE_FIELDS) + ("output_dir", "base_url", "model", "api_key", "timeout", "thinking_mode", "a_context_text", "b_context_text", "report_scope")
+        fields = tuple(FILE_FIELDS) + ("output_dir", "base_url", "model", "api_key", "timeout", "thinking_mode", "model_reasoning_effort", "a_context_text", "b_context_text", "report_scope", "update_requirements")
+        self.update_purpose = saved.get('update_purpose', {})
+        saved['update_requirements'] = self.update_purpose.get('reason', '')
+        self.comparison_requirements = saved.get('comparison_requirements', [])
+        excluded = {row['维度ID'] for row in self.comparison_requirements}
+        self.comparison_choices = {key: tk.BooleanVar(value=key in excluded)
+                                   for key in ('entity', 'report_scope', 'unit_scale')}
+        defaults['model_reasoning_effort']='high'
         self.values = {key: tk.StringVar(value=saved.get(key, defaults.get(key, ""))) for key in fields}
         self.scope_prefilter = tk.BooleanVar(value=saved.get("scope_prefilter", False))
         self.current_step = saved.get("current_step", "extract_a")
@@ -505,7 +513,14 @@ class Application:
             label.configure(text="尚未选择语义映射", fg=MUTED)
             return
         try:
-            record = _read_record(path, "附注语义映射-v1", "B" if key == "b_mapping" else "A")
+            record = _read_record(path, ("附注更新执行记录-v1","附注语义映射-v1") if key=="a_prime_mapping" else "附注语义映射-v1",
+                                  None if key=="a_prime_mapping" else "B" if key=="b_mapping" else "A")
+            if record.get('schema')=='附注更新执行记录-v1':
+                label.configure(text="已保存实际搬运记录及两份原合集引用；没有生成新的语义身份。", fg=MUTED)
+                return
+            if record.get('recognition_method') == 'direct':
+                label.configure(text="已保存模型识别结果：已知内容、缺失声明和原答复一并保留，后续按已确定的关系执行。", fg=MUTED)
+                return
             business_key = 'facts' if record.get('schema_version') == 2 else 'mappings'
             if any(not isinstance(record.get(category), list) for category in (business_key, "excluded", "unresolved")):
                 raise ValueError("映射缺少有效的业务、非业务或待核实清单")
@@ -798,29 +813,16 @@ class Application:
                     unified_gold = isinstance(first, dict) and bool(first.get('record_type'))
                 except (OSError, ValueError):
                     pass
-            if step == "recognize_b" and not unified_gold:
-                prefilter = tk.Checkbutton(inputs, text="先按附注内容筛选来源（可选）", bg="white",
-                    variable=self.scope_prefilter, command=self.change_scope_prefilter)
-                prefilter.grid(row=row, column=0, columnspan=5, sticky="w", pady=(7, 0))
-                self.page_editable.append((prefilter, "normal"))
-                self.label(inputs, "未勾选时，按金标准独立识别完整更新数据；附注中已有的客户、项目和年份不是排除其他数据的白名单。勾选且有 Word 位置关联时才先筛选，不能确定的内容仍保留识别。",
-                    fg=MUTED, wraplength=760, justify="left", font=("Microsoft YaHei UI", 9)).grid(
-                    row=row+1, column=0, columnspan=5, sticky="w", pady=(2, 3))
-                scope_actions = tk.Frame(inputs, bg="white")
-                scope_actions.grid(row=row+2, column=0, columnspan=5, sticky="w", pady=(3, 3))
-                for text, action in (("导出范围复核格式", self.export_scope_review), ("导入范围复核意见", self.import_scope_review)):
-                    button = self.button(scope_actions, text, action)
-                    button.pack(side="left", padx=(0, 8));self.page_editable.append((button, "normal"))
-                row += 3
-            elif step == "recognize_b":
-                self.scope_prefilter.set(False)
-                definition = {**definition, 'outputs': tuple(key for key in definition['outputs'] if key != 'b_scope')}
-                self.label(inputs, "完整初识所有科目和子表；只详看附注需要的内容，选中子表也不必逐格识别全部指标。没有有效附注映射时只保存初识。",
-                    fg=MUTED, wraplength=760, justify="left", font=("Microsoft YaHei UI", 9)).grid(
-                    row=row, column=0, columnspan=5, sticky="w", pady=(7, 3))
-                row += 1
             if step in MODEL_STEPS:
                 self.context_field(inputs, row + 1, "a_context_text" if step == "recognize_a" else "b_context_text")
+            if step in ('extract_a', 'recognize_a', 'recognize_b', 'match'):
+                self.context_field(inputs, row + 2, 'update_requirements')
+                choices = tk.Frame(inputs, bg='white')
+                choices.grid(row=row + 3, column=0, columnspan=5, sticky='w')
+                self.label(choices, '本次不比较（原身份照实保留）：').pack(side='left')
+                for key, label in [('entity', '主体'), ('report_scope', '单体或合并口径'), ('unit_scale', '金额倍率')]:
+                    button = ttk.Checkbutton(choices, text=label, variable=self.comparison_choices[key])
+                    button.pack(side='left'); self.page_editable.append((button, 'normal'))
             outputs = self.card(self.page)
             self.outputs_card = outputs
             outputs.grid(row=1, column=0, sticky="ew")
@@ -830,22 +832,6 @@ class Application:
                 self.file_row(outputs, row, key, reusable=True, output=True)
             self.label(outputs, definition["hint"], fg=MUTED, wraplength=760, justify="left",
                        font=("Microsoft YaHei UI", 9)).grid(row=len(definition["outputs"])+1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
-            if step in MODEL_STEPS:
-                self.label(outputs, "指标槽位说明“是什么指标”，实际维度说明“哪个客户、哪个日期等”。新维度取值沿用适用的原槽位；真正缺少的指标才补入金标准，仍有分歧的内容保留待核实。",
-                           fg=MUTED, wraplength=700, justify="left", font=("Microsoft YaHei UI", 9)).grid(
-                           row=len(definition["outputs"])+2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
-                actions = tk.Frame(outputs, bg="white")
-                actions.grid(row=len(definition["outputs"])+3, column=0, columnspan=5, sticky="w", pady=(8, 0))
-                manage = self.button(actions, "管理金标准", lambda: self.show_step("settings"))
-                manage.pack(side="left")
-                self.button(actions, "打开待处理说明", lambda: self.open_pending_instructions("A" if step == "recognize_a" else "B")).pack(side="left", padx=(8, 0))
-                self.page_editable.append((manage, "normal"))
-                review_actions = tk.Frame(outputs, bg="white")
-                review_actions.grid(row=len(definition["outputs"])+4, column=0, columnspan=5, sticky="w", pady=(8, 0))
-                carrier = "A" if step == "recognize_a" else "B"
-                for text, action in (("导出复核意见格式", self.export_external_review), ("导入复核意见", self.import_external_review)):
-                    button = self.button(review_actions, text, lambda action=action, carrier=carrier: action(carrier))
-                    button.pack(side="left", padx=(0, 8));self.page_editable.append((button, "normal"))
             if step == "write":
                 sources = self.card(self.page)
                 sources.grid(row=2, column=0, sticky="ew", pady=(8, 0))
@@ -862,7 +848,7 @@ class Application:
 
     def build_settings_page(self):
         self.page_title.configure(text="模型与项目设置")
-        self.page_description.configure(text="语义识别在第 2、3 步调用模型。提取和最终写入可独立执行。")
+        self.page_description.configure(text="模型只在第2、3步识别语义并确定来源和名单关系；后续机械执行已有结果。")
         model = self.card(self.page)
         model.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         model.columnconfigure(1, weight=1)
@@ -880,12 +866,15 @@ class Application:
         thinking.grid(row=4, column=1, sticky="ew", pady=5)
         thinking.bind("<<ComboboxSelected>>", lambda _: self.values["thinking_mode"].set(thinking_options[self.thinking_choice.get()]))
         self.page_editable.append((thinking, "readonly"))
+        self.label(model,'Codex推理强度').grid(row=4,column=2,padx=(12,8),sticky='w')
+        effort=ttk.Combobox(model,textvariable=self.values['model_reasoning_effort'],values=('low','medium','high','xhigh','max','ultra'),state='readonly',width=9)
+        effort.grid(row=4,column=3,sticky='w');self.page_editable.append((effort,'readonly'))
         show = tk.Checkbutton(model, text="显示密钥", bg="white", variable=self.show_key,
                               command=lambda: self.key_entry.configure(show="" if self.show_key.get() else "●"))
         show.grid(row=5, column=1, sticky="w")
         self.page_editable.append((show, "normal"))
         self.label(model, "密钥只由当前 Windows 用户加密保存。", fg=MUTED, font=("Microsoft YaHei UI", 9)).grid(row=6, column=0, columnspan=2, sticky="w", pady=(5, 0))
-        self.label(model, "API Key 按服务要求填写；无需认证的服务可以留空。", fg=MUTED,
+        self.label(model, "本机Codex：服务地址填codex://local，使用本机登录，无需API Key；其他服务按原地址填写。", fg=MUTED,
                    font=("Microsoft YaHei UI", 9)).grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.label(model, "报告口径（可指定）").grid(row=8, column=0, sticky="w", padx=(0, 12), pady=5)
         options={"按文件识别":"","单户":"standalone","合并":"consolidated","母公司":"parent"}
@@ -907,11 +896,13 @@ class Application:
         box.grid(row=row, column=0, columnspan=5, sticky="ew", pady=(6, 0))
         box.columnconfigure(0, weight=1)
         expanded = bool(self.values[key].get().strip())
-        toggle = self.button(box, ("收起" if expanded else "展开") + "：文件未注明的信息（可选）", lambda: self.toggle_context(key))
+        title = '本次更新要求' if key == 'update_requirements' else '文件未注明的信息（可选）'
+        toggle = self.button(box, ("收起" if expanded else "展开") + '：' + title, lambda: self.toggle_context(key))
         toggle.grid(row=0, column=0, sticky="w")
         details = tk.Frame(box, bg="white")
         details.grid(row=1, column=0, sticky="ew", pady=(5, 0));details.columnconfigure(0, weight=1)
-        self.label(details, "只补充主体、实际日期、币种、单位及单户/合并/母公司口径；文件已写明时留空。",
+        self.label(details, ('说明日期如何更新、哪些名单随来源变化、哪些原值保留；识别和搬运使用同一份要求。'
+                           if key == 'update_requirements' else "只补充主体、实际日期、币种、单位及单户/合并/母公司口径；文件已写明时留空。"),
                    fg=MUTED, wraplength=700, justify="left", font=("Microsoft YaHei UI", 9)).grid(row=0, column=0, sticky="w", pady=(0, 4))
         context = tk.Text(details, height=3, wrap="word", relief="solid", borderwidth=1, bg="white", fg=TEXT)
         context.grid(row=1, column=0, sticky="ew")
@@ -931,17 +922,18 @@ class Application:
 
     def toggle_context(self, key):
         details = self.context_panels[key]
+        title = '本次更新要求' if key == 'update_requirements' else '文件未注明的信息（可选）'
         if details.winfo_manager():
             details.grid_remove()
-            self.context_toggles[key].configure(text="展开：文件未注明的信息（可选）")
+            self.context_toggles[key].configure(text='展开：' + title)
         else:
             details.grid()
-            self.context_toggles[key].configure(text="收起：文件未注明的信息（可选）")
+            self.context_toggles[key].configure(text='收起：' + title)
 
     def set_context(self, key, value):
-        if key not in {"a_context_text", "b_context_text"} or value == self.values[key].get():
+        if key not in {"a_context_text", "b_context_text", "update_requirements"} or value == self.values[key].get():
             return
-        step = "recognize_a" if key == "a_context_text" else "recognize_b"
+        step = "recognize_b" if key == "b_context_text" else "recognize_a"
         self.apply_values({**{field: "" for field in STEP_INVALIDATED[step]}, key: value})
 
     def build_standard_settings(self):
@@ -1039,8 +1031,15 @@ class Application:
         self.append_log("来源筛选方式已改变，已清空更新数据及后续成果的选择；原成果文件仍保留，请重新识别更新数据。")
 
     def config(self):
-        return {**{key: value.get().strip() for key, value in self.values.items()},
-                "scope_prefilter": self.scope_prefilter.get(), "review": True, "current_step": self.current_step if self.current_step in STEPS else "extract_a"}
+        requirements = [row for row in self.comparison_requirements if row['维度ID'] not in self.comparison_choices
+                        or self.comparison_choices[row['维度ID']].get()]
+        recorded = {row['维度ID'] for row in requirements}
+        requirements += [{'维度ID': key, '要求含义': '本次不参与比较，实际身份保留', '出处': '用户在本次更新要求中选择'}
+                         for key, value in self.comparison_choices.items() if value.get() and key not in recorded]
+        return {**{key: value.get().strip() for key, value in self.values.items() if key != 'update_requirements'},
+                'update_purpose': {**self.update_purpose, 'reason': self.values['update_requirements'].get().strip()},
+                'comparison_requirements': requirements,
+                "scope_prefilter": self.scope_prefilter.get(), "current_step": self.current_step if self.current_step in STEPS else "extract_a"}
 
     def refresh_ready(self):
         if not hasattr(self, "status"):
@@ -1105,14 +1104,16 @@ class Application:
         mapping = self.values["a_prime_mapping"].get()
         try:
             if not prime or not Path(prime).is_file() or not mapping or not Path(mapping).is_file():
-                raise ValueError("请先生成或选齐更新后附注表格及其语义映射")
-            record = _read_record(mapping, "附注语义映射-v1", "A")
-            bound = record.get("original_path") or record.get("source_path") or ""
+                raise ValueError("请先生成或选齐更新后附注表格及其执行记录")
+            record = _read_record(mapping, ("附注更新执行记录-v1","附注语义映射-v1"))
+            execution = record.get('schema')=='附注更新执行记录-v1'
+            if not execution and record.get('carrier')!='A':raise ValueError("所选成果不是附注表格的识别结果")
+            bound = record.get("output_path") or record.get("original_path") or record.get("source_path") or ""
             if Path(bound).resolve() != Path(prime).resolve():
-                raise ValueError("当前更新后附注表格与所选语义映射的来源不一致")
+                raise ValueError("当前更新后附注表格与所选记录的来源不一致")
             link = record.get("a_link") or ""
             if link and not Path(link).is_file():
-                raise ValueError("更新后附注表格语义映射中的 Word 位置关联不存在")
+                raise ValueError("更新记录中的 Word 位置关联不存在")
             linked_word = ""
             if link:
                 association = _read_record(link, "附注Word关联-v1")
@@ -1122,14 +1123,15 @@ class Application:
         except (ValueError, OSError) as exc:
             messagebox.showinfo("尚不能开始下一轮", str(exc), parent=self.root)
             return
-        self.apply_values({"a_path": prime, "a_mapping": mapping, "a_link": link,
+        self.apply_values({"a_path": prime, "a_mapping": "" if execution else mapping, "a_link": link,
                            "word_path": linked_word,
                            "a_review": "", "a_gold_changes": "", "a_standard_review": "", "b_path": "", "b_mapping": "", "b_review": "",
                            "b_scope": "", "b_gold_changes": "", "b_standard_review": "",
                            "a_context_text": record.get("additional_context") or "", "b_context_text": "", "update_plan": "", "trace": "",
                            **{key:'' for key in STRUCTURE_FIELDS}})
-        self.append_log("已将更新后附注表格及其语义映射用于下一轮；请选择新的更新数据表。没有自动运行任何步骤。")
-        self.show_step("recognize_b")
+        self.append_log("已选更新后附注表格。下一次A识别会带入两边原判断和搬运记录，复用仍适用的认识；没有自动运行。" if execution else
+                        "已选择附注表格及其识别结果；请选择新的更新数据表。没有自动运行。")
+        self.show_step("recognize_a" if execution else "recognize_b")
 
     def choose_output(self):
         path = filedialog.askdirectory(parent=self.root, title="选择成果保存文件夹", mustexist=True)

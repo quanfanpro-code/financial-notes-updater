@@ -348,6 +348,10 @@ def append_identity_search(scope, prior, search):
 
 
 def search_after_binding(engine, snapshot, outline, context, mapping):
+    if mapping.get('semantic_reading'):
+        from .A语义阅读 import checked_reading
+        # 尚未核查不是身份不同；先保留当前进度，不能据此扩成全体A补查。
+        if checked_reading(mapping) is None:return None
     scope=deepcopy(mapping['recognition_scope'])
     if not any(not r.get('standard_sources',r['exact_sources']) and (r['candidates'] or scope.get('identity_search_version') == 2)
                for r in scope['coverage']['targets']):return None
@@ -516,7 +520,18 @@ def _stage_receipt(item, mapping, task_name):
     task = json.loads((path.parent / '任务.json').read_text(encoding='utf-8-sig'))
     identity = {k: v for k, v in task.items() if k != 'task_id'}
     _require(task['task_id'] == _hash(identity) == receipt['task_id'] and receipt['result_hash'] == _hash(receipt['result']), '分层识别请求或结果校验失败')
-    _require(task['source'] == mapping['source_hash'] and task['gold'] == mapping['gold_hash'] and task['payload']['task'] == task_name, '分层识别依据与原件、标准或任务不符')
+    # 独立原文阅读不发送标准；调用方仍须按当前原件重建并核对完整请求。
+    source_only=task_name in {'a_semantic_read','a_semantic_read_check'}
+    compatible=False
+    if task['gold']!=mapping['gold_hash'] and task_name in {'a_semantic_bind','a_semantic_review'} and mapping.get('gold_path'):
+        from .统一语义 import read_standard_v2
+        from .A语义阅读 import standard_material
+        current=read_standard_v2(mapping['gold_path']);supplied=task['payload']['standards']
+        ids=[m['id'] for m in supplied['metrics']]
+        compatible=(current['sha256']==mapping['gold_hash'] and all(m in current['metric'] and current['metric'][m]['status']=='active' for m in ids)
+                    and supplied==standard_material(ids,current))
+    _require(task['source'] == mapping['source_hash'] and (source_only or compatible or task['gold'] == mapping['gold_hash'])
+             and task['payload']['task'] == task_name, '分层识别依据与原件、标准或任务不符')
     return task, receipt['result']
 
 

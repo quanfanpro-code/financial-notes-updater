@@ -214,7 +214,7 @@ public static class TableSynchronizer
         if (paragraphs.Length == 1 && !value.Contains('\n'))
         {
             // 保留每个原文字片段的格式，将多出的字符交给最后有效片段；旧值的分隔不应残留。
-            foreach (var separator in cell.Descendants().Where(e => e.Name == w + "br" || e.Name == w + "cr" || e.Name == w + "tab").ToArray()) separator.Remove();
+            foreach (var separator in cell.Descendants().Where(e => e.Parent?.Name == w + "r" && (e.Name == w + "br" || e.Name == w + "cr" || e.Name == w + "tab")).ToArray()) separator.Remove();
             foreach (var fragment in fragments) fragment.Node.ReplaceWith(TextNodes(fragment.Text, w, fragment.Node));
             return;
         }

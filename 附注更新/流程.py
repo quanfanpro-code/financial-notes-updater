@@ -187,35 +187,16 @@ def run_job(config,log=None,cancel=None):
             return finish("complete" if br.get("complete") else "partial",
                 f"更新数据表已确认{len(br['mappings'])}个业务格；待核实{len(br.get('unresolved',[]))}项",
                 prediction=str(run_dir/"更新数据语义识别.json"))
-        # 完整性必须在最终写入前成立，识别疑点不会被旧数或空值掩盖。
-        if not ar.get("complete") or not br.get("complete"):
-            save_json(run_dir/"待核实事项.json",{"A":ar.get("unresolved",[]),"B":br.get("unresolved",[])})
-            return finish("partial","识别结果已保存；存在待核实语义，尚未发布更新后的附注")
         for path,digest in original_inputs.items():
             if file_hash(path)!=digest:raise ValueError("识别期间原始资料发生变化，本次写入停止")
         check_cancel(cancel);log("按共同金标准语义勾稽附注表格与更新数据表")
         plan=build_update_plan(a,b,ar["mappings"],br["mappings"])
         operations=[];working_a=a
-        structure_needed=bool(plan.get("unplaced_sources") or any(i.get("kind")=="missing_source" for i in plan.get("issues",[])))
-        if structure_needed and a.get("names"):
-            from .结构 import resolve_structure
-            log("根据语义差异核验是否需要增减目标表行列")
-            structure=resolve_structure(engine,a,b,ar,br,plan,str(run_dir))
-            operations=structure.get("operations",[])
-            if structure.get("issues"):
-                plan["issues"].extend(structure["issues"])
-            else:
-                working_a=structure["a_snapshot"]
-                plan=build_update_plan(working_a,b,structure["a_mappings"],br["mappings"])
-        if plan.get("unplaced_sources"):
-            plan["issues"].extend({"kind":"unplaced_source","sheet":m["sheet"],"cell":m["cell"],
-                "reason":"更新数据表存在已识别业务数据，但附注表格中没有已确认接收位置","slot_id":m["slot_id"]} for m in plan["unplaced_sources"])
         plan["word_operations"]=operations
         save_json(run_dir/"更新清单.json",plan)
         trace_workbook(run_dir/"更新核对表.xlsx",plan)
         if plan.get("issues"):
             save_json(run_dir/"待核实事项.json",plan["issues"])
-            return finish("partial",f"已生成核对表；{len(plan['issues'])}项对应关系待核实，尚未发布最终文件")
         if not plan["updates"]:
             return finish("partial","未识别出可更新的财务数据单元格，尚未发布最终文件")
         check_cancel(cancel);log("将更新数据表原始单元格数据写入附注表格的对应语义位置")
@@ -231,7 +212,8 @@ def run_job(config,log=None,cancel=None):
                 "output":str(final_word),"operations":operations},run_dir,cancel)
             if not written.get("output_verified"):raise ValueError("Word回写尚未通过重新读取验证")
             result_files["word"]=str(final_word)
-        return finish("complete",f"完成{len(plan['updates'])}个业务数据格更新；原始文件保持不变",**result_files)
+        return finish("partial" if plan['issues'] or ar.get('unresolved') or br.get('unresolved') else "complete",
+                      f"完成{len(plan['updates'])}个业务数据格更新；原始文件及未决内容保持",**result_files)
     except SemanticCancelled as e:
         result={"status":"cancelled","message":str(e),"output_dir":str(run_dir or config.get("output_dir") or ROOT/"输出")}
         if run_dir:save_json(run_dir/("取消记录_"+uuid.uuid4().hex[:6]+".json"),result)

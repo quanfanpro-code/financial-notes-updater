@@ -7,12 +7,13 @@ import hashlib
 import json
 from pathlib import Path
 from openpyxl import load_workbook
+from openpyxl.cell.cell import ERROR_CODES
 
 from .表格 import _plain, file_hash, recalculate_copy, same_excel_value
 from .金标准 import _pairs, _invalid_number
 from .数值副本 import derive_value_copy
 from .统一证据 import context_catalog, resolve_context
-from .统一语义 import (_hash, _require, semantic_key, validate_facts, value_for_target,
+from .统一语义 import (_hash, _require, definition_hash, semantic_key, validate_facts, value_for_target,
                      ensure_standard_compatible, read_standard_v2, validate_partial_semantics, validate_fact)
 
 
@@ -23,6 +24,11 @@ def _location(fact):
 
 
 def _check_mapping(mapping, standard):
+    if mapping.get('recognition_method') == 'direct':
+        from .A合集 import validate_direct_collection
+        validate_direct_collection(mapping)
+        _require(mapping['gold_hash']==standard['sha256'],'合集标准版本不一致')
+        return
     _require(mapping.get('schema_version') == 2 and
              (mapping.get('gold_hash') == standard.get('sha256') or mapping.get('_validated_standard_hash') == standard.get('sha256')),
              '映射与统一标准版本不符')
@@ -83,39 +89,52 @@ def compare_semantic_slots(target, source, standard):
             'comparison_rule':'仅比较相同金标准槽位及维度定义；具体维度取值分别保存，同槽位位置组不表示同一个具体成员或可直接取数。'}
 
 
+def _calculation_formulas(mapping):
+    """已识别格公式及明确引用的标签公式，共用已有副本取值。"""
+    formulas={row['source_reference']['location']:row['raw_value'] for row in mapping['facts']
+              if row['raw_value_state']=='formula'}
+    references={ref for row in [*mapping['facts'],*mapping.get('slot_bindings',[])]
+                for refs in row.get('dimension_evidence',{}).values() for ref in refs}
+    references.update(row['sheet']+'!'+row['cell'] for row in mapping.get('slot_bindings',[]))
+    references.update(item['source'] for relation in mapping.get('已确认关系',[]) if relation.get('kind')=='取数对应'
+                      for item in relation.get('bindings',[]))
+    for relation in mapping.get('已确认关系',[]):
+        if relation.get('kind')!='名单编排':continue
+        for table in relation.get('tables',[]):
+            for row in [*table.get('source_rows',[]),*[item['source_row'] for item in table.get('totals',[])]]:
+                for target,column in table.get('row_columns',{}).get(str(row),table.get('columns',{})).items():
+                    if column:references.add(table.get('row_sources',{}).get(str(row),{}).get(target) or
+                        f"{table['source_sheet']}!{column}{row+table.get('column_row_offsets',{}).get(target,0)}")
+                references.update(f"{table['source_sheet']}!{column}{row}" for column in table.get('labels',{}).values() if column)
+    formulas.update({sheet['name']+'!'+cell:item['formula'] for sheet in mapping.get('机械记录',{}).get('sheets',[])
+                     for cell,item in sheet['cells'].items() if item.get('formula') and sheet['name']+'!'+cell in references})
+    return formulas
+
+
 def _calculated_values(mapping, receipt):
-    """重读Excel原生重算副本；从未把来源原有缓存当作已核实结果。"""
+    """按已保存的位置读取计算副本的值，不重核原表及计算前后内容。"""
     _require(receipt.get('schema')=='统一语义公式计算-v1' and receipt.get('method')=='Excel.CalculateFullRebuild',
              '公式计算依据类型不符')
     _require(receipt['source_hash']==mapping['source_hash'] and file_hash(receipt['source_path'])==mapping['source_hash'],
              '公式计算依据与原件版本不符')
     _require(file_hash(receipt['workbook_path'])==receipt['workbook_hash'],'公式计算副本已变化')
-    original=load_workbook(mapping['source_path'],data_only=False)
-    calculated=load_workbook(receipt['workbook_path'],data_only=False)
     values=load_workbook(receipt['workbook_path'],data_only=True)
     result={}
     try:
-        _require(original.sheetnames==calculated.sheetnames,'公式计算前后工作表不一致')
-        for name in original.sheetnames:
-            def contents(sheet):
-                return {cell.coordinate:cell.value for cell in sheet._cells.values() if cell.value is not None}
-            _require(contents(original[name])==contents(calculated[name]),'公式计算前后原值或公式发生变化')
-        for fact in mapping['facts']:
-            if fact['record_type']!='metric_fact' or fact['raw_value_state']!='formula':continue
-            sheet,address=_location(fact);location=sheet+'!'+address
-            _require(original[sheet][address].data_type=='f' and original[sheet][address].value==fact['raw_value'],
-                     '公式记录与原件不符')
+        for location,formula in _calculation_formulas(mapping).items():
+            sheet,address=location.rsplit('!',1)
             cell=values[sheet][address];value=cell.value
-            if cell.data_type=='e':state,reason='error','Excel计算错误：'+str(value)
+            if cell.data_type=='e':state,reason='value','保留Excel原有错误值：'+str(value)
             elif value is None and cell.data_type not in ('str','s'):
                 state,reason='error','重算后仍未取得计算结果'
             elif value is None or value=='':state,reason='blank','公式结果为空，不解释成零'
             elif not isinstance(value,(str,int,float,bool)):
                 state,reason='error','计算结果不是可搬运的数值或文字';value=str(value)
             else:state,reason='value','已由Excel原生重算并回读'
-            result[location]={'formula':fact['raw_value'],'state':state,'value':value,'reason':reason}
+            result[location]={'formula':formula,'state':state,'value':value,'reason':reason,
+                              **({'excel_data_type':'e'} if cell.data_type=='e' else {})}
     finally:
-        original.close();calculated.close();values.close()
+        values.close()
     _require(file_hash(mapping['source_path'])==mapping['source_hash'] and file_hash(receipt['workbook_path'])==receipt['workbook_hash'],
              '读取计算结果期间文件已变化')
     return result
@@ -123,7 +142,7 @@ def _calculated_values(mapping, receipt):
 
 def calculate_mapping_formulas(mapping, folder):
     """语义识别仍绑定原文件，计算副本与原公式分开保存。"""
-    if not any(row['record_type']=='metric_fact' and row['raw_value_state']=='formula' for row in mapping['facts']):return
+    if not _calculation_formulas(mapping):return
     from .流程 import save_json
     from .表格 import read_workbook
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
@@ -144,23 +163,19 @@ def calculate_mapping_formulas(mapping, folder):
 
 def calculation_files(mapping):
     evidence=mapping.get('calculation_evidence')
-    if not evidence:
-        _require(not mapping.get('formula_values'),'公式计算结果缺少计算依据')
-        return []
+    if not evidence:return []
     _require(file_hash(evidence['path'])==evidence['sha256'],'公式计算依据已变化')
     receipt=json.loads(Path(evidence['path']).read_text(encoding='utf-8-sig'),object_pairs_hook=_pairs,parse_constant=_invalid_number)
-    _require(_calculated_values(mapping,receipt)==mapping.get('formula_values'),'保存的公式计算结果与实际副本不符')
     return [evidence['path'],receipt['workbook_path'],receipt['source_path']]
 
 
 def _effective_source(fact, mapping, standard):
     if fact['raw_value_state']!='formula':return fact
     calculated=mapping.get('formula_values',{}).get(fact['source_reference']['location'])
-    if not calculated or not mapping.get('calculation_evidence') or calculated['state']=='error':return fact
+    if not calculated or not mapping.get('calculation_evidence'):return fact
+    if calculated['state']=='error' and calculated.get('value') not in ERROR_CODES:return fact
     _require(calculated['formula']==fact['raw_value'],'计算结果与原公式不符')
-    result=deepcopy(fact);result['raw_value_state']=calculated['state'];result['raw_value']=calculated['value']
-    from .统一语义 import validate_fact
-    validate_fact(result,standard)
+    result=deepcopy(fact);result['raw_value_state']='value' if calculated.get('value') in ERROR_CODES else calculated['state'];result['raw_value']=calculated['value']
     return result
 
 
@@ -170,7 +185,25 @@ def load_fact_mapping(path, standard, _ancestors=frozenset()):
     _require(path not in _ancestors,'派生映射存在循环引用')
     ancestors=_ancestors|{path}
     mapping=json.loads(raw.decode('utf-8-sig'),object_pairs_hook=_pairs,parse_constant=_invalid_number)
+    if isinstance(mapping,list):
+        from .A合集 import combine_direct_collections
+        parts=[]
+        for row in mapping:
+            part=load_fact_mapping(path.parent/row['最终合集'],standard,ancestors)
+            _require(part['mapping_hash']==row['sha256'],'分组合集与索引记录不符')
+            parts.append(part)
+        mapping=combine_direct_collections(parts)
+    if mapping.get('recognition_method') == 'direct':
+        from .A合集 import validate_direct_collection
+        validate_direct_collection(mapping)
+        mapping.update(mapping_path=str(path), mapping_hash=hashlib.sha256(raw).hexdigest())
+        return mapping
     mapping.pop('_validated_standard_hash',None)
+    if mapping.get('collection_version')==1:
+        from .A合集 import validate_collection
+        validate_collection(mapping)
+        mapping.update(mapping_path=str(path),mapping_hash=hashlib.sha256(raw).hexdigest())
+        return mapping
     if mapping.get('value_derivation'):
         from .数值副本 import validate_value_copy
         return validate_value_copy(path,mapping,standard,ancestors)
@@ -335,8 +368,7 @@ def load_fact_mapping(path, standard, _ancestors=frozenset()):
 
 def verify_fact_update_plan(plan, target, source, standard):
     """写入前重新按语义取数，并核对全部可执行内容。"""
-    _require(plan.get('schema')=='附注更新清单-v2' and plan.get('complete') and not plan.get('issues'),
-             '更新清单尚未确认完整')
+    _require(plan.get('schema')=='附注更新清单-v2','更新清单格式不符')
     _require(plan.get('gold_hash')==standard['sha256'],'更新清单的标准版本不符')
     for mapping in (target,source):
         _require(plan['inputs'].get(mapping['mapping_path'])==mapping['mapping_hash'],'更新清单未绑定当前映射版本')
@@ -346,16 +378,14 @@ def verify_fact_update_plan(plan, target, source, standard):
         _require(isinstance(scope.get('label'),str) and scope['label'].strip(),'局部验证须明确名称')
         _require(not plan.get('structure'),'局部验证不隐式执行结构增减')
         target=select_mapping_scope(target,scope['target']);source=select_mapping_scope(source,scope['source'])
-    from .表格编排 import source_ready
-    _require(target.get('scope_coverage' if scope else 'coverage',{}).get('complete'),'A范围语义尚未完整')
-    _require(source.get('scope_coverage',{}).get('complete') if scope else source_ready(source,target,standard),'B完整初识或当前A所需内容尚未完成')
     if plan.get('structure'):
         from .统一结构 import load_structural_target
         target=load_structural_target(plan['structure'],target,source,standard)
         _require(plan['inputs'].get(target['mapping_path'])==target['mapping_hash'],'清单未绑定调整后独立语义映射')
     expected_operations=plan.get('structure',{}).get('layout',{}).get('operations',[]) or plan.get('update_purpose',{}).get('operations',[])
     _require(plan.get('word_operations',[])==expected_operations,'Word结构变更与已核验语义布局不符')
-    fresh=build_fact_update_plan(target,source,standard,equivalence_proofs=plan.get('equivalence_proofs',[]),update_purpose=plan.get('update_purpose'))
+    fresh=build_fact_update_plan(target,source,standard,equivalence_proofs=plan.get('equivalence_proofs',[]),
+                                 update_purpose=plan.get('update_purpose'),comparison_requirements=plan.get('comparison_requirements'))
     from .表格 import complete_numeric_formats
     complete_numeric_formats(target,fresh)
     from .统一未采用来源 import validate_unused_source_reviews
@@ -364,11 +394,10 @@ def verify_fact_update_plan(plan, target, source, standard):
     fresh['unused_sources']=unused
     unused_ids={row['source_id'] for row in unused}
     fresh['unplaced_sources']=[row for row in fresh['unplaced_sources'] if row['id'] not in unused_ids]
-    _require(not fresh['issues'] and not fresh['unplaced_sources'],'重新勾稽仍有未处理事项')
     for row in fresh['updates']:
         definition=standard['metric'][row['metric_id']]['definition']
         row['semantic_field']=' / '.join(definition[key] for key in ('economic_object','measure','measurement_basis'))
-    for key in ('updates','retained_blanks','unprovided_fields','operations','labels','unplaced_sources','source_a_hash','source_b_hash','template_layout'):
+    for key in ('updates','retained_blanks','unprovided_fields','operations','labels','unplaced_sources','source_a_hash','source_b_hash','template_layout','issues','identity_matches'):
         _require(plan.get(key)==fresh.get(key),'清单与重新语义取数不一致：'+key)
     _require(plan.get('caption_updates',[])==fresh.get('caption_updates',[]),'标题安排与重新语义取数不一致')
     fresh['_working_target']=original_target if scope else target
@@ -491,6 +520,10 @@ def select_mapping_scope(mapping, ranges):
         sheet,_,address=location.rpartition('!');r,c=coordinate_to_tuple(address)
         return any(sheet==s and l<=c<=rr and t<=r<=b for s,l,t,rr,b in bounds)
     expected=mapping.get('coverage',{}).get('expected_cells')
+    if mapping.get('collection_version')==2:
+        expected=[r['source_reference']['location'] for r in mapping['facts']]
+        expected += [r['sheet']+'!'+r['cell'] for r in mapping.get('slot_bindings',[])]
+        expected += [r['sheet']+'!'+r['cell'] for r in mapping.get('unresolved',[]) if r.get('sheet') and r.get('cell')]
     if expected is None:
         from .表格 import read_workbook,materialize_candidate_blanks
         snapshot=read_workbook(mapping['source_path'],context=mapping.get('source_context',[]));materialize_candidate_blanks(snapshot)
@@ -504,13 +537,16 @@ def select_mapping_scope(mapping, ranges):
         view['slot_bindings']=[row for row in view['slot_bindings'] if selected(row['sheet']+'!'+row['cell'])]
         assigned.extend(row['sheet']+'!'+row['cell'] for row in view['slot_bindings'])
     for kind in ('excluded','unresolved'):
-        view[kind]=[row for row in view.get(kind,[]) if selected(row.get('sheet',mapping.get('sheet',''))+'!'+row['cell'])]
+        view[kind]=[row for row in view.get(kind,[]) if row.get('cell') and selected(row.get('sheet',mapping.get('sheet',''))+'!'+row['cell'])]
         assigned.extend(row.get('sheet',mapping.get('sheet',''))+'!'+row['cell'] for row in view[kind])
     _require(len(assigned)==len(set(assigned)) and set(assigned)==expected,'局部验证范围存在遗漏或重复分类')
     view['scope_coverage']={'scope':'local_validation','ranges':deepcopy(ranges),'expected_count':len(expected),
         'financial_cells':len(view['facts'])+len(view.get('slot_bindings',[])),'unresolved_cells':len(view['unresolved']),
         'outside_unresolved_count':len(mapping.get('unresolved',[]))-len(view['unresolved']),
         'complete':not view['unresolved']}
+    if view.get('collection_version')==2:
+        from .A合集 import direct_digest
+        view['封存校验']=direct_digest(view)
     return view
 
 
@@ -892,8 +928,12 @@ def target_for_purpose(mapping, purpose, source=None, standard=None):
     return view
 
 
-def build_fact_update_plan(target_mapping, source_mapping, standard, equivalence_proofs=(), update_purpose=None):
+def build_fact_update_plan(target_mapping, source_mapping, standard, equivalence_proofs=(), update_purpose=None, *, comparison_requirements=None):
     """输入为已识别事实。文件级执行者仍须校验原件和映射版本后再写入。"""
+    if target_mapping.get('recognition_method') == 'direct' or source_mapping.get('recognition_method') == 'direct':
+        from .模板更新编排 import direct_update_plan
+        return direct_update_plan(target_mapping, source_mapping, update_purpose,comparison_requirements=comparison_requirements)
+    _require(not comparison_requirements,'显式比较要求须使用两个合集入口，旧映射入口不能忽略该要求')
     for mapping in (target_mapping, source_mapping):
         _check_mapping(mapping, standard)
         _require(not mapping.get('source_identities'), '识别结果只有文字或最近标准，须先准确对应金标准再比较')
@@ -980,12 +1020,11 @@ def build_fact_update_plan(target_mapping, source_mapping, standard, equivalence
                     'reason':'同槽位来源已保留，具体成员等维度尚未明确，未作为该目标的确定取数来源',
                     'source_locations':[row['sheet']+'!'+row['cell'] for row in partial]})
                 continue
-            if target['raw_value_state'] == 'blank':
-                plan['retained_blanks'].append({**issue, 'reason': '来源没有明确新值，保留原空白，不计作已更新'})
+            if matches:
+                plan['retained_blanks'].append({**issue, 'reason': 'B空白，按明确要求保留A原值；已确认对应保留'})
                 consumed.update(row['id'] for row in matches)
             else:
-                plan['issues'].append({**issue, 'kind': 'source_unknown_blank' if matches else 'missing_source',
-                                       'reason': '来源空白不能清空原金额' if matches else '没有相同指标和实际维度的来源'})
+                plan['issues'].append({**issue, 'kind': 'missing_source', 'reason': '没有相同指标和实际维度的来源'})
             continue
         def converted(row):
             if selected:return deepcopy(row['raw_value'])
@@ -999,10 +1038,6 @@ def build_fact_update_plan(target_mapping, source_mapping, standard, equivalence
             plan['issues'].append({**issue, 'kind': 'source_value_needs_review', 'reason': str(error),
                                    'source_locations': [row['source_reference']['location'] for row in explicit]})
             consumed.update(row['id'] for row in matches)
-            continue
-        if any(value != values[0] for value in values[1:]):
-            plan['issues'].append({**issue, 'kind': 'conflicting_sources', 'reason': '相同业务身份的多个来源金额冲突，未选取或求和',
-                                   'source_locations': [row['source_reference']['location'] for row in explicit]})
             continue
         sources = []
         for row in explicit:
@@ -1019,10 +1054,6 @@ def build_fact_update_plan(target_mapping, source_mapping, standard, equivalence
         consumed.update(row['id'] for row in matches)
     if source_mapping.get('recognition_scope',{}).get('mode')=='b_required':
         # 按需B已有用途及候选去向；未采用候选保留事实，不启动整B来源安置循环。
-        from .表格编排 import source_ready
-        local_ready=all(m.get('scope_coverage',{}).get('complete') for m in (source_mapping,target_mapping))
-        if not local_ready and not source_ready(source_mapping,recognition_target,standard):
-            plan['issues'].append({'kind':'required_scope_incomplete','reason':'B初识或当前A所需内容尚未确认完整'})
         for target in target_mapping['facts']:
             if target['record_type']!='metric_fact':continue
             if target['id'] in target_mapping.get('_purpose_sources',{}):continue

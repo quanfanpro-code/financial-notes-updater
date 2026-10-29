@@ -1,5 +1,5 @@
 ﻿# coding: utf-8
-"""A先读原文语义，再找标准；共同含义按模型声明的范围展开。"""
+"""模型按完整原文逐格识别金标准身份，程序保存各格结果。"""
 from copy import deepcopy
 from collections import Counter, deque
 from pathlib import Path
@@ -9,7 +9,7 @@ import time
 
 from openpyxl.utils.cell import range_boundaries, get_column_letter
 from openpyxl.formula.tokenizer import TokenizerError
-from .统一语义 import _require, definition_hash, validate_facts, required_cell_dimensions
+from .统一语义 import _require, definition_hash, validate_facts, required_cell_dimensions, _dimension_value, MEASUREMENT_PROMPT
 from .统一证据 import context_catalog, applicable_context
 from .表格 import read_workbook, materialize_candidate_blanks, file_hash, Tokenizer, _REFERENCE
 from .表格编排 import stage_proofs, _stage_receipt
@@ -19,10 +19,10 @@ READ_PROMPT = '''读懂整份文件的编排、全部科目和子表，再说明
 返回JSON：{"tables":[{"id":"本文件内编号","sheet":"工作表","range":"含标题表头的范围","subject":"科目","meaning":"行列、上下级、期间及例外含义","data_ranges":["全部待更新数据范围"]}],"notes":"公共理解及不明确之处"}。
 一表可列多个数据范围；范围内其余格表示标题、表头或标签。续表保留所属科目；不把整张混合工作表当一张表。'''
 
-SELECT_PROMPT = '''根据A已经表达的语义，在金标准目录中查找准确对应的指标；候选必须继续核对完整定义。不能只按表名匹配，不能把最接近的指标当作已对应。
+SELECT_PROMPT = '''根据已经读懂的原文语义，从简明目录召回可能适用的指标，供后续核对完整定义。本步不发身份证；目录摘录不等于完整标准。相关经济对象、计量含义及可能同义的指标均可列为候选，不能因名称不同或尚未核对完整定义就断言标准缺项。不能只按表名匹配，不能把最接近的候选当作已对应。
 结合原表文字逐项查看行列，不能只看整表概括；上级汇总包含多种经济对象时也查找相应组合指标。
 按每个项目自身的经济对象和计量含义选标准，同一业务事实换表展示不换标准。复合表的总项与子项分别选择适用指标；已有更直接的对象标准能完整表达子项时优先使用，不给子项追加原文没有的父项限定。
-展开指标及各维度定义，核对原文对象与计量是否在允许范围内；维度的新取值不能扩大指标已明确排除的对象，也不能把费用、累计账项变动、单项支出与净损益相互替代。
+明显无关的对象和计量不选；仍须查看完整定义才能确定的相关指标保留在metric_ids，并在missing说明待核对之处。后续绑定须严格核对对象和计量边界；维度的新取值不能扩大指标已明确排除的对象，也不能把费用、累计账项变动、单项支出与净损益相互替代。
 返回JSON：{"tables":[{"id":"原表编号","metric_ids":["完整指标ID"],"missing":"未找到的业务含义，无则空字符串"}]}。每张表都登记。'''
 
 READ_CHECK_PROMPT = '''沿用整份认识，只解决列出的范围疑点，返回这些表修正后的原reading格式。数字在数据范围外，确认它是表头序号还是漏掉的财务值；文字在数据范围内，区分独立披露的业务事实和用于说明对象/类别/账龄的身份标签。独立的款项内容、未偿还原因仍是数据，名称或分类标签保留为语义依据；不因没有金标准删掉真正的数据。空白财务位置仍保留，不能因范围调整漏掉。
@@ -52,6 +52,27 @@ BIND_PROMPT += '\n槽位、维度定义、实际取值分别确认。原文未�
 REVIEW_PROMPT += '\n核查槽位与维度定义是否符合原文，并检查已有取值是否有据。具体维度取值尚未填写但槽位已明确时，保留已知部分和未知状态，不仅因缺具体取值提出issues；错误指标、错误已有取值或无法确认的语义仍须指出。'
 BIND_PROMPT += '\n本格明确表头及适用说明决定其含义；执行者的推断、文件名或金额公式引用另一表，不覆盖本格明确的期间和业务范围。公式可补充原文字段的引用线索，不用于按数字猜含义。'
 REVIEW_PROMPT += '\n核对指标及维度定义允许的对象和计量边界，不能用维度取值容纳被指标排除的对象或改变计量基础。核查已有取值是否来自本格原文；执行者推断、文件名或金额公式引用另一表不能覆盖明确表头。'
+FORMAT_PROMPT = '\n回执格式须与维度定义一致：value_type=selection时value必须是含mode的对象，不能填类别字符串；成员用{"mode":"members","members":["原文实际类别"]}，总体用{"mode":"all"}，有条件的范围用{"mode":"predicate","predicate":"原文限定条件"}。currency填写原文币种的三位大写代码，unit_scale为数值；allowed_values已列出时只能用其中的准确取值，不把原文近义词直接作为编码。evidence优先引用本次source中的单格地址或单独的@C编号；引用原文短语必须逐字存在，不能把自行概括的公司、日期或业务解释当成原文。以上只约束格式，不替代业务判断。'
+BIND_PROMPT += FORMAT_PROMPT
+REVIEW_PROMPT += FORMAT_PROMPT + '\ncorrections.non_business中的每项须完整填写{"range":"单格或矩形范围","category":"label或annotation","reason":"原文角色依据","evidence":["本次原文引用"]}。只排除模型已核实的标签或注释，不能省略category，也不能以排除方式处理未读懂的财务格。'
+CELL_REQUIREMENTS_PROMPT = '\n本次逐格要求见cell_requirements：它说明本次实际采用的完整事实字段要求，不改标准原文。标准通用dimension_refs中的report_scope required标记不是本次单格门槛；报告口径未提供时省略，不填unknown，也不得仅因此提出未决。其余实际取值未提供时，保留已确认指标槽位及有据维度，不捏造值，不把未知字符串塞进固定编码；已读懂槽位不因实际取值尚未提供而失效。ratio_definitions补全原标准的比例计量关系，只用于理解，不计算数值。固定经济对象或计量定义与原文不符仍须保留未决；本规则不放宽标准边界。修正了旧问题时须明确列resolved_ranges，不能只漏报旧问题。'
+BIND_PROMPT += CELL_REQUIREMENTS_PROMPT
+REVIEW_PROMPT += CELL_REQUIREMENTS_PROMPT
+BIND_PROMPT += '\n'+MEASUREMENT_PROMPT
+REVIEW_PROMPT += '\n'+MEASUREMENT_PROMPT
+SELECT_PROMPT += '\n'+MEASUREMENT_PROMPT
+REVIEW_PROMPT += '\n核查后仍存在格式或原文引用错误时，必须修正或在issues明确保留具体位置及原因，不能用空issues宣布通过。补充候选定义后沿用已核实的其他格及标题分类，仅修正本次未决范围。'
+REVIEW_PROMPT += '\n本次回执采用标准派生的结构约束。period的value必须为{"kind":"instant","date":"YYYY-MM-DD"}或{"kind":"duration","start":"YYYY-MM-DD","end":"YYYY-MM-DD"}，不能只返回日期字符串。corrections逐项返回metrics、patches、resolved_ranges、non_business、remove_dimensions数组，无更正时为空；移除维度须明确id和ranges。结构只约束格式及有效编码，不代替原文判断。'
+
+# 旧提示词仅供旧任务审计；新A不把比较要求写成身份豁免。
+IDENTITY_RULE='全部必需维度（包括report_scope）按完整金标准列缺项；已知值和未知照实保留，缺项不否定已确认指标槽位。完整性与本次是否比较分开，更新要求不能提供任何身份取值。selection的domain和completeness须由你依完整标准及原文明确填写，程序不补值。证据可引用本次实际提供的跨表原文、共同说明与公式引用原文；存在或同文不自动证明适用，由你确认真实适用范围及例外。'
+RELATION_RULE='每表另存relations数组，只记录本次原文已经确认的角色、期间/标签适用范围、父子/成员/总体及比例等关系，不从更新要求生成。每项格式为{"content":"原有关系的明确内容","record_ranges":[{"table_id":"本次表编号","ranges":["明确本方财务范围，*只限所指表"]}],"exceptions":[{"table_id":"表编号","ranges":["明确例外范围"],"content":"例外原判断"}],"evidence":["本次实际原文引用"]}。尚未确认的关系不填写假值，在notes或issues保留缺口。自然语言概述不能代替上述实际范围。'
+NEW_BIND_PROMPT=BIND_PROMPT.replace(CELL_REQUIREMENTS_PROMPT,'').replace(
+    'report_scope是报表共同信息，不作为格子绑定的必填维度，也不参与A/B格子对应；原文有明确说明时保留，没有时省略，不询问或猜测。其余业务维度仍须准确绑定。','').replace(
+    '程序补入定义中的domain，按该指标允许的维度保存。','domain及completeness必须明确填写，不交给程序补。')+'\n'+IDENTITY_RULE+'\n'+RELATION_RULE
+NEW_REVIEW_PROMPT=REVIEW_PROMPT.replace(CELL_REQUIREMENTS_PROMPT,'').replace(
+    'report_scope不参与格子对应，不因缺少该项提出未决；检查其余指标和业务维度。','')+'\n'+IDENTITY_RULE+'\n'+RELATION_RULE+'\n只核查已有关系，不另生一套关系。每表checked_relations列出实际确认的原relations序号（从0开始）；有明确修正时corrections.relations填写[{index:原序号,value:完整修正关系}]，原记录仍保留。无法确认的关系不勾选，按范围列issues。缺项如实保存，缺少关系不能靠文字推成执行对应。'
+NEW_READ_PROMPT=READ_PROMPT+'\n逐表明确需要共同阅读的context_references:[{sheet:原工作表,range:原范围}]，可跨表，只选本次已读原文中真实相关的说明、表头或依赖，不改变该表数据范围；没有则空数组。程序不按邻近或同文替你决定适用性。'
 
 
 def addresses(area):
@@ -88,23 +109,28 @@ def expand_scopes(answer, table, cells, standard):
             _require(current and not current&selected,'取值范围没有财务目标或重复')
             selected.update(current)
         return selected
-    for row in answer['metrics']:
-        _require(row['id'] in standard['metric'],'不存在的指标')
-        for address in scope(row['ranges']):
-            _require('metric_id' not in result[address],'同一数据位置有两个指标')
-            result[address]['metric_id']=row['id']
+    for kind,key,category in (('metrics','metric_id','metric'),('dimension_bindings','dimension_id','dimension')):
+        for row in answer.get(kind,[]):
+            _require(row['id'] in standard[category],'不存在的金标准编号')
+            for address in scope(row['ranges']):
+                other='dimension_id' if key=='metric_id' else 'metric_id'
+                _require(not result[address].get(other) and result[address].get(key,row['id'])==row['id'],'同一数据位置有两个金标准编号')
+                result[address][key]=row['id']
     for row in answer['dimensions']:
         key=row['id'];definition=standard['dimension'].get(key)
         refs=[row['evidence']] if isinstance(row['evidence'],str) else row['evidence']
         _require(definition is not None,'不存在的维度')
         value=deepcopy(row['value'])
-        if definition['value_type']=='selection' and isinstance(value,dict):
+        if not standard.get('_complete_identity') and definition['value_type']=='selection' and isinstance(value,dict):
             value.setdefault('domain',definition['domain'])
             value.setdefault('completeness','unknown' if value.get('mode')=='unknown' else 'complete')
         for address in scope(row['ranges']):
             previous=result[address]['dimensions'].get(key)
             _require(previous is None or previous['value']==value,'同一数据位置的维度取值冲突')
             result[address]['dimensions'][key]={'value':value,'evidence':list(dict.fromkeys((previous['evidence'] if previous else [])+refs))}
+            if 'label_references' in row or previous and 'label_references' in previous:
+                result[address]['dimensions'][key]['label_references']=list(dict.fromkeys(
+                    (previous.get('label_references',[]) if previous else [])+row.get('label_references',[])))
     for row in answer.get('unresolved',[]):
         for address in scope([row['range']]):result[address].update(metric_id=None,reason=row['reason'])
     return result
@@ -113,12 +139,18 @@ def expand_scopes(answer, table, cells, standard):
 def formula_source_material(snapshot, selected):
     """追溯静态引用及其行列文字；不求值，也不据公式直接发证。"""
     compact=snapshot.get('semantic_formula_sources',3)>=3
+    direct=snapshot.get('semantic_formula_sources',3)==4
+    full=snapshot.get('semantic_formula_sources',3)>=5
     sheets={s['name']:s for s in snapshot['sheets']};queue=deque();seen=set()
     for sheet in snapshot['sheets']:
         queue.extend((sheet['name'],a) for a,c in sheet['cells'].items()
                      if a in selected.get(sheet['name'],set()) and c.get('formula'))
     result={'引用':{},'原文':{},'未展开':[]};indexes={}
     if compact:result.update(引用范围={},共同行列文字={},合并标题范围={})
+    if direct:
+        result['未递归数值计算']=[]
+        result['说明']='保留所选格的公式、直接引用及行列文字；文字标题公式继续追溯。未递归数值计算中每个格的原式见原文同名项，不展开其下层、不计算金额。原文中的空对象仍是已读数值或空白位置，数值及空白状态不用于判断身份。'
+        result['行列文字规则']='每格按格址读取共同行列文字：同一行、本列上方非公式文字，以及合并标题范围中覆盖本行且位于本列或左侧的标题、本列上方跨列标题及这些标题所在行的非公式文字。各范围由该格行列及合并标题范围确定，不把其他行或其他列的数字当作标签。'
     def context_cells(name,address):
         sheet=sheets[name];cell=sheet['cells'][address];row,col=cell['row'],cell['column']
         if name not in indexes:
@@ -128,20 +160,22 @@ def formula_source_material(snapshot, selected):
                     rows.setdefault(c['row'],[]).append(a);columns.setdefault(c['column'],[]).append(a)
             indexes[name]=(rows,columns)
         rows,columns=indexes[name]
-        owned=set(rows.get(row,[]))
-        owned.update(a for a in columns.get(col,[]) if sheet['cells'][a]['row']<row and not sheet['cells'][a].get('formula'))
+        owned=set(rows.get(row,[]));merged_anchors=set()
+        owned.update(a for a in columns.get(col,[]) if sheet['cells'][a]['row']<row and
+                     (not sheet['cells'][a].get('formula') or isinstance(sheet['cells'][a].get('cached_value'),str)))
         if compact:result['合并标题范围'].setdefault(name,sheet['merges'])
         for area in sheet['merges']:
             left,top,right,bottom=range_boundaries(area)
             if (top<=row<=bottom and left<=col) or (left<=col<=right and bottom<row):
-                owned.add(f'{get_column_letter(left)}{top}')
+                anchor=f'{get_column_letter(left)}{top}';owned.add(anchor);merged_anchors.add(anchor)
                 owned.update(a for a in rows.get(top,[]) if not sheet['cells'][a].get('formula'))
         text={}
         for a in sorted(owned):
             c=sheet['cells'].get(a,{})
             if c.get('formula'):
-                if (c['row']==row and c['column']<col) or isinstance(c.get('cached_value'),str):
-                    text[name+'!'+a]={'公式':c['formula']};queue.append((name,a))
+                if a!=address and (a in merged_anchors or (c['row']==row and c['column']<col) or isinstance(c.get('cached_value'),str)):
+                    text[name+'!'+a]={'公式':c['formula']}
+                    if not direct or isinstance(c.get('cached_value'),str):queue.append((name,a))
             elif isinstance(c.get('value'),str) and c['value'].strip():text[name+'!'+a]=c['value']
         # 共用文字按原位置只保存一次；每格保留适用范围，避免公式链平方复制全文。
         if not compact:return text
@@ -157,6 +191,8 @@ def formula_source_material(snapshot, selected):
         if not cell.get('formula'):continue
         try:tokens=Tokenizer(cell['formula']).items
         except (TokenizerError,ValueError,IndexError):
+            result['未展开'].append({'位置':location,'引用':cell['formula']});continue
+        if full and any(t.type=='FUNC' and t.subtype=='OPEN' and t.value.upper() in {'INDIRECT(','OFFSET('} for t in tokens):
             result['未展开'].append({'位置':location,'引用':cell['formula']});continue
         refs=[]
         for token in tokens:
@@ -181,16 +217,47 @@ def formula_source_material(snapshot, selected):
                 ref=target+'!'+a
                 if not compact or not match['b']:refs.append(ref)
                 if ref not in result['原文']:
-                    record={'行列文字':context_cells(target,a)}
+                    row_context=context_cells(target,a)
+                    record={} if direct else {'行列文字':row_context}
                     if c.get('formula'):record['公式']=c['formula']
                     elif isinstance(c.get('value'),str):
                         if compact:record['文字引用']=ref
                         else:record['文字']=c['value']
-                    else:record['数据位置']='只确认业务含义，不使用数值及空白状态'
+                    elif not direct:record['数据位置']='只确认业务含义，不使用数值及空白状态'
                     result['原文'][ref]=record
-                queue.append((target,a))
+                    if direct and c.get('formula') and not isinstance(c.get('cached_value'),str):
+                        result['未递归数值计算'].append(ref)
+                if not direct or isinstance(c.get('cached_value'),str):queue.append((target,a))
         result['引用'][location]=list({json.dumps(ref,ensure_ascii=False):ref for ref in refs}.values())
     return result
+
+
+def validate_material_references(source):
+    """只检查已传材料中的引用闭合；不能据此宣称财务上下文已经完整。"""
+    proof=source.get('公式引用依据',{})
+    _require(not proof.get('未展开'),'公式引用未展开，停止本次识别请求：'+json.dumps(proof.get('未展开'),ensure_ascii=False))
+    _require(not proof.get('未递归数值计算'),'公式下层引用未展开，不能提交历史残缺材料')
+    references=proof.get('引用',{});original=proof.get('原文',{});shared=proof.get('共同行列文字',{})
+    formulas=set(source.get('公式原文',{}))|{k for k,v in original.items() if v.get('公式')}
+    formulas.update(k for k,v in shared.items() if isinstance(v,dict) and v.get('公式'))
+    _require(formulas<=set(references),'公式缺少引用展开：'+str(sorted(formulas-set(references))))
+    for items in references.values():
+        for ref in items:
+            if isinstance(ref,dict):
+                key=ref['范围引用']
+                _require(key in proof.get('引用范围',{}),'公式缺少引用范围内容：'+key)
+                targets=proof['引用范围'][key]
+            else:targets=[ref]
+            _require(set(targets)<=set(original),'公式缺少引用原文：'+str(sorted(set(targets)-set(original))))
+    for row in original.values():
+        if '文字引用' in row:_require(row['文字引用'] in shared,'公式缺少共同原文：'+row['文字引用'])
+    def check(value):
+        if isinstance(value,dict):
+            if '原文引用' in value:_require(value['原文引用'] in source.get('共同原文',{}),'缺少共同原文：'+str(value['原文引用']))
+            for child in value.values():check(child)
+        elif isinstance(value,list):
+            for child in value:check(child)
+    check(source.get('context',{}))
 
 
 def source_material(snapshot, context, tables=None, semantic_only=False):
@@ -202,7 +269,13 @@ def source_material(snapshot, context, tables=None, semantic_only=False):
         selected={}
         for table in tables:
             selected.setdefault(table['sheet'],set()).update(addresses(table['range']))
+            if table.get('read_full_rows'):
+                first,last=range_boundaries(table['range'])[1::2]
+                source=next(s for s in snapshot['sheets'] if s['name']==table['sheet'])
+                selected[table['sheet']].update(address for address,cell in source['cells'].items() if first<=cell['row']<=last)
             for area in table.get('context_ranges',[]):selected[table['sheet']].update(addresses(area))
+            if snapshot.get('semantic_identity_version')==2:
+                for ref in table.get('context_references',[]):selected.setdefault(ref['sheet'],set()).update(addresses(ref['range']))
     sheets=[]
     targets={}
     if semantic_only:
@@ -214,13 +287,15 @@ def source_material(snapshot, context, tables=None, semantic_only=False):
             value=cell.get('cached_value') if cell.get('formula') else cell['value']
             if address in targets.get(sheet['name'],set()) and (value in (None,'') or isinstance(value,(int,float)) or cell.get('formula')):
                 value='[待确认业务含义]'
+            if isinstance(value,str) and ('\n' in value or '\r' in value):
+                value=json.dumps(value,ensure_ascii=False)
             lines.setdefault(cell['row'],[]).append(f'{get_column_letter(cell["column"])}={"[空白]" if value is None or value=="" else value}')
         if lines:sheets.append({'sheet':sheet['name'],'rows':'\n'.join(str(r)+': '+' | '.join(parts) for r,parts in sorted(lines.items())),
                                 'merges':[a for a in sheet['merges'] if set(addresses(a))&owned]})
     context_rows={}
     for alias,ref in aliases.items():
         record=catalog[ref];scope=record['scope']
-        if tables is not None and scope and not any(t['sheet']==scope['sheet'] and
+        if snapshot.get('semantic_identity_version')!=2 and tables is not None and scope and not any(t['sheet']==scope['sheet'] and
             ref in applicable_context(catalog,t['sheet'],[range_boundaries(t['range'])[1],range_boundaries(t['range'])[0],range_boundaries(t['range'])[3],range_boundaries(t['range'])[2]]) for t in tables):continue
         content=record['content']
         if isinstance(content,dict):content={k:content[k] for k in ('title','chapter_context','unit_text','text') if content.get(k)}
@@ -240,6 +315,10 @@ def source_material(snapshot, context, tables=None, semantic_only=False):
         if isinstance(value,list):return [compact(v) for v in value]
         return value
     material={'sheets':sheets,'context':compact(context_rows)}
+    if tables is not None:material['本次读取范围']=deepcopy(tables)
+    material['原有表区']={name:areas for name,areas in snapshot.get('names',{}).items()
+        if any(area['range'] and area['sheet'] in selected and
+               set(addresses(area['range']))&selected[area['sheet']] for area in areas)}
     if snapshot.get('semantic_formula_sources'):
         material['公式原文']={sheet['name']+'!'+address:cell['formula'] for sheet in snapshot['sheets']
             for address,cell in sheet['cells'].items() if address in selected.get(sheet['name'],set()) and cell.get('formula')}
@@ -282,6 +361,18 @@ def source_material(snapshot, context, tables=None, semantic_only=False):
                 # 同一行重复的原文保留全部出处，不猜其中哪个才是模型所指。
                 bounds=[top,left,bottom,right] if len(row_counts)==1 else [row,left,row,right]
                 aliases.setdefault(value,[]).append({'ref':ref,'scope':{'sheet':table['sheet'],'bounds':bounds}})
+    if snapshot.get('semantic_identity_version')==2:
+        shown={name+'!'+a for name,items in selected.items() for a in items}
+        shown.update(material.get('公式引用依据',{}).get('原文',{}))
+        shown.update(material.get('公式引用依据',{}).get('共同行列文字',{}))
+        evidence={s['name']+'!'+a:deepcopy(c) for s in snapshot['sheets'] for a,c in s['cells'].items() if s['name']+'!'+a in shown}
+        aliases['_all_evidence']=evidence
+        # 同文仅保留全部原位置，不以行列距离推定它的业务管辖范围。
+        for key in list(aliases):
+            if isinstance(aliases[key],list) and not key.startswith('_') and not re.fullmatch(r'T\d+',key):aliases.pop(key)
+        for ref,c in evidence.items():
+            value=c.get('cached_value') if c.get('formula') else c.get('value')
+            if isinstance(value,str) and value.strip():aliases.setdefault(value,[]).append({'ref':ref,'scope':None})
     return material,aliases
 
 
@@ -295,8 +386,13 @@ def validate_reading(answer, snapshot):
         _require(right<=sheet['max_column'] and bottom<=sheet['max_row'],'子表越出原文件')
         _require(not area&covered.setdefault(table['sheet'],set()),'子表范围重叠')
         covered[table['sheet']].update(area)
-        for target in table['data_ranges']:_require(set(addresses(target))<=area,'数据范围越出子表')
+        for target in table['data_ranges']:_require(set(addresses(target))<=area,'数据范围越出子表：'+table['sheet']+'!'+target+' 不在 '+table['range'])
         data_cells(table,sheet['cells'])
+        if snapshot.get('semantic_identity_version')==2:
+            for ref in table.get('context_references',[]):
+                _require(ref['sheet'] in sheets,'共同原文引用工作表不存在')
+                left,top,right,bottom=range_boundaries(ref['range'])
+                _require(top>0 and left>0 and right<=sheets[ref['sheet']]['max_column'] and bottom<=sheets[ref['sheet']]['max_row'],'共同原文引用越出真实网格')
     return deepcopy(answer)
 
 
@@ -356,6 +452,21 @@ def selection_payload(reading,snapshot,standard,include_basis=True):
 
 
 def standard_material(ids, standard):
+    if not standard.get('_historical_material'):
+        # 带上标准明文引用的其他定义；是否适用仍由本次识别决定。
+        selected=list(dict.fromkeys(ids))
+        for key in selected:
+            for side in standard['metric'][key]['definition'].get('ratio',{}).values():
+                if side['metric_id'] not in selected:selected.append(side['metric_id'])
+            for reference in re.findall(r'(?<![A-Za-z0-9_.])metric\.[A-Za-z0-9_.]+',json.dumps(standard['metric'][key]['definition'],ensure_ascii=False)):
+                reference=reference.rstrip('.')
+                if reference not in selected and standard['metric'].get(reference,{}).get('status')=='active':
+                    selected.append(reference)
+        metrics=[deepcopy(standard['metric'][key]) for key in selected]
+        dimensions={d['id'] for m in metrics for d in m['dimension_refs']}
+        return {'metrics':metrics,'dimensions':[deepcopy(standard['dimension'][key]) for key in sorted(dimensions)],
+                '共同识别原则':'范围以指标经济对象、计量基础和维度职责为总体。原文覆盖完整业务总体且无附加筛选时用all，不要求列出所有类别证明全体；不能把合计改成当前展示的明细名单。存在父项限定时保留父项，明确账龄或类别本身已是确定范围。保留其中项、交集、并集及排除条件，不添加原文没有的限制；不凭金额、当前行数、位置或常见做法推断。只记已知含义，真正缺少的条件才列未决。'}
+    # 仅供旧回执审计重放；新请求不使用历史删段材料。
     metrics=[standard['metric'][m] for m in dict.fromkeys(ids)]
     dimensions={d['id'] for m in metrics for d in m['dimension_refs']}
     repeated=Counter(part for d in standard['dimension'].values() for part in d['meaning'].split(' ') if len(part)>100)
@@ -369,6 +480,18 @@ def standard_material(ids, standard):
     return {'metrics':[{'id':m['id'],'definition':{k:v for k,v in m['definition'].items() if k!='ratio'},
                         'dimension_refs':m['dimension_refs']} for m in metrics], 'dimensions':definitions,
             '共同识别原则':'范围以指标经济对象、计量基础和维度职责为总体。原文覆盖完整业务总体且无附加筛选时用all，不要求列出所有类别证明全体；不能把合计改成当前展示的明细名单。存在父项限定时保留父项，明确账龄或类别本身已是确定范围。保留其中项、交集、并集及排除条件，不添加原文没有的限制；不凭金额、当前行数、位置或常见做法推断。只记已知含义，真正缺少的条件才列未决。'}
+
+
+def cell_requirements(ids,standard):
+    metrics={key:standard['metric'][key] for key in dict.fromkeys(ids)}
+    if standard.get('_complete_identity'):
+        return {'complete_fact_dimensions':{key:sorted(required_cell_dimensions(m,standard)) for key,m in metrics.items()},
+                'missing_values':'全部必需维度照实列缺项，保留已确认槽位；本次比较排除另存，不补取值。',
+                'ratio_definitions':{key:deepcopy(m['definition']['ratio']) for key,m in metrics.items() if 'ratio' in m['definition']}}
+    return {'complete_fact_dimensions':{key:sorted(required_cell_dimensions(m,standard)) for key,m in metrics.items()},
+            'report_scope':{'required_for_cell':False,'used_for_matching':False},
+            'missing_values':'实际取值未提供不否定已确认槽位；省略无据取值，不填unknown字符串或假成员。',
+            'ratio_definitions':{key:deepcopy(m['definition']['ratio']) for key,m in metrics.items() if 'ratio' in m['definition']}}
 
 
 def checked_records(answer, table, packet, standard, aliases):
@@ -387,6 +510,8 @@ def checked_records(answer, table, packet, standard, aliases):
         allowed={d['id'] for d in standard['metric'][metric]['dimension_refs']}
         required=required_cell_dimensions(standard['metric'][metric],standard)
         _require(set(row.get('dimensions',{}))<=set(standard['dimension']), '模型使用了不存在的维度ID')
+        if standard.get('_complete_identity'):
+            _require(set(row.get('dimensions',{}))<=allowed,'已声明维度不属于该指标；原答复保留，须明确修正，不能静默删除')
         dims={k:v['value'] for k,v in row.get('dimensions',{}).items() if k in allowed}
         try:
             evidence={k:normalize_evidence(v['evidence'],table['sheet'],aliases,address) for k,v in row.get('dimensions',{}).items() if k in allowed}
@@ -405,6 +530,14 @@ def normalize_evidence(refs, sheet, aliases, address=None):
     if isinstance(refs,str):refs=[refs]
     result=[]
     for ref in refs:
+        if '_all_evidence' in aliases and not ref.startswith('@') and ref not in aliases:
+            prefix,separator,area=ref.rpartition('!')
+            target=prefix.strip("'") if separator else sheet
+            try:locations=[target+'!'+a for a in addresses((area if separator else ref).replace('$',''))]
+            except (ValueError,TypeError):locations=[]
+            if locations:
+                _require(set(locations)<=set(aliases['_all_evidence']),'依据引用未在本次完整材料中提供：'+ref)
+                result.extend(locations);continue
         literal=ref.removeprefix('原文引用：').removeprefix('原文引用:').strip()
         if re.fullmatch(r'@T\d+',literal) and literal[1:] in aliases:literal=literal[1:]
         if literal in aliases:ref=literal
@@ -419,7 +552,7 @@ def normalize_evidence(refs, sheet, aliases, address=None):
             matching=[]
             for item in items:
                 scope=item['scope']
-                if not scope or (scope['sheet']==sheet and scope['bounds'][0]<=row<=scope['bounds'][2] and scope['bounds'][1]<=column<=scope['bounds'][3]):matching.append(item['ref'])
+                if '_all_evidence' in aliases or not scope or (scope['sheet']==sheet and scope['bounds'][0]<=row<=scope['bounds'][2] and scope['bounds'][1]<=column<=scope['bounds'][3]):matching.append(item['ref'])
             _require(matching,'共同原文说明不适用于当前位置：'+ref)
             result.extend(matching);continue
         if ref.startswith('@'):result.append(aliases.get(ref,ref));continue
@@ -437,10 +570,14 @@ def table_packet(table, snapshot, context):
     sheet=next(s for s in snapshot['sheets'] if s['name']==table['sheet'])
     area=set(addresses(table['range']))
     shown=area|{a for span in table.get('context_ranges',[]) for a in addresses(span)}
-    return {'source_path':snapshot['path'],'source_hash':snapshot['sha256'],'sheet':sheet['name'],
+    result={'source_path':snapshot['path'],'source_hash':snapshot['sha256'],'sheet':sheet['name'],
             'cells':{a:c for a,c in sheet['cells'].items() if a in shown},
             'candidate_cells':[a for a in sheet['cells'] if a in area and
                 ('semantic_candidates' not in snapshot or sheet['name']+'!'+a in snapshot['semantic_candidates'])], 'document_context':context}
+    if snapshot.get('semantic_identity_version')==2:
+        result['source_evidence']=snapshot.get('_source_evidence',{})
+        result['identity_collection_version']=1
+    return result
 
 
 def binding_payload(tables, selection, snapshot, context, standard, semantic_only=True, reading_notes=None):
@@ -448,7 +585,12 @@ def binding_payload(tables, selection, snapshot, context, standard, semantic_onl
     selected={r['id']:r for r in selection['tables']}
     ids=[m for t in tables for m in selected[t['id']]['metric_ids']]
     # 检索已读取完整行名，只提供实际选中的定义，不再次扩成整个同类指标。
-    payload={'task':'a_semantic_bind','reading':tables,'source':material,'standards':standard_material(ids,standard)}
+    payload={'task':'a_semantic_bind','reading':tables,'source':material,'standards':standard_material(ids,standard),
+             'cell_requirements':cell_requirements(ids,standard)}
+    if standard.get('_complete_identity'):
+        payload['identity_collection_version']=1
+        snapshot['_source_evidence']=deepcopy(aliases['_all_evidence'])
+        snapshot.setdefault('_all_source_evidence',{}).update(deepcopy(aliases['_all_evidence']))
     if snapshot.get('semantic_slot_bindings'):
         payload['槽位与取值分层']='先确认金标准槽位及维度定义，再记录原文实际取值。名称或金额未填写不否定已知槽位；缺少具体取值时保留已有维度，集合用unknown或partial如实记录，不填假名称，不改成all或合计，不放进unresolved删除已知指标。核查仍须确认指标及已知维度都有原文依据。'
     vocabulary={}
@@ -504,6 +646,8 @@ def validate_bindings(answer, tables, snapshot, context, standard, candidate=Fal
     if require_identity:
         _require(not any(t.get('source_identities') for t in answer['tables']),
                  '识别成功必须完整对应金标准，请通过metrics和dimensions修正绑定')
+        _require(all(m.get('id') in standard['metric'] for row in answer['tables'] for m in row.get('metrics',[])),
+                 '指标ID须引用当前金标准，不能填写表号或自造编码；未查明的范围保留unresolved，不填无效指标')
     index={t['id']:t for t in tables}
     if any(row.get('style_reuse') for row in answer['tables']):
         from .B样式复用 import apply_reuse
@@ -599,13 +743,26 @@ def validate_review(answer, tables, snapshot, context, focus=None, require_ident
              {t['id'] for t in answer['tables']}<=set(index),'核查表重复或越界')
     _,aliases=source_material(snapshot,context,tables)
     for row in answer['tables']:
+        for item in row.get('corrections',{}).get('non_business',[]):
+            _require(isinstance(item,dict) and {'range','category','reason','evidence'}<=set(item),
+                     'non_business须明确range、category、reason和evidence，不能由程序猜范围或类别')
+            _require(isinstance(item['range'],str) and bool(item['range'].strip()) and item['category'] in {'label','annotation'},
+                     'non_business须用明确范围及label或annotation类别')
+        for item in row.get('corrections',{}).get('remove_dimensions',[]):
+            _require(isinstance(item,str) and bool(item.strip()) or
+                     isinstance(item,dict) and set(item)=={'id','ranges'} and isinstance(item['id'],str)
+                     and isinstance(item['ranges'],list) and bool(item['ranges']),
+                     '维度移除须为维度ID或明确的{id,ranges}，不能猜范围')
         if focus is not None:
             wanted={a for span in focus[row['id']] for a in addresses(span)}
             if 'checked_ranges' in row:
                 _require({a for span in row['checked_ranges'] for a in addresses(span)}==wanted,'核查回复范围与请求不符')
             row['checked_ranges']=deepcopy(focus[row['id']])
             corrections=row.get('corrections',{})
-            _require(not corrections.get('dimensions') and not corrections.get('remove_dimensions'),'局部核查须用有范围的修正')
+            _require(not corrections.get('dimensions'),'局部核查须用有范围的修正')
+            for item in corrections.get('remove_dimensions',[]):
+                _require(isinstance(item,dict),'局部移除须逐项提供{id,ranges}，不能移除整表维度')
+                _require({a for span in item['ranges'] for a in addresses(span)}<=wanted,'维度移除越出本次核查范围')
             for key in ('metrics','patches','non_business','source_identities'):
                 for change in corrections.get(key,[]):
                     spans=[change['range']] if key=='non_business' else change['ranges']
@@ -622,14 +779,41 @@ def validate_review(answer, tables, snapshot, context, focus=None, require_ident
     return deepcopy(answer)
 
 
+def validate_review_result(answer,binding,tables,snapshot,context,standard,payload):
+    answer=validate_review(answer,tables,snapshot,context,payload.get('review_focus'),require_identity=True)
+    _require(all(isinstance(row.get('issues'),list) for row in answer['tables']),'核查必须明确返回issues数组，只有表号不等于已经核查')
+    merged=validate_bindings(reviewed_binding(binding,answer,tables,snapshot),tables,snapshot,context,standard)
+    index={t['id']:t for t in tables};rows={r['id']:r for r in merged['tables']}
+    _,aliases=source_material(snapshot,context,tables)
+    if standard.get('_complete_identity'):
+        from .A合集 import validate_relations
+        validate_relations(binding,answer,tables,aliases)
+    supplied={m['id'] for m in payload['standards']['metrics']}
+    for review in answer['tables']:
+        table=index[review['id']];packet=table_packet(table,snapshot,context)
+        _require(all(m['id'] in supplied for m in review.get('corrections',{}).get('metrics',[])),
+                 '指标更正须依据本次实际发送的完整定义，不能仅凭编码选标准')
+        checked=review_for_table(review,table,packet,aliases)
+        blocked={a for issue in checked['issues'] for a in issue['cells']}
+        row=rows[review['id']]
+        declared={a for issue in row.get('unresolved',[]) for a in addresses(issue['range'])}
+        records=checked_records(row,table,packet,standard,aliases)
+        for address in checked['checked_cells']:
+            record=records[address]
+            if address in blocked:continue
+            if record['kind']=='invalid_response' or record['kind']=='unresolved' and address not in declared:
+                raise ValueError('核查后仍未修正：'+review['id']+'!'+address+'；'+record['reason'])
+    return deepcopy(answer)
+
+
 def reviewed_binding(binding, review, tables=None, snapshot=None):
     """核查沿用原结果，只采纳有明确取值及范围的维度更正。"""
     result=deepcopy(binding);index={r['id']:r for r in result['tables']}
     for row in review.get('tables',[]):
         corrections=row.get('corrections',{})
-        _require(set(corrections)<= {'dimensions','metrics','non_business','remove_dimensions','patches','resolved_ranges','source_identities'},'核查更正字段不支持')
+        _require(set(corrections)<= {'dimensions','metrics','non_business','remove_dimensions','patches','resolved_ranges','source_identities','relations'},'核查更正字段不支持')
         replacements=corrections.get('dimensions',[])
-        ids={d['id'] for d in replacements}|set(corrections.get('remove_dimensions',[]))
+        ids={d['id'] for d in replacements}|{d for d in corrections.get('remove_dimensions',[]) if isinstance(d,str)}
         target=index[row['id']]
         for change in corrections.get('source_identities',[]):
             table=next(t for t in tables if t['id']==row['id'])
@@ -657,7 +841,9 @@ def reviewed_binding(binding, review, tables=None, snapshot=None):
                 remaining=(set(a for area in original['ranges'] for a in addresses(area))&owned)-changed
                 if remaining:kept.append({**original,'ranges':sorted(remaining)})
             target['metrics']=kept+[deepcopy(change)]
-        for change in corrections.get('patches',[]):
+        changes=[(change,False) for change in corrections.get('patches',[])]+[
+            (change,True) for change in corrections.get('remove_dimensions',[]) if isinstance(change,dict)]
+        for change,remove in changes:
             table=next(t for t in tables if t['id']==row['id'])
             owned=set(data_cells(table,next(s for s in snapshot['sheets'] if s['name']==table['sheet'])['cells']))
             def scope(item):
@@ -671,7 +857,7 @@ def reviewed_binding(binding, review, tables=None, snapshot=None):
                 if original['id']!=change['id']:kept.append(original);continue
                 remaining=scope(original)-changed
                 if remaining:kept.append({**original,'ranges':sorted(remaining)})
-            target['dimensions']=kept+[deepcopy(change)]
+            target['dimensions']=kept+([] if remove else [deepcopy(change)])
         resolved=set(a for area in corrections.get('resolved_ranges',[]) for a in addresses(area))
         if resolved:
             table=next(t for t in tables if t['id']==row['id'])
@@ -685,6 +871,7 @@ def reviewed_binding(binding, review, tables=None, snapshot=None):
 
 def duplicate_identity_questions(binding,tables,snapshot,standard):
     """同列不同原文却有相同身份时请模型查明，不自动判错或猜测财务范围。"""
+    if standard.get('_complete_identity'):return []
     questions=[];index={t['id']:t for t in tables}
     for row in binding['tables']:
         table=index[row['id']];cells=table_packet(table,snapshot,[])['cells']
@@ -714,6 +901,7 @@ def duplicate_identity_questions(binding,tables,snapshot,standard):
 
 def semantic_questions(binding,tables,snapshot,standard):
     """指出已发生过的合计范围疑点；只提问，财务结论仍由模型依据原文给出。"""
+    if standard.get('_complete_identity'):return []
     questions=duplicate_identity_questions(binding,tables,snapshot,standard);index={t['id']:t for t in tables}
     for row in binding['tables']:
         table=index[row['id']];cells=next(s for s in snapshot['sheets'] if s['name']==table['sheet'])['cells']
@@ -770,6 +958,16 @@ def shared_binding(binding):
     return result
 
 
+REVIEW_EVIDENCE_RULE='核查只引用text_evidence列出的当前表实际文字格，或source.context内适用的说明编号。reading_notes及其他表的文字不能代替当前表证据；缺少具体事实保持未提供，不据此编造取值。'
+
+
+def review_text_evidence(tables,snapshot,context):
+    return {t['id']:{t['sheet']+'!'+a:value
+        for a,c in table_packet(t,snapshot,context)['cells'].items()
+        if isinstance(value:=c.get('cached_value') if c.get('formula') else c.get('value'),str) and value.strip()}
+        for t in tables}
+
+
 def review_material(payload, binding, tables, snapshot, context, standard, prior_reviews=()):
     _,aliases=source_material(snapshot,context,tables);index={t['id']:t for t in tables};issues=[]
     catalog=context_catalog(context,snapshot['path'])
@@ -789,9 +987,24 @@ def review_material(payload, binding, tables, snapshot, context, standard, prior
                     failures={r['reason'] for r in partial.values() if r['kind']=='invalid_response'}
                 except (ValueError,KeyError,TypeError) as detail:failures={str(detail)}
                 for reason in failures:
-                    if '@context:' in reason:reason='所引用的@C说明不适用于这些位置，请依据当前表的表头、行名或全局说明重新引用。'
+                    if '@context:' in reason and not standard.get('_complete_identity'):reason='所引用的@C说明不适用于这些位置，请依据当前表的表头、行名或全局说明重新引用。'
                     issues.append({'id':row['id'],'dimension':dimension['id'],'ranges':dimension['ranges'],'reason':reason})
             continue
+        expanded=expand_scopes(row,table,table_packet(table,snapshot,context)['cells'],standard)
+        for dimension in row['dimensions']:
+            key=dimension['id'];definition=standard['dimension'].get(key)
+            declared={a for span in dimension['ranges'] for a in (expanded if span=='*' else addresses(span))}
+            relevant=sorted(a for a in declared&set(expanded) if expanded[a].get('metric_id') in standard['metric'] and
+                key in {d['id'] for d in standard['metric'][expanded[a]['metric_id']]['dimension_refs']})
+            if definition is None or not relevant:continue
+            value=expanded[relevant[0]]['dimensions'][key]['value'];failures=[]
+            try:_dimension_value(value,definition)
+            except (ValueError,TypeError,KeyError) as error:failures.append(str(error))
+            try:normalize_evidence(dimension['evidence'],table['sheet'],aliases,relevant[0])
+            except (ValueError,TypeError,KeyError,IndexError) as error:failures.append('原文依据：'+str(error))
+            for reason in failures:
+                issues.append({'id':row['id'],'dimension':key,'ranges':relevant,'reason':reason,'provided':deepcopy(value),
+                    'expected':{k:deepcopy(definition[k]) for k in ('value_type','domain','allowed_values') if k in definition}})
         reasons={}
         for address,record in records.items():
             if address in source_known and record['kind'] in {'partial_metric_fact','unresolved'}:continue
@@ -806,7 +1019,7 @@ def review_material(payload, binding, tables, snapshot, context, standard, prior
                 if not isinstance(ref,str):continue
                 if ref in reason:
                     scope=catalog[ref]['scope']
-                    if scope:
+                    if scope and not standard.get('_complete_identity'):
                         top,left,bottom,right=scope['bounds']
                         area=f'{get_column_letter(left)}{top}:{get_column_letter(right)}{bottom}'
                         reason=f'所引说明{alias}只适用于{scope["sheet"]}!{area}，不适用于当前问题位置；请换用适用的原文依据。'
@@ -826,12 +1039,25 @@ def review_material(payload, binding, tables, snapshot, context, standard, prior
     metrics=[m['id'] for m in payload.get('standards',{}).get('metrics',[])]
     metrics.extend(m['id'] for row in binding['tables'] for m in row.get('metrics',[])
                    if m['id'] in standard['metric'] and standard['metric'][m['id']]['status']=='active')
+    selected=set(metrics)
+    related=[key for key,m in standard['metric'].items() if m['status']=='active' and key not in selected
+             and (ratio:=m['definition'].get('ratio'))
+             and {ratio['numerator']['metric_id'],ratio['denominator']['metric_id']}<=selected]
+    if related:result['review_candidates']=related;metrics.extend(related)
     if metrics:result['standards']=standard_material(metrics,standard)
+    result['cell_requirements']=cell_requirements([m['id'] for m in result['standards']['metrics']],standard)
     if issues:result['program_issues']=issues
     questions=semantic_questions(binding,tables,snapshot,standard)
     if questions:result['semantic_questions']=questions
     previous=[{'id':row['id'],**issue} for answer in prior_reviews for row in answer.get('tables',[]) for issue in row.get('issues',[])]
     if previous:result['previous_issues']=previous
+    if 'semantic_candidates' in snapshot and snapshot.get('semantic_formula_sources',0)>=4:
+        result['text_evidence']=review_text_evidence(tables,snapshot,context)
+        result['evidence_rule']=REVIEW_EVIDENCE_RULE
+    if standard.get('_complete_identity'):
+        result['identity_collection_version']=1
+        result.pop('text_evidence',None)
+        result['evidence_rule']='只引用source实际提供的原文及共同引用；跨表与同文的业务适用性由识别核查确认，程序仅检验引用内容存在。'
     return result
 
 
@@ -967,6 +1193,7 @@ def focused_review_payload(payload, focus, standard):
     metrics.extend(result.get('review_candidates',[]))
     _require(all(m in standard['metric'] and standard['metric'][m]['status']=='active' for m in metrics),'核查候选指标无效')
     result['standards']=standard_material(metrics,standard)
+    if 'cell_requirements' in result:result['cell_requirements']=cell_requirements(metrics,standard)
     result['review_focus']=deepcopy(focus)
     for key in ('program_issues','semantic_questions','previous_issues'):
         relevant=[]
@@ -988,20 +1215,36 @@ def focused_review_payload(payload, focus, standard):
     return result
 
 
+def scoped_read_tables(snapshot, b_scope, b_outline):
+    from .表格编排 import scoped_subtables
+    detailed={d['subtable_id'] for d in b_scope['details']}
+    tables=[deepcopy(r) for t in scoped_subtables(b_outline,b_scope) if t['id'] in detailed for r in t['ranges']]
+    if snapshot.get('semantic_formula_sources',0)>=4:
+        from .B范围定位 import location_payload
+        previews={s['sheet']:s['preview_range'] for s in location_payload(snapshot,[],[])['sheets']}
+        # 定位读过的同表公共说明继续交给语义系统，不能在切入子表时丢失。
+        for table in tables:
+            table['context_ranges']=list(dict.fromkeys([*table.get('context_ranges',[]),previews[table['sheet']]]))
+    return tables
+
+
 def semantic_read_input(snapshot, context, b_scope=None, b_outline=None):
     """A读整份，B读已定位范围；后续选标准、绑定和核查共用。"""
     tables=None
     if b_scope is not None:
-        from .表格编排 import scoped_subtables
         snapshot['semantic_candidates']=set(b_scope['candidate_locations'])
         snapshot['semantic_known_targets']=deepcopy(b_scope['targets'])
-        detailed={d['subtable_id'] for d in b_scope['details']}
-        tables=[r for t in scoped_subtables(b_outline,b_scope) if t['id'] in detailed for r in t['ranges']]
+        tables=scoped_read_tables(snapshot,b_scope,b_outline)
     material,_=source_material(snapshot,context,tables)
     payload={'task':'a_semantic_read','source':material}
     if b_scope is not None:
         payload['candidate_locations']=b_scope['candidate_locations']
         payload['located_reading']=[{'id':d['subtable_id'],'structure':d['structure']} for d in b_scope['details']]
+        if snapshot.get('semantic_formula_sources',0)>=4:
+            # 初读只定编排；逐表绑定和核查仍由source_material提供完整公式依据。
+            if snapshot['semantic_formula_sources']==4:material.pop('公式引用依据',None)
+            payload['reading_ranges']=tables
+            payload['range_rule']='每个tables.range须在reading_ranges列出的range内；公共表头或说明只填context_ranges，不并入或扩大tables.range。表范围须覆盖全部candidate_locations；data_ranges只列其中的实际财务格，其他候选仍须由后续共同语义流程确认标签身份并核查，不能丢弃候选。不能据预览追加候选。'
     return payload
 
 
@@ -1011,14 +1254,20 @@ def validate_scoped_reading(answer, snapshot, b_scope=None, b_outline=None):
         return deepcopy(answer)
     reading=validate_reading(answer,snapshot)
     if b_scope is not None:
-        from .表格编排 import in_ranges, scoped_subtables
-        detailed={d['subtable_id'] for d in b_scope['details']}
-        allowed=[r for t in scoped_subtables(b_outline,b_scope) if t['id'] in detailed for r in t['ranges']]
+        from .表格编排 import in_ranges
+        tables=scoped_read_tables(snapshot,b_scope,b_outline)
+        allowed=[{'sheet':t['sheet'],'range':area} for t in tables for area in [t['range'],*t.get('context_ranges',[])]]
         for table in reading['tables']:
-            _require(all(in_ranges(table['sheet'],a,allowed) for a in addresses(table['range'])), 'B阅读超出已定位范围')
-            _require(all(in_ranges(table['sheet'],a,allowed) for span in table.get('context_ranges',[]) for a in addresses(span)), 'B公共说明超出已展示范围')
+            _require(all(in_ranges(table['sheet'],a,tables) for a in addresses(table['range'])), 'B阅读超出已定位范围：'+table['sheet']+'!'+table['range'])
+            _require(all(in_ranges(table['sheet'],a,allowed) for span in table.get('context_ranges',[]) for a in addresses(span)), 'B公共说明超出已展示范围：'+table['sheet']+'!'+str(table.get('context_ranges')))
         actual={t['sheet']+'!'+a for t in reading['tables'] for r in t['data_ranges'] for a in addresses(r)}
-        _require(actual==set(b_scope['candidate_locations']), 'B阅读遗漏必要候选或增加了无关数据格')
+        expected=set(b_scope['candidate_locations'])
+        if snapshot.get('semantic_formula_sources',0)>=4:
+            covered={t['sheet']+'!'+a for t in reading['tables'] for a in addresses(t['range'])}
+            _require(expected<=covered and actual<=expected,
+                     'B阅读遗漏必要候选或增加了无关数据格：遗漏候选='+str(sorted(expected-covered))+'；多出数据='+str(sorted(actual-expected)))
+        else:
+            _require(actual==expected, 'B阅读遗漏必要候选或增加了无关数据格')
     return reading
 
 
@@ -1057,225 +1306,537 @@ def semantic_groups(tables, saved_groups):
     return groups
 
 
-def recognize_a(engine, source, context, progress=None, artifact_metadata=None, previous_result=None, *, b_scope=None, b_outline=None):
-    """A/B共用：读原文→按语义检索→按范围确认→核查已有结果。保留旧A协议兼容。"""
-    from .语义 import SemanticCancelled
-    snapshot=read_workbook(source,context=context);materialize_candidate_blanks(snapshot)
-    snapshot['semantic_formula_sources']=3
-    snapshot['semantic_slot_bindings']=True
-    engine.source_hash=snapshot['sha256']
-    previous=None;origin_cache={}
-    carrier='B' if b_scope is not None else 'A'
-    proof_key='semantic_reading' if b_scope is not None else 'a_semantic_reading'
-    if previous_result:
-        from .统一勾稽 import load_fact_mapping
-        candidate=json.loads(Path(previous_result).read_text(encoding='utf-8-sig'))
-        if candidate.get(proof_key) and candidate.get('source_hash')==snapshot['sha256'] and candidate.get('source_context')==context:
-            previous=load_fact_mapping(previous_result,engine.standard)
-            if previous.get('source_identities'):
-                # 只沿用已验真的原文阅读；旧“最近标准”检索和文字绑定均须修正。
-                for field in ('selection','selection_additions','batches'):previous[proof_key][field]=[]
-    read_input=semantic_read_input(snapshot,context,b_scope,b_outline)
-    if b_scope is not None:
-        from .B样式复用 import prepare_reuse
-        prepare_reuse(snapshot,b_scope,b_outline,engine.standard)
-    proof={'reading':[],'reading_check':[],'selection':[],'selection_additions':[],'batches':[]};timings=[];batches=[]
-    def request(prompt,payload,validator):
-        start=len(engine._review_receipts);before=dict(engine.usage);clock=time.perf_counter()
-        previous_mode=engine.settings.get('thinking_mode','default')
-        actual_mode=previous_mode
-        engine.settings['thinking_mode']=actual_mode
-        try:return engine._request(prompt.replace('A','B') if b_scope is not None else prompt,payload,validator)
-        finally:
-            engine.settings['thinking_mode']=previous_mode
-            timings.append({'task':payload['task'],'thinking_mode':actual_mode,'seconds':round(time.perf_counter()-clock,3),
-                            'usage':{k:v-before.get(k,0) for k,v in engine.usage.items()}})
-    engine.log(carrier+'：先读原文及各表语义，本步不发送金标准')
-    start=len(engine._review_receipts)
-    prompt=READ_PROMPT
-    if b_scope is not None:prompt+='\n已按待更新文件需要定位并比较；本次只读所给范围。data_ranges必须且只能覆盖candidate_locations，其他格用于理解上下文；不扩大为整本来源文件发证，不把范围外金额当作漏识别。每张表可增加context_ranges:[同一工作表内的公共表头或说明范围]，须来自已展示原文；不同业务表不因共用表头合并。实际含义以本次原文为准。'
-    no_candidates=b_scope is not None and not b_scope['candidate_locations']
-    reading=({'tables':[],'notes':'未找到必要候选，原A需要继续保留。'} if no_candidates else
-             request(prompt,read_input,lambda x:validate_scoped_reading(x,snapshot,b_scope,b_outline)))
-    proof['reading']=stage_proofs(engine,start)
-    questions=reading_questions(reading,snapshot)
-    if questions:
-        engine.log(carrier+'：只补读数字范围或文字业务角色尚有疑点的子表：'+str(len(questions))+'个')
-        start=len(engine._review_receipts)
-        answer=request(READ_CHECK_PROMPT,reading_check_payload(reading,questions,snapshot,context),
-                       lambda x: (apply_reading_check(reading,x,questions,snapshot),x)[1])
-        proof['reading_check']=stage_proofs(engine,start)
-        reading=apply_reading_check(reading,answer,questions,snapshot)
-        validate_scoped_reading(reading,snapshot,b_scope,b_outline)
-    destination=engine.work_dir/(carrier+'简洁语义进度')/str(time.time_ns())
-    destination.mkdir(parents=True)
-    def publish(final=False):
-        _require(file_hash(source)==snapshot['sha256'] and file_hash(engine.gold_path)==engine.gold_hash,'识别期间原件或标准发生变化')
-        result=assemble(snapshot,context,engine.standard,reading,batches,b_scope,b_outline,require_identity=True)
-        result.update(schema_version=2,gold_path=engine.gold_path,gold_hash=engine.gold_hash,source_path=snapshot['path'],
-                      source_hash=snapshot['sha256'],source_context=context,
-                      stage_timings=deepcopy(timings),usage=dict(engine.usage),
-                      request_receipts=proof['reading']+proof['reading_check']+proof['selection']+proof['selection_additions']+[p for b in proof['batches'] for k in ('binding','prior_reviews','review') for p in b.get(k,[])])
-        result[proof_key]=deepcopy(proof)
-        result['identity_version']=1
-        result['cell_identity_version']=1
-        result['formula_source_version']=3
-        result['slot_binding_version']=1
-        if b_scope is not None:
-            result['dimension_vocabulary_version']=1
-            result['style_reuse_version']=1
-        if b_scope is None:result['recognition_scope']={'mode':'a_semantics'}
-        result.update(deepcopy(artifact_metadata or {}))
-        path=destination/(('B语义映射.json' if b_scope is not None else '整份A语义映射.json') if final else f'进度_{time.time_ns()}.json')
-        result['mapping_path']=str(path);engine._save(path,result)
-        if progress:progress(result)
-        return result
-    publish()
-    if no_candidates:return publish(final=True)
-    engine.log(carrier+'：按已经读出的语义，在金标准简明目录中查找对应定义')
-    start=len(engine._review_receipts)
-    select_input=selection_payload(reading,snapshot,engine.standard);select_prompt=SELECT_PROMPT
-    same_selection=(previous or {}).get('gold_hash')==engine.gold_hash and (b_scope is None or
-        all(previous.get('recognition_scope',{}).get(k)==v for k,v in b_scope.items() if k!='coverage'))
-    if same_selection and previous.get(proof_key,{}).get('selection'):
-        old_task,_=_stage_receipt(previous[proof_key]['selection'][0],previous,'a_semantic_select')
-        select_input=old_task['payload'];select_prompt=old_task['system']
-    selection=request(select_prompt,select_input,lambda x:validate_selection(x,reading,engine.standard))
-    proof['selection']=stage_proofs(engine,start)
-    selected={r['id']:r for r in selection['tables']}
-    detailed=set(selected) if '原表文字' in select_input else set()
-    for reference in ((previous or {}).get(proof_key,{}).get('selection_additions',[]) if same_selection else []):
-        task,answer=_stage_receipt(reference,previous,'a_semantic_select')
-        addition=validate_selection(answer,task['payload']['reading'],engine.standard)
-        selected.update((r['id'],r) for r in addition['tables']);detailed.update(r['id'] for r in addition['tables'])
-        proof['selection_additions'].append(deepcopy(reference))
-    reviewed=set()
-    for batch in (previous or {}).get(proof_key,{}).get('batches',[]):
-        origin=batch_origin(batch,previous,origin_cache)
-        for reference in batch['review']:
-            _,answer=_stage_receipt(reference,origin,'a_semantic_review')
+def checked_reading(mapping):
+    """核实全部子表都有完整核查记录，不把中断进度当作全表起点。"""
+    proof=mapping.get('semantic_reading') or mapping.get('a_semantic_reading',{})
+    if not proof.get('reading'):return None
+    _,reading=_stage_receipt(proof['reading'][0],mapping,'a_semantic_read')
+    reviewed=set();origins={}
+    for batch in proof.get('batches',[]):
+        origin=batch_origin(batch,mapping,origins)
+        for ref in batch.get('prior_reviews',[])+batch.get('review',[]):
+            _,answer=_stage_receipt(ref,origin,'a_semantic_review')
+            if answer.get('incomplete') or any(not isinstance(r,dict) or not isinstance(r.get('issues'),list) for r in answer['tables']):return None
             reviewed.update(r['id'] for r in answer['tables'] if isinstance(r,dict) and isinstance(r.get('issues'),list))
-    pending=[t for t in reading['tables'] if t['id'] not in detailed|reviewed]
-    if pending:
-        partial={'tables':pending}
-        engine.log(carrier+'：仅给尚未核查的子表补充原表项目名称，避免概括遗漏相关标准：'+str(len(pending))+'张')
-        start=len(engine._review_receipts)
-        addition=request(SELECT_PROMPT,selection_payload(partial,snapshot,engine.standard),lambda x:validate_selection(x,partial,engine.standard))
-        proof['selection_additions'].extend(stage_proofs(engine,start))
-        selected.update((r['id'],r) for r in addition['tables'])
-    selection={'tables':[selected[t['id']] for t in reading['tables']]}
-    # 已确认科目的新子表共用材料；旧已核查分组保持原状，不为分组变化重跑。
-    saved_groups={}
-    for saved in (previous or {}).get(proof_key,{}).get('batches',[]):
-        if not saved['review']:continue
-        origin=batch_origin(saved,previous,origin_cache)
-        task,_=_stage_receipt(saved['binding'][0],origin,'a_semantic_bind')
-        _,answer=_stage_receipt(saved['review'][0],origin,'a_semantic_review')
-        tables=task['payload']['reading']
-        if (all(t in reading['tables'] for t in tables) and
-            {t['id'] for t in answer.get('tables',[]) if isinstance(t,dict) and isinstance(t.get('issues'),list)}=={t['id'] for t in tables}):
-            saved_groups[tables[0]['id']]=tables
-    groups=semantic_groups(reading['tables'],saved_groups)
-    for tables in groups:
-        engine._check_cancel()
-        payload,aliases=binding_payload(tables,selection,snapshot,context,engine.standard,reading_notes=reading.get('notes',''))
-        reused=False;saved_first=None
-        for saved in (previous or {}).get(proof_key,{}).get('batches',[]):
-            origin=batch_origin(saved,previous,origin_cache)
-            task,binding=_stage_receipt(saved['binding'][0],origin,'a_semantic_bind')
-            if task['payload']['reading']!=tables:continue
-            # 已验真的旧请求可能包含较宽的候选；候选精简不使已有成果失效。
-            old_payload=task['payload']
-            old_source,_=source_material(snapshot,context,tables,semantic_only='数值处理' in old_payload['source'])
-            supplied=[m['id'] for m in old_payload['standards']['metrics']]
-            if old_payload['standards']!=standard_material(supplied,engine.standard):continue
-            if old_payload.get('style_templates')!=payload.get('style_templates'):continue
-            if (old_payload.get('style_templates')==payload.get('style_templates') and
-                old_payload['source']==old_source and {m['id'] for m in payload['standards']['metrics']}<=set(supplied)):
-                payload=deepcopy(old_payload)
-            binding=validate_bindings(binding,tables,snapshot,context,engine.standard,candidate=True)
-            earlier=[];known_questions=[]
-            for reference in saved.get('prior_reviews',[]):
-                prior_task,old_review=_stage_receipt(reference,origin,'a_semantic_review')
-                known_questions.extend(prior_task['payload'].get('semantic_questions',[]))
-                old_review=validate_review(old_review,tables,snapshot,context,prior_task['payload'].get('review_focus'))
-                binding=reviewed_binding(binding,old_review,tables,snapshot);earlier.append(old_review)
-            current_review=None
-            if saved['review']:
-                old_review_task,current_review=_stage_receipt(saved['review'][0],origin,'a_semantic_review')
-                known_questions.extend(old_review_task['payload'].get('semantic_questions',[]))
-                current_review=validate_review(current_review,tables,snapshot,context,old_review_task['payload'].get('review_focus'))
-            if task['payload']==payload and origin['gold_hash']==engine.gold_hash:
-                saved_first=(reviewed_binding(binding,current_review,tables,snapshot) if current_review else binding,
-                             deepcopy(saved['binding']),deepcopy(saved.get('prior_reviews',[])+saved['review']),earlier+([current_review] if current_review else []))
-            if not saved['review']:continue
-            if task['payload']!=payload or {r['id'] for r in current_review['tables']}!={t['id'] for t in tables}:continue
-            checked=carry_role_corrections(current_review,earlier)
-            if any(set(table_packet(t,snapshot,context)['candidate_cells'])-
-                   set(review_for_table(next(r for r in checked['tables'] if r['id']==t['id']),t,table_packet(t,snapshot,context),aliases)['checked_cells']) for t in tables):continue
-            # 全范围身份已核查；父项维度的通用提醒不构成新错误，不能因补查使用自然语言就重查整表。
-            questions=[q for q in semantic_questions(binding,tables,snapshot,engine.standard)
-                       if q.get('check')!='same_identity_different_rows' and not (q.get('dimension') and not q.get('check'))]
-            questions+=duplicate_identity_questions(reviewed_binding(binding,current_review,tables,snapshot),tables,snapshot,engine.standard)
-            if any(q not in known_questions for q in questions):continue
-            retained=deepcopy(saved)
-            if origin['gold_hash']!=engine.gold_hash:
-                retained['reused_from']={'path':previous['mapping_path'],'sha256':previous['mapping_hash']}
-            proof['batches'].append(retained);batches.append((binding,current_review,earlier))
-            engine.usage['reused_confirmed_tables']=engine.usage.get('reused_confirmed_tables',0)+len(tables)
-            engine.log(carrier+'：沿用已完成核查的子表，已有未决原样保留：'+'、'.join(t['subject'] for t in tables))
-            reused=True;break
-        if reused:continue
-        engine.log(carrier+'：确认这些完整子表的共同语义及行列差异：'+'、'.join(t['subject'] for t in tables))
-        start=len(engine._review_receipts)
-        try:
-            if saved_first:
-                binding,binding_proofs,prior_proofs,earlier=saved_first
-                engine.usage['reused_first_tables']=engine.usage.get('reused_first_tables',0)+len(tables)
-                engine.log(carrier+'：沿用已有第一轮，只处理其核查问题')
-            else:
-                prior_proofs=[];earlier=[]
-                binding=request(BIND_PROMPT,payload,lambda x:validate_bindings(x,tables,snapshot,context,engine.standard,candidate=True,require_identity=True))
-                binding_proofs=stage_proofs(engine,start)
-                _,raw_binding=_stage_receipt(binding_proofs[0],{'source_hash':snapshot['sha256'],'gold_hash':engine.gold_hash},'a_semantic_bind')
-                reused_cells=sum(len(row.get('style_reuse',[])) for row in raw_binding['tables'])
-                if reused_cells:
-                    engine.usage['style_reused_cells']=engine.usage.get('style_reused_cells',0)+reused_cells
-                    engine.log(carrier+'：已沿用五样式中的指标及固定业务范围：'+str(reused_cells)+'格；本次上下文另行绑定')
-        except SemanticCancelled:raise
-        except Exception as error:
-            engine.log('本组请求失败，停止扩量并保留已完成结果：'+engine._redact(str(error)));publish();break
-        review_payload=review_material(payload,binding,tables,snapshot,context,engine.standard,earlier)
-        review_payload.setdefault('reading_notes',deepcopy(reading.get('notes','')))
-        explicit=[r for answer in earlier for r in answer.get('tables',[]) if 'checked_ranges' in r]
-        if explicit:
-            focus={t['id']:sorted(set(table_packet(t,snapshot,context)['candidate_cells'])-
-                {a for r in explicit if r['id']==t['id'] for span in r['checked_ranges'] for a in addresses(span)}) for t in tables}
-            if any(focus.values()):review_payload=focused_review_payload(review_payload,focus,engine.standard)
-        engine.log(carrier+'：核查这些表已确定的含义及目标覆盖，不重新生成身份')
-        start=len(engine._review_receipts)
-        def check_review(answer):
-            answer=validate_review(answer,tables,snapshot,context,review_payload.get('review_focus'),require_identity=True)
-            _require(all(isinstance(row.get('issues'),list) for row in answer['tables']),'核查必须明确返回issues数组，只有表号不等于已经核查')
-            validate_bindings(reviewed_binding(binding,answer,tables,snapshot),tables,snapshot,context,engine.standard)
-            index={t['id']:t for t in tables}
-            for row in answer['tables']:
-                table=index[row['id']]
-                apply_role_corrections({},row,table,table_packet(table,snapshot,context),engine.standard,aliases)
-            return deepcopy(answer)
-        failed_review=False
-        try:
-            review=request(REVIEW_PROMPT,review_payload,check_review)
-            if review.get('incomplete'):
-                engine.log('核查仅返回部分有效子表，保留实际记录；缺少部分仍未核查，停止续发')
-                failed_review=True
-        except SemanticCancelled:raise
-        except Exception as error:
-            engine.log('本组核查未完成，保留原结果及未决：'+engine._redact(str(error)));review={'tables':[]};failed_review=True
-        proof['batches'].append({'binding':binding_proofs,'prior_reviews':prior_proofs,'review':stage_proofs(engine,start)})
-        batches.append((binding,review,earlier));publish()
-        if failed_review:break
-    return publish(final=True)
+    return reading if {t['id'] for t in reading['tables']}<=reviewed else None
+
+
+def correction_scope(mapping, *, gold_hash=None):
+    """只有全部子表已核查才纠正实际未决，整份最多一轮。"""
+    proof=mapping.get('semantic_reading') or mapping.get('a_semantic_reading',{})
+    if not mapping.get('unresolved') or (proof.get('correction_pass') and proof.get('correction_rules_hash')==correction_rules_hash()
+                                        and (gold_hash is None or gold_hash==mapping['gold_hash'])):return {}
+    reading=checked_reading(mapping)
+    if reading is None:return {}
+    pending={(r['sheet'],r['cell']) for r in mapping['unresolved']}
+    return {t['id']:cells for t in reading['tables']
+            if (cells:=sorted(a for a in addresses(t['range']) if (t['sheet'],a) in pending))}
+
+
+def correction_rules_hash():
+    return definition_hash({'read':READ_PROMPT,'read_check':READ_CHECK_PROMPT,'select':SELECT_PROMPT,'bind':BIND_PROMPT,'review':REVIEW_PROMPT})
+
+
+def scope_material(snapshot, context):
+    """范围认识保留所有行列文字；公式身份留给必要候选的完整识别。"""
+    material,_=source_material({**snapshot,'semantic_formula_sources':0},context)
+    for sheet in material['sheets']:
+        grouped=[];start=end=None;previous=None
+        for line in sheet['rows'].splitlines():
+            number,body=line.split(': ',1);number=int(number)
+            if body==previous and number==end+1:
+                end=number
+                continue
+            if start is not None:grouped.append(f'{start}'+(f'-{end}' if end!=start else '')+': '+previous)
+            start=end=number;previous=body
+        if start is not None:grouped.append(f'{start}'+(f'-{end}' if end!=start else '')+': '+previous)
+        sheet['rows']='\n'.join(grouped)
+    material['行号说明']='连续重复行写为起行-止行，该范围内每一行的列值完全相同；没有删除任何行。仅认识范围，不据此确认公式格身份。'
+    return material
+
+
+def _compact_coordinate_ranges(addresses):
+    """只合并同列连续坐标，展开后保留全部原位置。"""
+    columns = {}
+    for address in addresses:
+        column, row, _, _ = range_boundaries(address)
+        columns.setdefault(column, []).append(row)
+    result = []
+    for column, rows in sorted(columns.items()):
+        rows = sorted(rows); start = end = rows[0]; prefix = get_column_letter(column)
+        for row in rows[1:] + [None]:
+            if row is not None and row == end + 1: end = row; continue
+            result.append(f'{prefix}{start}' if start == end else f'{prefix}{start}:{prefix}{end}')
+            if row is not None: start = end = row
+    return result
+
+
+def compact_formula_material(snapshot, material):
+    """逐格保留实际公式，只合并重复的来源文字。"""
+    proof=material.get('公式引用依据',{})
+    locations=set(material.get('公式原文',{}))|set(proof.get('原文',{}))|set(proof.get('共同行列文字',{}))|set(proof.get('引用',{}))
+    if not locations:return material
+    formulas={};sheets=[]
+    for sheet in snapshot['sheets']:
+        cells={a:c for a,c in sheet['cells'].items() if sheet['name']+'!'+a in locations}
+        if not cells:continue
+        sheets.append({**sheet,'cells':cells})
+        for address,cell in cells.items():
+            if not cell.get('formula'):continue
+            formulas[sheet['name']+'!'+address]=cell['formula']
+    unresolved = {}
+    for item in proof.get('未展开', []):
+        sheet, address = item['位置'].rsplit('!', 1)
+        attributes = {k: v for k, v in item.items() if k != '位置'}
+        key = (sheet, json.dumps(attributes, ensure_ascii=False, sort_keys=True))
+        group = unresolved.setdefault(key, {**attributes, '位置': []})
+        group['位置'].append(address)
+    for (sheet, _), group in unresolved.items():
+        group['位置'] = [sheet + '!' + address for address in _compact_coordinate_ranges(group['位置'])]
+    sources=scope_material({**snapshot,'sheets':sheets},[])
+    result={k:v for k,v in material.items() if k not in {'公式原文','公式引用依据'}}
+    result['公式及来源']={'公式原文':formulas,'来源行列原文':sources['sheets'],
+        '行号说明':sources['行号说明'],'未展开':list(unresolved.values()),
+        '公式写法':'逐格列出实际公式，不需要展开相对偏移；未展开位置中的连续范围包含范围内全部格。所有递归引用来源及共用文字保留在来源行列原文中。'}
+    return result
+
+
+DIRECT_PROMPT = """按完整上下文和相关金标准识别本次每个待更新格。只回答每个格子对应哪个金标准，以及该格的维度实际取值、期间、来源和原文依据。使用金标准已有编号和维度名，不计算或填写金额；空白财务格同样识别。原文已明确指标含义而具体名称、成员或其他维度取值未提供时，仍给出该格已确定的金标准编号；未知只记在相关维度，不把维度取值缺失当作指标无法识别，不把空白成员改成全体或合计。原文的总体、明细、其中项及例外分别如实保留，不能用当前明细名单替代总体，不反用标准缩小原文范围。未知及与标准的差异照实保存在该格结果中，不补造，不另作核查或重答。"""
+
+CELL_IDENTITY_OUTPUT = ('槽位编号、维度定义、维度实际值是三层：metric_id选择本格计量槽位，维度ID选择金标准已有属性，属性下保存本格原文实际值；不得互相替代，也不以维度值缺失否定已确定槽位。'
+    '答复只包含本次各格的金标准对应结果，每格独立写明原位置及本次识别字段的实际取值；'
+    '金标准对应的是本格自身承载的业务含义和计量值。指标格按指标定义的economic_object、measure、value_type及time_kind判断；'
+    '维度格按自身维度定义的meaning、value_type及取值规则判断，不套用指标定义字段。'
+    '不能只因表题或项目名提到某指标，就把仅列示名称、表头或说明的格子当成该指标的金额或比例数据格；'
+    '本格承载维度值时使用现有维度标准dimension_id，并独立给出本格自己的具名维度实际值及依据；不能借用数据格身份或从owner_reference、共同声明和标签引用中推导。'
+    '没有适用的指标或维度标准时如实给出相应编号为null及本格依据。财务数据格的原值为空或具体成员未知则仍按已明确含义选择指标。'
+    '共同上下文由你读懂并分别落实到各格自己的身份，不能交付待展开规则或后续执行安排。'
+    '只回答请求字段，未请求的指标、期间、来源及其他字段沿用，不重述或重新裁定。'
+    '直接交付每格已经确定的身份证字段：指标标准使用metric_id，维度标准使用dimension_id，每格只选自身对应的一个金标准；维度使用金标准原始ID，期间角色使用template_period_role。'
+    '使用对象或字段列时，原位置字段沿用location，维度分组字段沿用dimensions，分组内仍逐项以金标准原始维度ID为字段名保存实际值；不要把未具名的取值对象直接放进dimensions，也不要用通用id/value或dimension_id/value列表代替具名维度字段。本格金标准dimension_id独立声明，不能由维度分组里的属性ID代替；逐格结果直接列出，不另加自命名的外层包装。'
+    'A、B交付和保存共用上述字段名；本次请求的字段逐格直接交付，无法确定时仍用原字段写null并另列依据，不能用省略代替未知。'
+    '字段名和实际取值由你直接给出，不用字段别名或解释文字代替，不要求程序从自然语言中推导、翻译或补成身份证。'
+    '实际取值遵循所给金标准的value_type和meaning：currency使用原文币种的三位大写代码，unit_scale使用数值；'
+    '标准列有allowed_values时使用其中的准确取值；期间按金标准说明保留实际日期或实际起止日期，不能只写期初期末等角色。'
+    '槽位的定义、所引用维度的定义和本格实际值分别理解，维度定义说明本维度描述什么，不能抄成该格实际值。'
+    'A、B共用所给金标准原文；先依据各自完整原文判断本格对应的槽位、描述该槽位的维度及实际值，同一含义沿用同一标准表达。'
+    '语义相同与否由你在本次识别中判断，程序只保存你直接写出的字段并比较身份证，不会理解或改写同义句。'
+    '已有身份用于沿用本方正确结果；识别B时，A需要中已经按本次金标准保存的实际值用于统一相同含义的表达。'
+    '本方原文支持同一含义时，直接采用该已有值的原字段写法及实际内容，不另造一个同义表达；双方事实不同或未知时照实保留，不能复制另一方事实。'
+    '标准没有规定的答复包装或额外字段不能成为填写要求；未知只影响相关维度，不能为了凑齐字段放弃槽位或其他已知值。'
+    'selection使用含mode的取值对象，'
+    '按金标准含义确定all、members、predicate或complement，并保存实际成员、条件或补集范围，不用类别字符串代替selection对象。'
+    '请求template_period_role时，它只记录本格原文所指的期间角色：closing为期末、opening为期初、current为本期、prior为上期；'
+    '这是执行用户换期要求的既有字段，不是新增金标准，不替代period中的实际期间。不能确定时给null，理由另列。'
+    '原文引用、证据坐标、公式和解释另列为该格依据，不混入身份字段的实际取值。'
+    '完整识别或本次字段列有label_references时，逐格给出本方维度的标签原文引用：'
+    '使用既有label_references字段，按金标准维度ID分别保存本方原文坐标列表；是否属于本格由你依据完整上下文判断。'
+    '它只记录本格维度的原文依据，不是可搬运文本或A位置取B位置的安排，不能据此更新被引用的其他格。引用未知照实保留，不按相邻位置补造。'
+    '只请求label_references时，只给每格这项引用，已有指标、维度实际值和期间角色不重答。'
+    '不能合并格子、共用取值、写“同上”或让程序按行列展开。'
+    '不得另给A/B位置对应、取数指令、名单编排或写回安排。'
+    '文字、列表或表格均可，不限定JSON或固定模板。')
+
+
+def _with_declared_context(mapping, ranges):
+    """定向范围沿用模型已指定的共同阅读引用，不按内容判断适用性。"""
+    declared=[table for group in mapping.get('正常入口范围认识',{}).get('ranges',[])
+              for table in group.get('tables',[group])]
+    result=[]
+    for area in ranges:
+        refs=list(area.get('context_references',[]));owned=set(addresses(area['range']))
+        for table in declared:
+            if table['sheet']==area['sheet'] and owned.intersection(addresses(table['range'])):
+                refs.extend(table.get('context_references',[]))
+        result.append({**area,'context_references':list({json.dumps(ref,sort_keys=True):ref for ref in refs}.values())})
+    return result
+
+
+def recognize_list_relations(engine, a, b, config, destination):
+    """旧名单入口接回B逐格识别，只更新明确指定的身份字段。"""
+    dimension=config['list_dimension']
+    _require(dimension in engine.standard['dimension'] and
+             engine.standard['dimension'][dimension]['value_type']=='selection','名单维度须来自金标准')
+    field_scope=deepcopy(config.get('b_field_scope') or {
+        area['sheet']+'!'+area['range']:[dimension] for area in config['b_source_ranges']})
+    metadata={key:deepcopy(config[key]) for key in
+        ('update_purpose','comparison_requirements','a_required_ranges','b_source_ranges') if key in config}
+    metadata.update(carrier='B',normal_entry=True,field_scope=field_scope,
+        additional_context=str(config.get('b_additional_context','') or ''))
+    if config.get('b_source_images'):metadata['source_images']=deepcopy(config['b_source_images'])
+    result=recognize_a(engine,b['source_path'],b.get('source_context',[]),artifact_metadata=metadata,
+        previous_result=b['mapping_path'],target_mapping=a,allowed_metrics=config.get('b_allowed_metrics'),
+        source_snapshot=deepcopy(b['机械记录']))
+    destination=Path(destination);destination.mkdir(parents=True,exist_ok=True)
+    answer_path=destination/'B识别答复.txt'
+    answer_path.write_text(result.get('答复接入来源',{}).get('本次原答复',result['识别答复']),encoding='utf-8-sig')
+    from .A合集 import direct_recognition_status
+    status=direct_recognition_status(result)
+    return {'status':status,'message':('B指定格识别字段已完整接入并保存。' if status=='complete' else 'B指定格原答复和已接入字段已保存；识别尚未完整接入，未重答。'),
+        'files':{'b_mapping':result['mapping_path'],'recognition_answer':str(answer_path)},'usage':dict(engine.usage)}
+
+
+def recognize_a(engine, source, context, progress=None, artifact_metadata=None, previous_result=None, *, b_scope=None, b_outline=None, target_mapping=None, sheets=None, allowed_metrics=None, target_table=None, source_snapshot=None):
+    """A/B各进行一次直接识别；旧分轮辅助函数仅供历史成果读取。"""
+    metadata = artifact_metadata or {}
+    carrier = metadata.get('carrier', 'B' if target_mapping is not None or b_scope is not None else 'A')
+    field_scope=metadata.get('field_scope')
+    period_labels_only=bool(field_scope and
+        'period只补明确的原表标签引用，不改日期' in metadata.get('additional_context','') and
+        all(set(fields)<={'period','template_period_role'} for fields in field_scope.values()))
+    snapshot = source_snapshot if source_snapshot is not None else read_workbook(source, context=context)
+    materialize_candidate_blanks(snapshot)
+    snapshot['semantic_formula_sources'] = 5
+    snapshot['semantic_identity_version'] = 2
+    previous=None;execution=None;original_collections={}
+    if previous_result:
+        stored=json.loads(Path(previous_result).read_text(encoding='utf-8-sig'))
+        if stored.get('schema')=='附注更新执行记录-v1':
+            from .A合集 import resume_direct_output, direct_digest
+            _require(carrier=='A','更新执行记录仅用于A副本接续')
+            if not field_scope:
+                requested=([target_table['sheet']+'!'+cell for area in target_table['data_ranges'] for cell in addresses(area)]
+                    if target_table else list(stored.get('template_layout',{}).get('added',{})))
+                field_scope={loc:['metric_id','dimension_id','template_period_role',*engine.standard['dimension']] for loc in requested}
+            previous,execution,original_collections=resume_direct_output(previous_result,snapshot,context,engine.standard,field_scope)
+            if not field_scope:
+                destination=engine.work_dir/('直接识别_'+str(time.time_ns()))
+                destination.mkdir(parents=True)
+                path=destination/'A识别结果.json'
+                previous.update(usage=dict(engine.usage),mapping_path=str(path.resolve()))
+                previous['封存校验']=direct_digest(previous)
+                engine._save(path,previous)
+                return previous
+        elif field_scope:
+            from .统一勾稽 import load_fact_mapping
+            previous=load_fact_mapping(previous_result,engine.standard)
+        else:
+            previous=stored
+    selected = None
+    if sheets is not None:
+        _require(set(sheets) <= {s['name'] for s in snapshot['sheets']}, '指定工作表不存在')
+        selected = [{'sheet': s['name'], 'range': f'A1:{get_column_letter(s["max_column"])}{s["max_row"]}'}
+                    for s in snapshot['sheets'] if s['name'] in sheets]
+    if carrier=='B' and metadata.get('b_source_ranges'):
+        selected=[{**area,'data_ranges':[],'read_full_rows':True} for area in metadata['b_source_ranges']]
+    if target_table is not None:
+        target_table = deepcopy(target_table)
+        sheet = next(s for s in snapshot['sheets'] if s['name'] == target_table['sheet'])
+        targets = [a for span in target_table['data_ranges'] for a in addresses(span)]
+        _require(bool(targets) and len(targets) == len(set(targets)), '固定目标为空或重复')
+        _require(set(targets) <= set(addresses(target_table['range'])) <= set(addresses(
+            f'A1:{get_column_letter(sheet["max_column"])}{sheet["max_row"]}')), '固定目标越出原表范围')
+        selected = [target_table]
+    if field_scope and not selected:
+        # 多表字段补交也保留完整二维网格；作答位置仍只由原字段范围限定。
+        requested_sheets={area.rsplit('!',1)[0].strip("'") for area in field_scope if '!' in area}
+        if not requested_sheets and len(snapshot['sheets'])==1:requested_sheets={snapshot['sheets'][0]['name']}
+        selected=[{'sheet':s['name'],'range':f'A1:{get_column_letter(s["max_column"])}{s["max_row"]}',
+                   'data_ranges':[]} for s in snapshot['sheets'] if s['name'] in requested_sheets]
+    if selected and previous and previous.get('source_hash')==snapshot['sha256']:
+        selected=_with_declared_context(previous,selected)
+    if period_labels_only and carrier=='A':
+        requested={sheet+'!'+cell for span in field_scope for sheet,area in [span.rsplit('!',1)] for cell in addresses(area)}
+        named=[area for areas in snapshot.get('names',{}).values() for area in areas
+               if any(area['sheet']+'!'+cell in requested for cell in addresses(area['range']))]
+        if named:selected=named
+    if carrier=='B' and target_mapping is None:
+        material=scope_material(snapshot,context)
+    else:
+        direct_formula_input=carrier=='B'
+        reading_snapshot=({**snapshot,'semantic_formula_sources':4}
+                          if direct_formula_input else snapshot)
+        material, _ = source_material(reading_snapshot, context, selected)
+        if carrier=='B':
+            proof=material.get('公式引用依据',{})
+            material=compact_formula_material(reading_snapshot,material)
+            if direct_formula_input and '公式及来源' in material:
+                material['公式及来源']['未递归数值计算']=deepcopy(proof.get('未递归数值计算',[]))
+                material['公式及来源']['说明']=proof.get('说明','')
+                material['公式及来源']['公式写法']=material['公式及来源']['公式写法'].replace(
+                    '所有递归引用来源及共用文字保留在来源行列原文中。',
+                    '保留直接引用和标题公式链，不展开数值公式下层，具体范围见本段说明。')
+    if selected and (carrier!='B' or target_mapping is not None):
+        # 作答范围不能裁掉父项说明；按工作表保留原文，不由程序挑选适用文字。
+        context_sheets={area['sheet'] for area in selected}
+        requested={}
+        for span in field_scope or []:
+            sheet,area=span.rsplit('!',1);requested.setdefault(sheet,set()).update(addresses(area))
+        if not requested:
+            for area in selected:requested.setdefault(area['sheet'],set()).update(addresses(area['range']))
+        references=formula_source_material({**snapshot,'semantic_formula_sources':4},requested)
+        context_sheets.update(location.rsplit('!',1)[0]
+            for field in ('原文','共同行列文字') for location in references.get(field,{}))
+        complete_ranges=[{'sheet':sheet['name'],'range':f'A1:{get_column_letter(sheet["max_column"])}{sheet["max_row"]}'}
+                         for sheet in snapshot['sheets'] if sheet['name'] in context_sheets]
+        complete,_=source_material({**snapshot,'semantic_formula_sources':1},context,complete_ranges)
+        material['完整工作表原文']={key:complete[key] for key in ('sheets','公式原文','原有表区') if key in complete}
+        material['完整工作表原文']['说明']='目标工作表及直接引用涉及工作表的完整原文和公式；仅作上下文，不扩大本次逐格作答范围。'
+    gold_text = Path(engine.gold_path).read_text(encoding='utf-8-sig')
+    # 只去除旧转换及历史样例，指标与维度定义的原行保持完整。
+    definitions = '\n'.join(line for line in gold_text.splitlines() if line.strip()
+        and (lambda row: row.get('record_type') == 'dimension' or
+             row.get('record_type') == 'metric' and row.get('status') == 'active')(json.loads(line)))
+    if allowed_metrics is not None:
+        related = standard_material([key for key in allowed_metrics if key in engine.standard['metric']], engine.standard)
+        ids = {r['id'] for kind in ('metrics', 'dimensions') for r in related[kind]}
+        ids.update(key for key in allowed_metrics if key in engine.standard['dimension'])
+        if field_scope:ids.update(key for fields in field_scope.values() for key in fields)
+        definitions = '\n'.join(line for line in definitions.splitlines() if json.loads(line)['id'] in ids)
+    material['载体']=carrier
+    material['源文件']={'path':snapshot['path'],'sha256':snapshot['sha256']}
+    materials = {'原文.json': material, '金标准.jsonl': definitions}
+    if selected:
+        from .表格文字 import workbook_table_text
+        materials['本次原表网格.txt']=workbook_table_text(snapshot,selected)
+    if metadata.get('update_purpose'):materials['本次明确更新要求.json']=deepcopy(metadata['update_purpose'])
+    prompt = DIRECT_PROMPT + (' A、B只通过唯一、相同的金标准身份证连接；本次完成本方身份识别，'
+        '不要另给“A位置取B位置”的对应表；同义判断须在本次识别中完成，不能另交同义对照表让程序解释。'
+        '确属同一含义时使用相同的标准维度取值表示，原文及其差异保留为依据；'
+        '未确定的内容留在识别结果中，不交给后续程序猜测或选择。')
+    if metadata.get('normal_entry'):
+        prompt += ' 在每格身份中明确本期、上期、期初或期末角色（template_period_role），实际日期仍照实保留；该格的期间依据注明原表标签位置和原文。'
+    if metadata.get('comparison_requirements'):
+        materials['用户明确的比较排除.json']=metadata['comparison_requirements']
+        prompt += ' 用户明确排除的维度只是不参与本次对应，双方实际身份仍分别保存，不能因被排除维度不同拒绝已要求的搬运关系。'
+    if metadata.get('既有另一方身份参照'):
+        materials['既有另一方身份证表达.json'] = deepcopy(metadata['既有另一方身份参照'])
+        prompt += (' 已保存另一方身份仅供同一金标准实际取值的表达参照；依据本方完整原文判断，'
+                   '确属相同含义且符合金标准时，在本次识别中直接沿用同一实际取值对象，'
+                   '不要另造同义表达或交给程序转换。本方原文不同或未知时照实保留；'
+                   '主体、报告范围、实际日期及单位仍依本方原文，不能为对应抄写另一方事实。')
+    if target_table is not None:
+        materials['原文.json']['固定目标'] = target_table
+        prompt += ' 本次范围已由固定目标给出，保留全部指定位置，不重新圈范围。'
+    if metadata.get('target_tables'):
+        materials['原文.json']['范围认识声明的候选表区']=metadata['target_tables']
+    if carrier == 'B':
+        prompt += ' 原文.json是B来源，A原表.json及A原表网格.txt是A模板；表内A、B、C等是各自的原列号，不能把A模板的列位置套到B来源。本次只回答B身份，A材料仅说明更新需要。'
+        if target_mapping is None:
+            prompt = '了解整份B各科目和子表的用途、位置与边界。按工作表列出各子表的行列范围、相关共同说明和明显的主体期间差异，包括空白模板。现在只保存目录认识，不逐格识别、不选金标准、不判定最终对应。简洁作答，文字或表格均可，不要求固定格式。'
+            materials.pop('金标准.jsonl')
+        else:
+            _require(target_mapping['gold_hash']==engine.gold_hash,'A需要与本次识别没有使用同一金标准')
+            prompt += ' 本次识别B：依据A需要及本次明确更新要求确定必要范围。要求名单随B更新时，指定名单范围中的新成员也属于需要，不能因A没有同名成员而排除；仍只处理本次指定范围和字段。A只说明查找需要，B坐标和身份均依据B自己的原文，不沿用A的行列号。同一范围的认识复用，未找到的需要照实保留。'
+            prompt += ' 依据本方完整原文和所给金标准确定各格身份。双方原文在同一金标准字段下含义相同时，使用A已保存且符合金标准的同一实际取值；selection的mode、成员或条件及对象结构均保持相同，不另写同义表达，程序不会替你合并同义身份。双方原文不同或无法确定时照实保留，不能为了对应抄写A事实。'
+            if not field_scope:
+                prompt += ' 请逐格完成候选格的识别，各格分别给出所选槽位及其维度实际取值，使用金标准维度名，不用表结构描述代替实际取值。'
+            materials['A需要.json'] = {'载体':'A','目标表区':deepcopy(metadata.get('a_required_ranges',[])),
+                **direct_reference(target_mapping,compact=True,ranges=metadata.get('a_required_ranges'))}
+            if not period_labels_only:
+                snapshot_a=target_mapping['机械记录'];requested=metadata.get('a_required_ranges',[])
+                owned={area['sheet']+'!'+cell for area in requested for cell in addresses(area['range'])}
+                named={name:areas for name,areas in snapshot_a.get('names',{}).items()
+                       if not requested or any(area['sheet']+'!'+cell in owned for area in areas for cell in addresses(area['range']))}
+                tables=[area for areas in named.values() for area in areas]
+                if not tables and requested:
+                    tables=[{'sheet':row['sheet'],'range':row['range']} for row in target_mapping.get('outline',{}).get('subtables',[])
+                            if any(row['sheet']+'!'+cell in owned for cell in addresses(row['range']))]
+                context_a=[row for row in target_mapping.get('source_context',[])
+                           if not requested or not named or isinstance(row,str) or isinstance(row,dict) and (not row.get('sheet') or row.get('range_name') in named)]
+                reference_ranges=tables or requested or [{'sheet':s['name'],
+                    'range':f'A1:{get_column_letter(s["max_column"])}{s["max_row"]}'} for s in snapshot_a['sheets']]
+                materials['A原表.json'],_=source_material(snapshot_a,context_a,reference_ranges)
+                materials['A原表.json']['载体']='A'
+                materials['A原表.json']['源文件']={'path':snapshot_a['path'],'sha256':snapshot_a['sha256']}
+                from .表格文字 import workbook_table_text
+                materials['A原表网格.txt']=workbook_table_text(snapshot_a,reference_ranges)
+                prompt += (' 同次识别明确每个B数据格的身份证和期间原文依据。按用户要求换期时，明确期初、期末、本期、上期角色，两个合集分别保留原实际日期；不能根据旧日期相等改变角色。'
+                    '名单中的成员及其计量字段也分别保存各格身份，新增成员不能因A没有同名成员而遗漏。'
+                    'A、B的连接只凭相同身份证。缺少标准或原文时在相应格说明具体问题，不编编号。')
+    else:
+        prompt += ' 本次识别A：覆盖本次原文全部待更新财务格，包括待填空白。'
+    if previous_result:
+        if execution:
+            materials['上次搬运记录.json']={key:deepcopy(execution[key]) for key in
+                ('output_path','output_hash','collections','update_purpose','comparison_requirements',
+                 'template_layout','operations','retained_values')}
+            if selected:
+                owned={area['sheet']+'!'+cell for area in selected for cell in addresses(area['range'])}
+                layout=materials['上次搬运记录.json']['template_layout']
+                layout['positions']={old:new for old,new in layout['positions'].items() if new in owned}
+                layout['added']={loc:row for loc,row in layout.get('added',{}).items() if loc in owned}
+                materials['上次搬运记录.json']['本次位置范围']=deepcopy(selected)
+            materials['上次搬运记录.json']['完整记录']={'path':str(previous_result),'sha256':file_hash(previous_result)}
+            for side,saved in original_collections.items():
+                from .A合集 import _records
+                known_ranges=([{'sheet':loc.rsplit('!',1)[0],'range':loc.rsplit('!',1)[1]}
+                    for loc,row in _records(saved) if any(row.get(key) in allowed_metrics for key in ('metric_id','dimension_id'))] if allowed_metrics else None)
+                materials['上次'+side+'原判断.json']=direct_reference(saved,compact=True,ranges=known_ranges)
+                source_sheets={area['sheet'] for area in known_ranges or []}
+                complete_ranges=([{'sheet':s['name'],'range':f'A1:{get_column_letter(s["max_column"])}{s["max_row"]}'}
+                    for s in saved['机械记录']['sheets'] if s['name'] in source_sheets] if side=='B' and source_sheets else None)
+                # 原工作表及逐格公式完整保留，不重复嵌入递归来源副本。
+                materials['上次'+side+'原文.json'],_=source_material(
+                    {**saved['机械记录'],'semantic_formula_sources':1},saved['source_context'],complete_ranges)
+            prompt += (' 上次搬运记录只说明实际动作，两边原判断和原文分别保留。'
+                '本次只识别指定位置自己的金标准身份；不能把模板格、另一方身份或搬运记录当成新格的身份。'
+                '已保存的旧格身份仅随明确版式移动复用，没有要求重跑其他范围。')
+        if previous is not None and (previous.get('source_hash') == snapshot['sha256'] and previous.get('gold_hash') == engine.gold_hash
+                and previous.get('source_context') == context):
+            if previous.get('recognition_method') != 'direct':
+                materials['已有结果.json'] = direct_reference(previous)
+                prompt += ' 已有结果仍适用的部分直接复用；缺项照实保留，不重新安排一轮核查。'
+    if field_scope:
+        _require(previous is not None and previous.get('recognition_method')=='direct'
+                 and previous.get('source_hash')==snapshot['sha256'] and previous.get('gold_hash')==engine.gold_hash,
+                 '字段纠正须使用同一原件及金标准的已有直接识别合集')
+        materials['本次字段范围.json']={'载体':carrier,'字段范围':field_scope}
+        materials['已有身份.json']=direct_reference(previous,compact=True,
+            ranges=[{'sheet':area.rsplit('!',1)[0],'range':area.rsplit('!',1)[1]} for area in field_scope]
+            if all('!' in area for area in field_scope) else None)
+        if period_labels_only:
+            from .A合集 import _records
+            selected_locations={sheet+'!'+cell for area in field_scope
+                                for sheet,span in [area.rsplit('!',1)] for cell in addresses(span)}
+            materials['已有期间只读参照.json']={location:deepcopy(row['dimensions']['period'])
+                for location,row in _records(previous)
+                if location in selected_locations and 'period' in row['dimensions']}
+            prompt = ('本次只补字段范围内每格身份的期间原文依据。'
+                '每格分别指出原表标签坐标及标签原文。'
+                '已有期间只作只读参照，不按日期反推标签，不重答日期、编号或其他身份维度。'
+                '只依据本方原文及明确的行列关系，包括空白数据格；未能明确的对应关系照实保留。'
+                '原有表区是提取时保留的子表边界，不能把前一张表的标题沿用到后一张表；行上的期间文字也可能是标签。'
+                '使用自然文字即可，不要求JSON或固定模板。')
+            if any('template_period_role' in fields for fields in field_scope.values()):
+                prompt += ' 对列有template_period_role的范围，同时明确本期、上期、期初或期末角色；只补标签的格不重答角色。'
+        else:
+            prompt += f' 本次字段范围只列{carrier}端需要识别的字段，不是另一方的目标位置。本次只识别其中列明的坐标和字段，使用金标准已有维度名；未列出的正确内容由保存入口沿用，无需重答。给出实际取值，未知照实保留，不用“按各行选取”等描述代替。'
+    request_materials=({key:value for key,value in materials.items() if key!='A需要.json'}
+                       if period_labels_only else materials)
+    if field_scope and all(set(fields)<={'period','template_period_role','entity','report_scope','currency','unit_scale'} for fields in field_scope.values()) and not period_labels_only and not metadata.get('source_targets'):
+        request_materials={key:value for key,value in materials.items() if key not in ('A需要.json','A原表.json','A原表网格.txt')}
+        prompt=('本次逐格识别字段范围列明的身份取值，其他已有结果复用。'
+            '依据本方整份材料的报告信息和各表原文判断共同说明是否适用，包括实际期间、主体、币种、口径；不能借用另一方事实。'
+            '使用所给金标准字段名，每格分别写明本格实际取值，不另作核查或重答。')
+        if metadata.get('additional_context'):prompt+='\n'+metadata['additional_context']
+    source_targets=metadata.get('source_targets')
+    if metadata.get('normal_entry') and 'A需要.json' in request_materials:
+        request_materials['B原文.json']=request_materials.pop('原文.json')
+        prompt+=' B身份和位置以B原文为准；A原表及A需要只说明更新目标，A的单位、日期与共同说明不属于B事实。'
+    if 'A原表.json' in request_materials:
+        prompt+=' A原表中“本次读取范围”是本次目标；原Word正文中的其他表区引用仅供上下文，同名标题也不能改接范围外的表。'
+    if metadata.get('additional_context') and metadata['additional_context'] not in prompt:
+        prompt+='\n本次具体要求：'+metadata['additional_context']
+    if '本次原表网格.txt' in request_materials:
+        from .表格文字 import TABLE_STRUCTURE_READING
+        prompt+=TABLE_STRUCTURE_READING
+    if metadata.get('source_images'):
+        _require(all(image.get('source_hash')==snapshot['sha256'] for image in metadata['source_images']),
+                 '原表图片不属于本次原件，未发送识别')
+        request_materials['原表图片.json']=deepcopy(metadata['source_images'])
+        prompt+=' 所附原表图片保留实际版式；先依据目标位置与图中行列、合并表头确认本格，再按同一金标准直接给出本格身份。标色只定位作答对象，不表示金标准或维度值；其他位置仍只作上下文。'
+    if target_table is not None:
+        request_materials['本次作答位置.json']={'载体':carrier,'位置':[target_table['sheet']+'!'+cell
+            for area in target_table['data_ranges'] for cell in addresses(area)]}
+        prompt+=' 本次作答位置单独列在材料末尾；location使用其中所列原位置，不添加A或B等载体前缀。原文中的其他坐标仅作证据，不另选作答位置。'
+    if carrier != 'B' or target_mapping is not None:
+        prompt+='\n'+CELL_IDENTITY_OUTPUT
+    if field_scope:
+        prompt+='\n本次字段范围按每格分别限定作答：未列metric_id或dimension_id的位置，只补其已保存身份证的属性，不重新为该格选择标准，也不能把待补字段名填作本格标准编号。列有标准编号的位置，才按所给原文和金标准选择该格自身的标准。本次指定字段不能适用或不能确定时，仍用该原字段给null并另列本方依据，不改写未请求字段。'
+    answer = engine.request_text(prompt, request_materials)
+    _require(file_hash(source) == snapshot['sha256'] and file_hash(engine.gold_path) == engine.gold_hash,
+             '识别期间原件或金标准已变化；原答复已经保留')
+    record = {**metadata, 'schema_version': 2, 'recognition_method': 'direct', 'carrier': carrier,
+              'source_path': snapshot['path'], 'source_hash': snapshot['sha256'], 'source_context': context,
+              'gold_path': engine.gold_path, 'gold_hash': engine.gold_hash,
+              '原文材料': material, '金标准原文': definitions,
+              '识别答复': answer, '答复指纹': definition_hash(answer),
+              'usage': dict(engine.usage), 'recognition_scope': {'mode': 'b_outline' if carrier == 'B' and target_mapping is None else 'direct'}}
+    if target_table is not None:
+        record['target_table'] = target_table
+    if target_mapping is not None and 'A需要.json' in materials:
+        record['A需要'] = materials['A需要.json']
+    destination = engine.work_dir / ('直接识别_' + str(time.time_ns()))
+    path = destination / (carrier + '识别结果.json')
+    if source_targets:
+        from .A合集 import save_direct_answer
+        base={**previous,'target_table':target_table,'target_tables':deepcopy(metadata.get('target_tables',[])),
+              'source_targets':deepcopy(source_targets),
+              'b_source_ranges':deepcopy(metadata.get('b_source_ranges',[])),
+              'a_required_ranges':deepcopy(metadata.get('a_required_ranges',[]))}
+        identity_scope=field_scope or {area['sheet']+'!'+area['range']:
+            ['metric_id','dimension_id','template_period_role',*engine.standard['dimension']]
+            for area in metadata.get('b_source_ranges',[])}
+        _require(identity_scope,'B身份识别缺少本次已定位的B范围；不能改为保存A/B位置对应')
+        result=save_direct_answer({**base,'usage':dict(engine.usage)},answer,path,
+            field_scope=identity_scope,withdrawn=metadata.get('withdrawn'),snapshot=previous['机械记录'],
+            standard=engine.standard,target_mapping=target_mapping)
+        result['本次关系答复']=answer
+        return result
+    if record['recognition_scope']['mode'] != 'b_outline':
+        from .A合集 import save_direct_answer
+        if field_scope:
+            base=deepcopy(previous)
+            base.update(usage=dict(engine.usage),**metadata)
+            if execution:base['原文材料']=material
+            if target_mapping is not None:base['A需要']=materials['A需要.json']
+            base['source_context']=list({json.dumps(row,ensure_ascii=False,sort_keys=True):row
+                for row in [*context,*previous['source_context']]}.values())
+            base['金标准原文']='\n'.join(dict.fromkeys((previous['金标准原文']+'\n'+definitions).splitlines()))
+            base['封存定义原文']=base['金标准原文'].splitlines()
+            record=save_direct_answer(base,answer,path,field_scope=field_scope,
+                withdrawn=metadata.get('withdrawn'),snapshot=previous['机械记录'],standard=engine.standard,
+                target_mapping=target_mapping)
+        else:
+            record = save_direct_answer(record, answer, path, snapshot=snapshot, standard=engine.standard)
+    else:
+        destination.mkdir(parents=True)
+        record['mapping_path'] = str(path)
+        engine._save(path, record)
+    if progress:
+        progress(record)
+    return record
+
+
+def direct_reference(record, *, compact=False, ranges=None):
+    """只搬运已保存的结果，不重建、补齐或解释旧身份。"""
+    if compact:
+        from .A合集 import _records
+        owned={area['sheet']+'!'+cell for area in ranges or [] for cell in addresses(area['range'])}
+        selected=lambda loc:not ranges or loc in owned
+        needs=[{'location':loc,**{key:row[key] for key in ('metric_id','dimension_id') if row.get(key)},'dimensions':deepcopy(row['dimensions']),
+                **({'missing_dimensions':deepcopy(row['missing_dimensions'])} if row.get('missing_dimensions') else {})}
+               for loc,row in _records(record) if selected(loc)]
+        def without_original(value):
+            if isinstance(value,dict):return {k:without_original(v) for k,v in value.items() if k!='original'}
+            if isinstance(value,list):return [without_original(v) for v in value]
+            return deepcopy(value)
+        def kept_ranges(spans,sheet):
+            kept=[]
+            for span in spans:
+                cells=list(addresses(span));chosen=[cell for cell in cells if selected(sheet+'!'+cell)]
+                kept.extend([span] if chosen==cells else chosen)
+            return kept
+        tables=[]
+        for table in record.get('outline',{}).get('subtables',[]):
+            copied={'sheet':table['sheet'],'metrics':[],'dimensions':[]}
+            for kind in ('metrics','dimensions'):
+                for row in table.get(kind,[]):
+                    if not (kind=='metrics' and 'template_period_role' in row or
+                            kind=='dimensions' and row.get('id')=='template_period_role'):continue
+                    declared=[part for span in row['ranges'] for part in
+                              (table['data_ranges'] if span=='*' else [span])]
+                    spans=kept_ranges(declared,table['sheet'])
+                    if not spans:continue
+                    item={**without_original(row),'ranges':spans}
+                    # 已声明的坐标映射只裁切范围；未分配的角色列表保持原样。
+                    if isinstance(item.get('template_period_role'),dict):
+                        item['template_period_role']={part:role for span,role in item['template_period_role'].items()
+                            for part in ([cell for area in spans for cell in addresses(area)
+                                if re.fullmatch(span+r'\d+',cell)] if re.fullmatch(r'[A-Z]+',span)
+                                else kept_ranges([span],table['sheet']))}
+                    copied[kind].append(item)
+            if copied['metrics'] or copied['dimensions']:tables.append(copied)
+        return {'source_hash':record['source_hash'],'gold_hash':record['gold_hash'],'需要':needs,
+                'outline':{'subtables':tables},
+                'unresolved':[without_original(row) for row in record.get('unresolved',[]) if
+                    not row.get('sheet') or not row.get('cell') or selected(row['sheet']+'!'+row['cell'])],
+                'source_identities':[deepcopy(row) for row in record.get('source_identities',[]) if selected(row['source_reference']['location'])]}
+    fields = ('carrier', 'source_hash', 'gold_hash', 'recognition_method', '识别答复',
+              'outline', 'facts', 'slot_bindings', 'source_identities', 'unresolved',
+              '已确认关系', '完整性')
+    return {key: deepcopy(record[key]) for key in fields if key in record}
 
 
 def supplied_review_standards(original, supplied, standard):
@@ -1293,6 +1854,7 @@ def verify_mapping(mapping, standard, *, rebuild=False):
     from .语义 import _stable_content
     from .统一语义 import read_standard_v2
     historical=deepcopy(standard) if standard['sha256']==mapping['gold_hash'] else read_standard_v2(mapping['gold_path'])
+    historical['_historical_material']=mapping.get('formula_source_version',0)<5
     historical['_historical_report_scope']=mapping.get('cell_identity_version')!=1
     _require(historical['sha256']==mapping['gold_hash'],'原识别标准已经改变')
     context=mapping.get('source_context',[])
@@ -1340,8 +1902,9 @@ def verify_mapping(mapping, standard, *, rebuild=False):
             task,_=_stage_receipt(reference,mapping,'a_semantic_select')
             partial=task['payload']['reading']
             _require(all(t==index.get(t['id']) for t in partial['tables']),'补检索改变了原表理解')
-            addition=validate_selection(read([reference],'a_semantic_select',SELECT_PROMPT,
-                selection_payload(partial,snapshot,historical,include_basis=any('basis' in m for m in task['payload']['catalog']))),partial,historical)
+            select_input=selection_payload(partial,snapshot,historical,include_basis=any('basis' in m for m in task['payload']['catalog']))
+            if 'selection_questions' in task['payload']:select_input['selection_questions']=task['payload']['selection_questions']
+            addition=validate_selection(read([reference],'a_semantic_select',SELECT_PROMPT,select_input),partial,historical)
             selected.update((r['id'],r) for r in addition['tables'])
         selection={'tables':[selected[t['id']] for t in reading['tables']]}
         for item in proof['batches']:
@@ -1354,14 +1917,24 @@ def verify_mapping(mapping, standard, *, rebuild=False):
                                       reading_notes=reading.get('notes','') if 'reading_notes' in task['payload'] else None)
             # 按该次回执实际提供的候选重建，补充同对象候选后不能使已合法保存的旧结果失效。
             supplied=[m['id'] for m in task['payload']['standards']['metrics']]
-            required={m for r in selection['tables'] if r['id'] in {t['id'] for t in tables} for m in r['metric_ids']}
-            _require(required<=set(supplied),'实际请求遗漏了所选标准')
             payload['standards']=standard_material(supplied,historical)
+            if 'cell_requirements' in task['payload']:payload['cell_requirements']=cell_requirements(supplied,historical)
+            else:payload.pop('cell_requirements',None)
             binding=validate_bindings(read(item['binding'],'a_semantic_bind',BIND_PROMPT,payload),tables,snapshot,context,historical,candidate=True)
             earlier=[]
+            seen={t['id']:{a:set(supplied) for a in table_packet(t,snapshot,context)['candidate_cells']} for t in tables}
+            def record_definitions(answer,review_task):
+                ids={m['id'] for m in review_task['payload']['standards']['metrics']}
+                _,review_aliases=source_material(snapshot,context,tables)
+                for row in answer['tables']:
+                    table=next(t for t in tables if t['id']==row['id'])
+                    checked=review_for_table(row,table,table_packet(table,snapshot,context),review_aliases)
+                    for address in checked['checked_cells']:seen[row['id']][address].update(ids)
             for reference in item.get('prior_reviews',[]):
                 old_task,_=_stage_receipt(reference,receipt_mapping,'a_semantic_review')
                 prior_payload={**payload,'task':'a_semantic_review','recognized':binding}
+                if 'text_evidence' in old_task['payload']:
+                    prior_payload.update(text_evidence=review_text_evidence(tables,snapshot,context),evidence_rule=REVIEW_EVIDENCE_RULE)
                 if 'reading_notes' in old_task['payload']:prior_payload['reading_notes']=deepcopy(reading.get('notes',''))
                 if old_task['payload'].get('共同声明合并'):
                     prior_payload.update(recognized=shared_binding(binding),共同声明合并=True)
@@ -1369,13 +1942,19 @@ def verify_mapping(mapping, standard, *, rebuild=False):
                 if 'review_candidates' in old_task['payload']:prior_payload['review_candidates']=old_task['payload']['review_candidates']
                 if focus is not None:prior_payload=focused_review_payload(prior_payload,focus,historical)
                 prior_payload['standards']=supplied_review_standards(prior_payload['standards'],old_task['payload']['standards'],historical)
+                if 'cell_requirements' in old_task['payload']:
+                    prior_payload['cell_requirements']=cell_requirements([m['id'] for m in prior_payload['standards']['metrics']],historical)
+                else:prior_payload.pop('cell_requirements',None)
                 for key in ('program_issues','semantic_questions','previous_issues','返回骨架'):
                     if key in old_task['payload']:prior_payload[key]=old_task['payload'][key]
                 old_review=validate_review(read([reference],'a_semantic_review',REVIEW_PROMPT,prior_payload),tables,snapshot,context,focus)
+                record_definitions(old_review,old_task)
                 binding=reviewed_binding(binding,old_review,tables,snapshot);earlier.append(old_review)
             review_payload={**payload,'task':'a_semantic_review','recognized':binding}
             if item['review']:
                 old_task,_=_stage_receipt(item['review'][0],receipt_mapping,'a_semantic_review')
+                if 'text_evidence' in old_task['payload']:
+                    review_payload.update(text_evidence=review_text_evidence(tables,snapshot,context),evidence_rule=REVIEW_EVIDENCE_RULE)
                 if 'reading_notes' in old_task['payload']:review_payload['reading_notes']=deepcopy(reading.get('notes',''))
                 if old_task['payload'].get('共同声明合并'):
                     review_payload.update(recognized=shared_binding(binding),共同声明合并=True)
@@ -1383,6 +1962,9 @@ def verify_mapping(mapping, standard, *, rebuild=False):
                 if 'review_candidates' in old_task['payload']:review_payload['review_candidates']=old_task['payload']['review_candidates']
                 if focus is not None:review_payload=focused_review_payload(review_payload,focus,historical)
                 review_payload['standards']=supplied_review_standards(review_payload['standards'],old_task['payload']['standards'],historical)
+                if 'cell_requirements' in old_task['payload']:
+                    review_payload['cell_requirements']=cell_requirements([m['id'] for m in review_payload['standards']['metrics']],historical)
+                else:review_payload.pop('cell_requirements',None)
                 if 'program_issues' in old_task['payload']:
                     # 诊断文案只是辅助提示；原始文案由任务哈希保护，业务原文、标准、身份及结果仍重新核验。
                     review_payload['program_issues']=old_task['payload']['program_issues']
@@ -1391,6 +1973,17 @@ def verify_mapping(mapping, standard, *, rebuild=False):
                 if 'previous_issues' in old_task['payload']:review_payload['previous_issues']=old_task['payload']['previous_issues']
             review=validate_review(read(item['review'],'a_semantic_review',REVIEW_PROMPT,
                 review_payload),tables,snapshot,context,review_payload.get('review_focus')) if item['review'] else {'tables':[]}
+            if item['review']:record_definitions(review,old_task)
+            final_binding=reviewed_binding(binding,review,tables,snapshot)
+            _,review_aliases=source_material(snapshot,context,tables)
+            for row in final_binding['tables']:
+                table=next(t for t in tables if t['id']==row['id'])
+                try:records=checked_records(row,table,table_packet(table,snapshot,context),historical,review_aliases)
+                except (ValueError,KeyError,TypeError):continue
+                for address,record in records.items():
+                    if record['kind'] in {'metric_fact','partial_metric_fact'}:
+                        fact=record.get('fact',record.get('partial_semantics'))
+                        _require(fact['metric_id'] in seen[row['id']][address],'本格身份缺少实际发送的完整标准：'+row['id']+'!'+address)
             batches.append((binding,review,earlier))
     else:_require(not proof['batches'],'尚未检索标准不能已有身份结果')
     expected=assemble(snapshot,context,historical,reading,batches,b_scope,b_outline,require_identity=mapping.get('identity_version')==1)

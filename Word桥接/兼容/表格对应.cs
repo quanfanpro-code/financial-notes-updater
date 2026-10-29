@@ -9,10 +9,13 @@ namespace 附注工具.核心;
 // XML位置从0开始；Word编号和逻辑网格位置从1开始，三者不能混用。
 public sealed record WordCellPosition(string TargetId, int XmlRowIndex, int XmlCellIndex,
     int WordRowIndex, int WordColumnIndex, int GridStartColumn, int GridSpan,
-    int GridBefore, string? VerticalMerge, string Text);
+    int GridBefore, int RowEndColumn, string? VerticalMerge, string Text);
 
 public sealed record WordTableLayout(int WordRowCount, int WordColumnCount, IReadOnlyList<WordCellPosition> Cells)
 {
+    public bool HasOmittedColumns => Cells.Any(c => c.GridBefore != 0)
+        || Cells.Any(c => c.RowEndColumn < Cells.Max(other => other.RowEndColumn));
+
     public static WordTableLayout Read(TableInfo table)
     {
         XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
@@ -27,8 +30,6 @@ public sealed record WordTableLayout(int WordRowCount, int WordColumnCount, IRea
             || e.Name == w + "cellIns" || e.Name == w + "cellDel" || e.Name == w + "cellMerge")
             || rows.SelectMany(r => r.Elements(w + "trPr").Descendants()).Any(e => e.Name == w + "ins" || e.Name == w + "del"))
             throw new InvalidDataException("表格含有行或单元格结构修订，需先确认采用的表格结构。");
-        if (rows.Any(r => ((int?)r.Element(w + "trPr")?.Element(w + "gridAfter")?.Attribute(w + "val") ?? 0) != 0))
-            throw new InvalidDataException("这张表省略了行尾网格，当前尚未取得该结构的Word编号对照。");
         var cells = new List<WordCellPosition>();
         var activeMerges = new HashSet<(int Start, int Span)>();
         int wordRow = 0, wordColumns = 0;
@@ -36,6 +37,7 @@ public sealed record WordTableLayout(int WordRowCount, int WordColumnCount, IRea
         {
             var rowCells = rows[r].Elements(w + "tc").ToArray();
             var before = (int?)rows[r].Element(w + "trPr")?.Element(w + "gridBefore")?.Attribute(w + "val") ?? 0;
+            var rowEnd = before + rowCells.Sum(c => (int?)c.Element(w + "tcPr")?.Element(w + "gridSpan")?.Attribute(w + "val") ?? 1);
             var gridColumn = before + 1;
             var nextMerges = new HashSet<(int Start, int Span)>();
             wordColumns = Math.Max(wordColumns, rowCells.Length);
@@ -56,7 +58,7 @@ public sealed record WordTableLayout(int WordRowCount, int WordColumnCount, IRea
                 if (merge is not null) nextMerges.Add((gridColumn, span));
                 if (!continued)
                     cells.Add(new WordCellPosition($"{table.Id}/tr/{r}/tc/{c}", r, c, wordRow, c + 1,
-                        gridColumn, span, before, mergeValue, string.Concat(rowCells[c].Descendants(w + "t").Select(t => t.Value))));
+                        gridColumn, span, before, rowEnd, mergeValue, string.Concat(rowCells[c].Descendants(w + "t").Select(t => t.Value))));
                 gridColumn += span;
             }
             activeMerges = nextMerges;
@@ -172,14 +174,12 @@ public static class TableMapper
         foreach(var group in layout.Cells.GroupBy(c=>c.XmlRowIndex))
         {
             var first=group.First();
-            if(first.GridBefore==0) continue;
-            int end=Array.IndexOf(edges,first.GridBefore+1);
-            if(end<0) return "行首省略位置没有对应的网格边界。";
             int row=region.FirstRow+(physicalRows?first.XmlRowIndex:first.WordRowIndex-1);
-            int lastColumn=region.FirstColumn+end-1;
-            if(region.Cells.Any(c=>c.Row==row && c.Column<=lastColumn && (c.Text.Length>0 || c.IsFormula)))
+            int start=region.FirstColumn+Array.IndexOf(edges,first.GridBefore+1);
+            int end=region.FirstColumn+Array.IndexOf(edges,first.RowEndColumn+1)-1;
+            if(region.Cells.Any(c=>c.Row==row && (c.Column<start || c.Column>end) && (c.Text.Length>0 || c.IsFormula)))
                 return "Excel在Word原本省略的位置填写了数据，不能忽略或补造该单元格。";
-            if(region.Merges.Any(m=>m.FirstRow<=row && m.LastRow>=row && m.FirstColumn<=lastColumn && m.LastColumn>=region.FirstColumn))
+            if(region.Merges.Any(m=>m.FirstRow<=row && m.LastRow>=row && (m.FirstColumn<start || m.LastColumn>end)))
                 return "Excel合并范围跨越Word原本省略的位置，不能更改原表格结构。";
         }
         var expectedMerges=new HashSet<MergeRegion>();

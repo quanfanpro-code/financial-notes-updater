@@ -3,6 +3,9 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+if '--无界面' in sys.argv:
+    from 附注更新.无界面 import main
+    raise SystemExit(main(sys.argv[1:]))
 try:
     from 附注更新.界面 import main
     main()

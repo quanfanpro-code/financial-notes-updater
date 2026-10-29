@@ -12,6 +12,18 @@ def 响应(内容, 类型):
 
 
 class 模型传输收尾(unittest.TestCase):
+    def test_完整对象后多余结束符可留痕恢复且不接受第二个内容(self):
+        from 附注更新.语义 import _repair_complete_response,SemanticError
+        raw='{"tables":[{"id":"任意表","data_ranges":["D8:E9"]}]}'
+        for tail in ('}',']}', '}}', ']\n }'):
+            with self.subTest(tail=tail):
+                result,repairs=_repair_complete_response(raw+tail)
+                self.assertEqual(result,{'tables':[{'id':'任意表','data_ranges':['D8:E9']}]})
+                self.assertEqual(repairs,[{'kind':'extra_root_object_closer','removed':tail}])
+        for tail in ('[', '}{"another":true}', '{"another":true}','改成其他来源', ']false'):
+            with self.subTest(tail=tail),self.assertRaises(SemanticError):_repair_complete_response(raw+tail)
+        with self.assertRaises(ValueError):_repair_complete_response(raw[:-1])
+
     def test_完整返回原样读取(self):
         数据 = {'choices': [{'message': {'content': '{"完成":true}'}, 'finish_reason': 'stop'}]}
         原文 = json.dumps(数据, ensure_ascii=False).encode('utf-8')

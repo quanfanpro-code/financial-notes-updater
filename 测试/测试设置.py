@@ -361,6 +361,16 @@ class 设置测试(unittest.TestCase):
             app.values["a_prime_mapping"].set(str(linked_map));app.values["word"].set("无关Word.docx")
             app.use_updated_a()
             self.assertEqual(app.values["word_path"].get(),"真正新Word.docx")
+            execution=folder/"执行记录.json"
+            execution.write_text(json.dumps({"schema":"附注更新执行记录-v1","output_path":str(prime),
+                "a_link":str(link),"collections":{"A":{"mapping_path":"原A"},"B":{"mapping_path":"原B"}}}),encoding="utf-8")
+            app.values["a_prime_mapping"].set(str(execution))
+            app.use_updated_a()
+            self.assertEqual(app.values["a_path"].get(),str(prime))
+            self.assertEqual(app.values["a_mapping"].get(),"")
+            self.assertEqual(app.values["a_prime_mapping"].get(),str(execution))
+            self.assertEqual(app.current_step,"recognize_a")
+            self.assertIsNone(app.worker)
         finally:_destroy_test_window(root)
 
     def test_程序内金标准与分别补充信息迁移(self):

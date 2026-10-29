@@ -62,26 +62,38 @@ class 正式槽位对应测试(unittest.TestCase):
         unbound=api.compare_semantic_slots(a,b,standard)
         self.assertFalse(unbound['complete']);self.assertEqual(unbound['issues'][0]['kind'],'unbound_identity')
 
-    def test_普通对应入口只输出语义且保留明确写入的原入口(self):
+    def test_旧候选记录可查看但写入不重启旧流程(self):
         case=勾稽夹具.MatchTests();case.setUp();root,gold,paths=case.file_fixture()
         for carrier,path in zip(('A','B'),paths):
             record=case.complete_fixture_mapping(path);record['carrier']=carrier
             path.write_text(json.dumps(record,ensure_ascii=False),encoding='utf-8-sig')
         from 附注更新.分步流程 import run_step
         config={'output_dir':str(root/'槽位入口'),'gold_path':str(gold),'a_mapping':str(paths[0]),'b_mapping':str(paths[1])}
-        with patch.object(api,'build_fact_update_plan',side_effect=AssertionError('对应阶段不取数')), \
-             patch.object(api,'calculate_mapping_formulas',side_effect=AssertionError('对应阶段不计算')):
+        with patch.object(api,'calculate_mapping_formulas',side_effect=AssertionError('不重新计算原表')):
             result=run_step('match',config)
         self.assertEqual(result['status'],'complete',result['message'])
         plan=json.loads(Path(result['files']['update_plan']).read_text(encoding='utf-8-sig'))
-        self.assertEqual(plan['schema'],'附注语义对应-v2');self.assertNotIn('updates',plan)
-        book=load_workbook(result['files']['trace'],read_only=True)
-        self.assertIn('逐格槽位对应',book.sheetnames);self.assertNotIn('更新记录',book.sheetnames);book.close()
-        from 附注更新.界面 import file_selection_updates
-        self.assertEqual(file_selection_updates('update_plan',result['files']['update_plan'],{})['a_mapping'],str(paths[0]))
-        written=run_step('write',{**config,**result['files']})
+        self.assertEqual(plan['schema'],'附注更新清单-v2');self.assertEqual(plan['updates'][0]['value'],900)
+        with patch('附注更新.分步流程._prepare_update_v2',side_effect=AssertionError('写入不重做匹配')):
+            written=run_step('write',{**config,**result['files']})
         self.assertEqual(written['status'],'complete',written['message'])
         book=load_workbook(written['files']['a_prime']);self.assertEqual(book['附注']['D8'].value,900);book.close()
+        from 附注更新.流程 import save_json
+        from 附注更新.表格 import file_hash
+        from 附注更新.统一语义 import read_standard_v2
+        standard=read_standard_v2(gold)
+        historical=api.compare_semantic_slots(*(api.load_fact_mapping(path,standard) for path in paths),standard)
+        historical.update({key:plan[key] for key in ('a_mapping','b_mapping','inputs','gold_path','a_link')})
+        historical_path=Path(save_json(root/'历史候选记录'/'单元格语义对应.json',historical))
+        save_json(historical_path.with_name('更新清单校验.json'),{'path':str(historical_path),'sha256':file_hash(historical_path)})
+        from 附注更新.界面 import file_selection_updates
+        self.assertEqual(file_selection_updates('update_plan',str(historical_path),{})['a_mapping'],str(paths[0]))
+        with patch('附注更新.分步流程._prepare_update_v2',side_effect=AssertionError('写入不重启旧流程')), \
+             patch('附注更新.分步流程.write_updated_workbook',side_effect=AssertionError('候选关系不是搬运动作')):
+            written=run_step('write',{**config,'update_plan':str(historical_path)})
+        self.assertEqual(written['status'],'failed',written['message'])
+        self.assertIn('历史候选记录只供查看',written['message'])
+        self.assertNotIn('a_prime',written['files'])
 
 
 if __name__=='__main__':unittest.main()

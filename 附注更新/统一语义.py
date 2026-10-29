@@ -15,6 +15,14 @@ from .金标准 import _invalid_number, _pairs
 
 RESERVED_DIMENSIONS = {"entity": "text", "report_scope": "text", "currency": "text", "unit_scale": "number", "period": "period"}
 
+# 只解释通用计量边界；企业实际取值和依据仍须来自本次原文。
+MEASUREMENT_PROMPT = '''先确定独立的经济计量，再理解它在当前表中的用途。同一经济计量换表展示不换指标；期间计提/分摊额、仅计入当期损益的费用、累计账项变动及调节填列额分别核对，不能仅因列在调节表就断言它只有展示含义。
+允许用适用的专业知识解释原文明示术语的规范含义，不要求企业在每一格重新写出术语定义。解释术语与推断该企业发生了什么不同：不得凭常见做法补入实例条件，也不能因原文没有另写定义就断言术语含义未知。上级部分的披露用途不能替代项目本身的经济计量；存在多个会改变计量的合理解释时，说明具体冲突或尚缺的条件，仍保留未决。
+当原文术语与表的分组或通栏表头看似不一致且已有定义仍不能确认时，若模型支持公开规范查询，先自行核查该术语的规范计量及适用范围，再依据本次原文绑定；不能仅凭栏目名称决定期间发生额或时点余额。查证只解释通用含义，不检索企业事实、不代入其他样本的身份或来源。规范仍不能消除真实歧义时保留未决。
+折旧、摊销可以归集至相关资产成本或当期损益，原文没有明确限定仅计入损益时，不得自行收窄为损益费用。须结合指标及全部事项、对象范围维度判断现有定义是否能表达；同一数字可被某个退役展示指标填写，不足以证明它与底层经济计量同义，也不能换名恢复已经退役的同一展示计量。
+通栏本期/上期发生额不自动改变单项本身的时点或期间性质。报告标题、会计期间及适用共同说明也是原文，须与本格行列共同解释实际期间；不能漏读它们后把已经提供的年度或主体记为缺失。具体日期未明确与尚不能确定计量类型须区分，前者保留已确认槽位及实际缺失值，后者保留未决；原文真实冲突仍须指出，不按文件名或期望结果改写。
+原文包含事项、用途或其他限定时，保留限定的实际对象范围，不能只保存一个宽泛类别。以上知识不能充当企业本期的事实证据，evidence仍须引用本次原文。'''
+
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -110,14 +118,16 @@ def _dimension_value(value, definition, *, matching=False):
         extras = {"all": set(), "members": {"members"}, "predicate": {"predicate"},
                   "complement": {"base", "excluded"}, "unknown": set()}
         _require(mode in extras, "集合选取方式无效")
-        _fields(value, {"domain", "mode", "completeness"} | extras[mode])
+        _fields(value, {"domain", "mode"} | extras[mode], {"completeness", "condition", "known_scope", "known", "unknown"})
         _require(value["domain"] == definition["domain"], "集合超出该维度声明的业务总体")
-        _require(value["completeness"] in {"complete", "partial", "unknown"}, "集合完整性无效")
+        _require('completeness' not in value or value["completeness"] in {"complete", "partial", "unknown"}, "集合完整性无效")
         if mode == "unknown":
-            _require(value["completeness"] == "unknown", "未知集合不能声称完整")
+            _require(value.get("completeness") in (None,"unknown"), "未知集合不能声称完整")
         if matching:
-            _require(mode != "unknown" and value["completeness"] == "complete", "集合范围未明，不能建立确定匹配")
+            _require(mode != "unknown" and value.get("completeness") not in {"partial","unknown"}, "集合范围未明，不能建立确定匹配")
         result = copy.deepcopy(value)
+        if 'condition' in value:_require(_text(value['condition']), '已有条件须保留原文字')
+        if matching:result.pop('completeness',None)
         for key in ("members", "excluded"):
             if key in value:
                 _texts(value[key]); result[key] = sorted(value[key])
@@ -311,12 +321,29 @@ def validate_legacy_bindings(standard, legacy_rows, legacy_gold_hash):
 def required_cell_dimensions(metric, standard):
     """格子对应不以报表口径为前提；历史回执仍按当时规则重建。"""
     required = {ref['id'] for ref in metric['dimension_refs'] if ref['required']}
-    return required if standard.get('_historical_report_scope') else required - {'report_scope'}
+    return required if standard.get('_complete_identity') or standard.get('_historical_report_scope') else required - {'report_scope'}
+
+
+def identity_completeness(record, standard):
+    """独立列出全部标准缺项及未知；不重分类、不补值、不认证来源或取数资格。"""
+    known=record.get('partial_semantics',record)
+    if known.get('dimension_id'):
+        _require(known['dimension_id'] in standard['dimension'],'不存在的维度标准')
+        required=set()
+    else:
+        metric=standard['metric'][known['metric_id']]
+        required={ref['id'] for ref in metric['dimension_refs'] if ref['required']}
+    dimensions=known.get('dimensions',{})
+    missing=sorted(required-set(dimensions))
+    unknown=sorted(key for key,value in dimensions.items() if isinstance(value,dict)
+                   and (value.get('mode')=='unknown' or value.get('completeness') in {'partial','unknown'}))
+    return {'required_dimensions':sorted(required),'missing_dimensions':missing,
+            'unknown_dimensions':unknown,'complete':not missing and not unknown}
 
 
 def partial_pending_dimensions(known, standard):
     return sorted(set(known['missing_dimensions'])|{key for key,value in known['dimensions'].items()
-        if standard['dimension'][key]['value_type']=='selection' and (value['mode']=='unknown' or value['completeness']!='complete')})
+        if standard['dimension'][key]['value_type']=='selection' and (value['mode']=='unknown' or value.get('completeness') in {'partial','unknown'})})
 
 
 def validate_partial_semantics(known, standard):
@@ -329,13 +356,13 @@ def validate_partial_semantics(known, standard):
     required=required_cell_dimensions(metric, standard)
     dims=known['dimensions'];evidence=known['dimension_evidence']
     _require(isinstance(dims,dict) and set(dims)<=declared,'部分语义包含未声明维度')
-    _require(isinstance(evidence,dict) and set(evidence)==set(dims),'每项已知维度须有证据')
+    _require(isinstance(evidence,dict) and set(evidence)==set(dims),'维度与引用登记须逐项对应，未引用的保留空列表')
     _texts(known['missing_dimensions'],empty=True);_texts(known['evidence_cells'])
     missing=set(known['missing_dimensions'])
     _require(missing==required-set(dims) or missing==({ref['id'] for ref in metric['dimension_refs'] if ref['required']}-set(dims)),
              '缺少维度须精确列出尚未确定的必需项')
     for key,value in dims.items():
-        _dimension_value(value,standard['dimension'][key]);_texts(evidence[key])
+        _dimension_value(value,standard['dimension'][key]);_texts(evidence[key],empty=True)
     _require(partial_pending_dimensions(known,standard),'全部维度和范围已明确时应保存完整事实')
     definition=metric['definition']
     if 'period' in dims and definition['time_kind']!='none':
@@ -366,9 +393,9 @@ def validate_fact(fact, standard):
     declared = {ref["id"] for ref in metric["dimension_refs"]}
     required = required_cell_dimensions(metric, standard)
     _require(isinstance(dims, dict) and required <= set(dims) <= declared, "缺少必需维度或使用了未声明维度")
-    _require(isinstance(evidence, dict) and set(evidence) == set(dims), "每项实际维度必须有证据")
+    _require(isinstance(evidence, dict) and set(evidence) == set(dims), "维度与引用登记须逐项对应，未引用的保留空列表")
     for key, value in dims.items():
-        _dimension_value(value, standard["dimension"][key]); _texts(evidence[key])
+        _dimension_value(value, standard["dimension"][key]); _texts(evidence[key],empty=True)
     definition = metric["definition"]
     for constraint in definition["constraints"]:
         key = constraint["dimension_id"]
