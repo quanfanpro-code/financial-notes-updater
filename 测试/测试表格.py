@@ -390,13 +390,12 @@ class WorkbookTests(unittest.TestCase):
         self.assertEqual(plan["updates"][0]["sources"],[{"sheet":"附注","cell":"B2","value":0}])
         self.assertEqual(plan["updates"][0]["blank_sources"],[{"sheet":"附注","cell":"B3","value":None}])
 
-    def test_original_blank_without_source_is_preserved_and_not_counted_as_update(self):
+    def test_原格为空也保留身份证无来源事实及原空白(self):
         api=self.api();a=self.make("原空白无来源.xlsx",None);b=self.make("另一业务来源.xlsx",5)
         plan=api.build_update_plan(api.read_workbook(a),api.read_workbook(b),[self.mapping()],[self.mapping(counterparty="另一对象")])
-        self.assertFalse(plan["issues"]);self.assertFalse(plan["updates"])
-        self.assertEqual(len(plan["retained_blanks"]),1)
-        self.assertEqual(plan["retained_blanks"][0]["semantic_key"],api.semantic_key(self.mapping()))
-        self.assertIsNone(plan["retained_blanks"][0]["old_value"])
+        self.assertEqual([row["kind"] for row in plan["issues"]],["missing_source"])
+        self.assertFalse(plan["updates"])
+        self.assertIsNone(api.read_workbook(a)["sheets"][0]["cells"]["B2"]["value"])
         self.assertEqual(len(plan["unplaced_sources"]),1)
 
     def test_nonblank_or_formula_target_cannot_be_retained_as_blank_without_source(self):

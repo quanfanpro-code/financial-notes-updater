@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 
-from .统一语义 import _require, definition_hash, identity_completeness
+from .统一语义 import _require, definition_hash, identity_completeness, json_date, json_dates
 
 FIELDS=('facts','slot_bindings','owners','unresolved','excluded','source_identities','outline','coverage',
         'complete','a_identity_coverage','source_hash','gold_hash','source_context','recognition_scope',
@@ -2782,7 +2782,7 @@ def direct_answer(text, standard, sheet_names=(), metric_context=None, default_s
 def merge_direct_answer(old, reply, field_scope, withdrawn=None):
     """按原表已登记位置分配字段范围，复用同一字段合并逻辑。"""
     from .A语义阅读 import addresses
-    if old.get('carrier')!='B':
+    if old.get('carrier')!='B' or old.get('逐格字段版本')==1:
         tables=deepcopy(old['outline']['subtables']);sheets={t['sheet'] for t in tables}
         if old.get('逐格原样保存'):
             from openpyxl.utils.cell import range_boundaries, get_column_letter
@@ -3044,12 +3044,17 @@ def _merge_direct_table(old, reply, field_scope, withdrawn=None):
                         for part in ('known_scope','known','unknown'):
                             if part in prior:copied['value'].setdefault(part,deepcopy(prior[part]))
                     incoming[kind].append(copied)
-            elif kind=='metrics' and 'template_period_role' not in row:
+            elif kind in ('metrics','dimension_bindings'):
+                other='dimension_id' if kind=='metrics' else 'metric_id'
+                replaced[other].update(a for a in allowed if other in mask.get(a,set()))
                 for a in allowed:
                     copied={**row,'ranges':[a]}
-                    prior=[m for m in table['metrics'] if a in cells(m)]
+                    if 'template_period_role' not in mask.get(a,set()):
+                        copied.pop('template_period_role',None)
+                    prior=[m for m in table.get(kind,[]) if a in cells(m)]
                     roles=[m.get('template_period_role') for m in prior]
-                    if ('template_period_role' not in mask.get(a,set())|set(withdrawn.get(a,[])) and
+                    if ('template_period_role' not in copied and
+                        'template_period_role' not in mask.get(a,set())|set(withdrawn.get(a,[])) and
                         prior and all(m['id']==row['id'] for m in prior) and
                         roles[0] in ('current','prior','opening','closing','本期','上期','期初','期末',
                                      '本期发生额','上期发生额','期初余额','期末余额') and all(v==roles[0] for v in roles)):
@@ -5344,31 +5349,7 @@ def source_relation(a, b, reply, targets, *, arranged_targets=False):
 
 
 def save_source_relations(a, b, reply, targets, destination, *, usage=None, arranged_targets=False):
-    """保存模型明说的取数对应；不改变两端身份，不裁定候选。"""
-    from .统一勾稽 import load_fact_mapping
-    from .A语义阅读 import direct_reference
-    relation=source_relation(a,b,reply,targets,arranged_targets=arranged_targets)
-    if b.get('a_required_ranges'):
-        from .A语义阅读 import addresses
-        labels={r['sheet']+'!'+cell for r in b['a_required_ranges'] for cell in addresses(r['range'])}
-        relation['label_actions']=[row for row in relation['label_actions'] if row['target'] in labels]
-    result={**b,'已确认关系':deepcopy(b.get('已确认关系',[])),'usage':usage or {}}
-    result['A需要指纹']=definition_hash(direct_reference(a,compact=True))
-    from .正常入口识别 import answer_relations
-    dimensions=list(dict.fromkeys(key for group in b.get('正常入口范围认识',{}).get('ranges',[])
-        if group.get('a_ranges')==b.get('a_required_ranges') for key in group.get('list_dimensions',[])))
-    declared_relations=answer_relations(a,{**b,'识别答复':reply,'答复接入来源':{}},b.get('b_source_ranges',[]),dimensions,_standard(b),b.get('a_required_ranges',[]),targets=targets)
-    for declared in declared_relations:
-        if declared['kind']=='取数对应':
-            for key in ('bindings','retained_targets','label_actions','caption_updates'):
-                relation[key]=deepcopy(declared.get(key,[]))
-    append_declared_relation(result['已确认关系'],relation)
-    for declared in declared_relations:
-        if declared['kind']=='名单编排':append_declared_relation(result['已确认关系'],declared)
-    result['封存校验']=direct_digest(result)
-    path=Path(destination);path.parent.mkdir(parents=True,exist_ok=True);result['mapping_path']=str(path.resolve())
-    with path.open('x',encoding='utf-8') as file:json.dump(result,file,ensure_ascii=False,indent=2)
-    return load_fact_mapping(path,{})
+    raise ValueError("旧位置取数安排入口已停用；只保存本格身份证。")
 
 
 def append_declared_relation(relations, relation):
@@ -5416,252 +5397,32 @@ def append_declared_relation(relations, relation):
 
 
 def save_list_relations(a, b, reply, dimension, destination, *, usage=None, source_ranges=()):
-    """名单关系另存于两合集，保留全部原识别及原位置。"""
-    from .统一勾稽 import load_fact_mapping
-    from .A语义阅读 import direct_reference
-    relation={'kind':'名单编排','dimension':dimension,'content':reply,'answer_hash':definition_hash(reply),
-              'source_a_hash':a['source_hash'],'source_b_hash':b['source_hash'],'gold_hash':a['gold_hash']}
-    relation['source_ranges']=deepcopy(source_ranges)
-    relation['tables']=_declared_list_tables(a,reply,dimension,source_ranges,b)
-    relation['conflicts'],relation['未采用的引用说明']=_list_relation_conflicts(b,reply,source_ranges)
-    labels=source_relation(a,{**b,'target_table':None,'target_tables':[],'b_source_ranges':source_ranges},reply,[location for location,_ in _records(a)])
-    previous_relations=deepcopy(b.get('已确认关系',[]))
-    pending=[item for row in previous_relations if row.get('kind')=='取数对应' and row.get('arranged_targets')
-             for item in row.get('bindings',[]) if not any(k in item for k in ('target_member','target_original'))]
-    if relation['tables'] and pending:
-        from .模板更新编排 import direct_update_plan
-        from openpyxl.utils.cell import range_boundaries,coordinate_to_tuple,get_column_letter
-        prior_plan=direct_update_plan(a,b);positions=prior_plan['template_layout']['positions']
-        members={}
-        for table in prior_plan['update_purpose'].get('tables',[]):
-            area=a['机械记录']['names'][table['range_name']][0]
-            first_col,top,_,_=range_boundaries(area['range']);sheet=area['sheet']
-            anchor=positions[f'{sheet}!{get_column_letter(first_col)}{top}']
-            moved_top=coordinate_to_tuple(anchor.rsplit('!',1)[1])[0]
-            first=positions[f'{sheet}!{get_column_letter(first_col)}{top+table["first_row_offset"]}']
-            first=coordinate_to_tuple(first.rsplit('!',1)[1])[0]
-            for index,source_row in enumerate(table['source_rows']):
-                row=moved_top+table['target_row_offsets'][index] if table.get('target_row_offsets') else first+index
-                for column in table['columns']:
-                    members[f'{sheet}!{column}{row}']={key:deepcopy(table[key]) for key in
-                        ('range_name','first_row_offset','source_sheet')}
-                    members[f'{sheet}!{column}{row}'].update(source_row=source_row,column=column)
-        original={new:old for old,new in positions.items() if new}
-        for item in pending:
-            target=item['target']
-            # 旧保存格式只用于找回当时的落点；后续始终引用模型名单中的同一成员。
-            if item.get('target_anchor'):
-                anchor=item['target_anchor'];area=a['机械记录']['names'][anchor['range_name']][0]
-                first_col,top,_,_=range_boundaries(area['range'])
-                moved_top=coordinate_to_tuple(positions[f'{area["sheet"]}!{get_column_letter(first_col)}{top}'].rsplit('!',1)[1])[0]
-                target=f'{area["sheet"]}!{anchor["column"]}{moved_top+anchor["row_offset"]}'
-            if target in members:item['target_member']=deepcopy(members[target])
-            elif target in original:item['target_original']=original[target]
-            else:continue
-            item.pop('target_anchor',None)
-    paths={}
-    for carrier,mapping in [('A',a),('B',b)]:
-        result={**mapping,'已确认关系':[deepcopy(row) for row in (previous_relations if carrier=='B' else mapping.get('已确认关系',[]))
-            if not (row.get('kind')=='名单编排' and row.get('answer_hash')==relation['answer_hash'])]}
-        append_declared_relation(result['已确认关系'],relation)
-        if carrier=='B':result['A需要指纹']=definition_hash(direct_reference(a,compact=True))
-        if labels['label_actions'] or labels['caption_updates']:append_declared_relation(result['已确认关系'],labels)
-        result['usage']=usage or {};result['封存校验']=direct_digest(result)
-        path=Path(destination)/(carrier+'识别结果.json');path.parent.mkdir(parents=True,exist_ok=True)
-        result['mapping_path']=str(path.resolve())
-        with path.open('x',encoding='utf-8') as file:json.dump(result,file,ensure_ascii=False,indent=2)
-        load_fact_mapping(path,{})
-        paths[carrier.lower()+'_mapping']=str(path.resolve())
-    answer_path=Path(destination)/'名单关系答复.txt';answer_path.write_text(reply,encoding='utf-8-sig')
-    return {'status':'saved','message':'名单关系原答复已随两个合集另存回读；原身份及位置不变。',
-            'files':{**paths,'recognition_answer':str(answer_path)},'usage':usage or {}}
+    raise ValueError("旧名单执行安排入口已停用；只保存本格身份证。")
 
 
-def _attach_declared_name_refs(answer, mapping, reply, field_scope):
-    """连接答复明说的各行名称与已保存名称列，不推定其他金额随同行名称。"""
-    from .A语义阅读 import addresses
-    if mapping.get('carrier')!='B':return
-    sheets={table['sheet'] for table in mapping['outline']['subtables']}
-    field_scope={(area if '!' in area else next(iter(sheets))+'!'+area):keys
-                 for area,keys in field_scope.items() if '!' in area or len(sheets)==1}
-    allowed={sheet+'!'+cell:set(keys) for area,keys in field_scope.items()
-             for sheet,span in [area.rsplit('!',1)] for cell in addresses(span)}
-    declarations={};label_names={};member_aliases={}
-    plain=reply.replace('`','')
-    for declaration in re.finditer(r'以下“([^”]+)”均为\s*(\w+)[^。]*成员按原文标签列出',plain):
-        names=re.search(re.escape(declaration[1])+r'包括[:：]\s*([^。\n]+)',plain[declaration.start():])
-        if names:
-            member_aliases[declaration[2]]=(declaration[1],{name.strip() for name in re.split(r'[、，,]',names[1])})
-    for relation in mapping.get('已确认关系',[]):
-        if relation.get('kind')!='名单编排':continue
-        if relation['source_b_hash']!=mapping['source_hash'] or relation['gold_hash']!=mapping['gold_hash']:continue
-        for table in relation.get('tables',[]):
-            for area in table.get('source_ranges',[]):
-                for cell in addresses(area['range']):
-                    declarations.setdefault((relation['dimension'],area['sheet']+'!'+cell),set()).update(table['labels'].values())
-        for named,raw in re.findall(r'标为“([^”]+)”[^。\n]*?来源标签也是“([^”]+)”',relation.get('content','')):
-            label_names.setdefault((relation['dimension'],raw),set()).add(named)
-        for area in relation.get('source_ranges',[]):
-            sheet=area['sheet'];columns=set()
-            for line in relation['content'].replace('`','').splitlines():
-                if sheet+'!' in line:columns.update(re.findall(r'名称在\s*([A-Z]+)\s*列',line))
-            for cell in addresses(area['range']):
-                declarations.setdefault((relation['dimension'],sheet+'!'+cell),set()).update(columns)
-    cells={sheet['name']+'!'+cell:value for sheet in mapping['机械记录']['sheets'] for cell,value in sheet['cells'].items()}
-    for table in answer.get('tables',[answer]):
-        rows=[];sheet=table.get('sheet')
-        for row in table.get('dimensions',[]):
-            original=row.get('original')
-            while isinstance(original,dict):original=original.get('original')
-            value=row.get('value')
-            alias,names=member_aliases.get(row['id'],('',set()))
-            by_label=(alias and isinstance(original,str) and '为各'+alias in original
-                      and original.replace('`','') in plain and isinstance(value,dict)
-                      and value.get('mode')=='unknown' and value.get('known_scope')=={'mode':'members'})
-            if by_label:
-                for span in row['ranges']:
-                    for cell in addresses(span):
-                        location=sheet+'!'+cell;columns=declarations.get((row['id'],location),set())
-                        item={**deepcopy(row),'ranges':[cell]}
-                        if row['id'] in allowed.get(location,set()) and len(columns)==1:
-                            ref=sheet+'!'+next(iter(columns))+re.search(r'\d+$',cell)[0]
-                            source=cells.get(ref,{})
-                            raw=source.get('cached_value') if source.get('formula') else source.get('value')
-                            raw=raw.strip() if isinstance(raw,str) else raw
-                            members=({raw} if isinstance(raw,str) and raw in names else label_names.get((row['id'],raw),set())&names)
-                            if len(members)==1:
-                                item['value']={'mode':'members','domain':value['domain'],'members':list(members)}
-                                item['evidence']=[ref]
-                        rows.append(item)
-                continue
-            if (not isinstance(original,str) or '格按各自表格项目名称取范围' not in original
-                or original.replace('`','') not in reply.replace('`','') or row.get('evidence')
-                or not isinstance(value,dict) or value.get('mode')!='members'):
-                rows.append(row);continue
-            for span in row['ranges']:
-                for cell in addresses(span):
-                    location=sheet+'!'+cell;columns=declarations.get((row['id'],location),set())
-                    item={**deepcopy(row),'ranges':[cell]}
-                    if row['id'] in allowed.get(location,set()) and len(columns)==1:
-                        item['evidence']=[sheet+'!'+next(iter(columns))+re.search(r'\d+$',cell)[0]]
-                    rows.append(item)
-        table['dimensions']=rows
 
 
-def _attach_declared_row_labels(answer, mapping, reply, field_scope):
-    """把答复明说的同行标签原字定位到已有记录，不判断标签含义或期间。"""
-    from .A语义阅读 import addresses
-    allowed={sheet+'!'+cell for area,keys in field_scope.items() if 'period' in keys and '!' in area
-             for sheet,span in [area.rsplit('!',1)] for cell in addresses(span)}
-    sheets={s['name']:s['cells'] for s in mapping['机械记录']['sheets']}
-    sheet=next(iter(sheets)) if len(sheets)==1 else None
-    links={}
-    for line in reply.replace('`','').replace('**','').splitlines():
-        named=[name for name in sheets if line.strip(' #：:')==name or name+'!' in line]
-        if len(named)==1:sheet=named[0]
-        if not sheet:continue
-        labels=[]
-        for clause in re.split(r'[。；;]',line):
-            if not re.search(r'各自行标签|同一行标签|同行(?:的)?[“「"]',clause):continue
-            quoted=re.findall(r'[“「"]([^”」"]+)[”」"]',clause)
-            if quoted:labels=quoted
-            if not labels:continue
-            cells=set()
-            for area in re.findall(r'(?<![A-Za-z0-9_])[A-Z]+\d+(?::[A-Z]+\d+)?',clause):
-                cells.update(addresses(area))
-            span=re.search(r'([A-Z]+(?:[、，,][A-Z]+)*)列第(\d+):(\d+)行',clause)
-            if span:
-                cells.update(col+str(row) for col in re.findall(r'[A-Z]+',span[1])
-                             for row in range(int(span[2]),int(span[3])+1))
-            for cell in cells:
-                location=sheet+'!'+cell
-                if location not in allowed:continue
-                row=re.search(r'\d+$',cell)[0]
-                refs=[sheet+'!'+ref for ref,raw in sheets[sheet].items()
-                      if re.search(r'\d+$',ref)[0]==row and not raw.get('formula') and raw.get('value') in labels]
-                if len(refs)==1:links[location]=refs
-    for table in answer.get('tables',[answer]):
-        if not any(loc.startswith(table['sheet']+'!') for loc in links):continue
-        expanded=[]
-        for item in table.get('dimensions',[]):
-            if item['id']!='period':expanded.append(item);continue
-            ranges=[span for area in item['ranges'] for span in (table['data_ranges'] if area=='*' else [area])]
-            for span in ranges:
-                for cell in addresses(span):
-                    row={**deepcopy(item),'ranges':[cell]};refs=links.get(table['sheet']+'!'+cell)
-                    if refs:row.update(evidence=refs,label_references=refs)
-                    expanded.append(row)
-        table['dimensions']=expanded
 
 
-def _attach_declared_source_periods(answer, mapping, reply, field_scope):
-    """把答复明示的日期及表内期间角色附到同段已采用的B引用，不从原表推定日期。"""
-    from .A语义阅读 import addresses
-    names=[s['name'] for s in mapping['机械记录']['sheets']]
-    field_scope={(area if '!' in area else names[0]+'!'+area):keys for area,keys in field_scope.items() if '!' in area or len(names)==1}
-    allowed={sheet+'!'+cell:set(keys) for area,keys in field_scope.items() for sheet,span in [area.rsplit('!',1)] for cell in addresses(span)}
-    references=re.compile(r'('+ '|'.join(re.escape(name) for name in sorted(names,key=len,reverse=True))+r')!([A-Z]+\d+(?::[A-Z]+\d+)?)')
-    date=r'(\d{4})年(\d{1,2})月(\d{1,2})日';roles={'期末':'closing','期初':'opening'};declared={}
-    known_roles={}
-    for table in answer.get('tables',[answer]):
-        for row in table.get('metrics',[])+table.get('dimensions',[]):
-            role=row.get('template_period_role') if row.get('template_period_role') else row.get('value') if row.get('id')=='template_period_role' else None
-            if role not in roles.values():continue
-            for span in row.get('ranges',[]):
-                for area in table['data_ranges'] if span=='*' else [span]:
-                    for cell in addresses(area):known_roles.setdefault(table['sheet']+'!'+cell,set()).add(role)
-    for line in reply.replace('`','').replace('**','').splitlines():
-        dates={roles[role]:f'{int(y):04}-{int(m):02}-{int(d):02}' for role,y,m,d in
-               re.findall(r'(期末|期初)(?:部分)?实际日期为\s*'+date,line)}
-        if not dates:continue
-        for sheet,span in references.findall(line):
-            for cell in addresses(span):
-                loc=sheet+'!'+cell;known=known_roles.get(loc,set())
-                if loc in allowed and len(known)==1 and (role:=next(iter(known))) in dates:
-                    declared[loc]=(dates[role],role,[],line)
-    for block in re.split(r'\n(?=#{1,6}\s)',reply.replace('`','').replace('**','')):
-        dates={role:f'{int(y):04}-{int(m):02}-{int(d):02}' for role,y,m,d in re.findall(r'(期末|期初)\s*'+date,block)}
-        for clause in re.split(r'[。\n]',block):
-            found=re.search(r'日期为\s*'+date,clause);selected=set(re.findall(r'期末|期初',clause))
-            if found and len(selected)==1 and '标签' in clause:dates[next(iter(selected))]='-'.join(f'{int(v):02}' for v in found.groups())
-        labels={}
-        for clause in re.split(r'[，,。\n]',block):
-            selected=set(re.findall(r'期末|期初',clause));refs=references.findall(clause)
-            if len(selected)==len(refs)==1 and '采用' in clause:
-                labels[next(iter(selected))]=[refs[0][0]+'!'+cell for cell in addresses(refs[0][1])]
-        header=None;source_column=None
-        for line in block.splitlines():
-            if not line.startswith('|'):continue
-            values=[v.strip() for v in line.strip('|').split('|')]
-            columns=[i for i,v in enumerate(values) if re.search(r'B\s*(?:位置|来源)',v)]
-            if columns:header=values;source_column=columns[0];continue
-            if header is None or len(values)!=len(header):continue
-            selected=set(re.findall(r'期末|期初',line))
-            if not selected and len(dates)==1:selected=set(dates)
-            if len(selected)!=1:continue
-            role=next(iter(selected))
-            if role not in dates:continue
-            for sheet,span in references.findall(values[source_column]):
-                for cell in addresses(span):
-                    location=sheet+'!'+cell
-                    if location in allowed:declared[location]=(dates[role],roles[role],labels.get(role,[]),line)
-    for table in answer.get('tables',[answer]):
-        changes={loc.rsplit('!',1)[1]:values for loc,values in declared.items() if loc.rsplit('!',1)[0]==table['sheet']}
-        if not changes:continue
-        kept=[]
-        for item in table.get('dimensions',[]):
-            if item['id'] not in ('period','template_period_role'):kept.append(item);continue
-            cells=[cell for span in item['ranges'] for area in (table['data_ranges'] if span=='*' else [span]) for cell in addresses(area)]
-            cells=[cell for cell in cells if cell not in changes or item['id'] not in allowed[table['sheet']+'!'+cell]]
-            if cells:kept.append({**item,'ranges':cells})
-        for cell,(value,role,refs,original) in changes.items():
-            for key,content in [('period',value),('template_period_role',role)]:
-                if key in allowed[table['sheet']+'!'+cell]:kept.append({'id':key,'ranges':[cell],'value':content,'evidence':refs,'label_references':refs,'original':original})
-        table['dimensions']=kept
 
 
 def _per_cell_answer(reply, standard, sheet_names, default_sheet=None):
     """仅读取各格自己写出的字段，不承接共同声明或其他格的取值。"""
+    class ConflictingValues(list):
+        pass
+    def field_pairs(items):
+        value={}
+        for key,item in items:
+            if isinstance(value.get(key),ConflictingValues):value[key].append(item)
+            elif key in value and value[key]!=item:
+                if not isinstance(value[key],ConflictingValues):value[key]=ConflictingValues([value[key]])
+                value[key].append(item)
+            else:value[key]=item
+        return value
+    def conflicting(value):
+        if isinstance(value,ConflictingValues):return True
+        if isinstance(value,dict):return any(conflicting(item) for item in value.values())
+        return isinstance(value,list) and any(conflicting(item) for item in value)
     result={'metrics':[],'dimension_bindings':[],'dimensions':[],'unresolved':[]}
     section_sheet=None
     single=re.compile(r"(?:(?:'([^']+)'|([^!]+))!)?\$?([A-Z]+)\$?([1-9]\d*)$")
@@ -5677,6 +5438,10 @@ def _per_cell_answer(reply, standard, sheet_names, default_sheet=None):
     def keep(where,fields,original):
         own={k:v for k,v in fields.items() if k in standard['dimension'] or k in ('metric_id','dimension_id','template_period_role')}
         grouped=fields.get('dimensions',{})
+        if isinstance(grouped,ConflictingValues):
+            result['unresolved'].append({'id':'dimensions','ranges':[where],'reason':'该格维度分组重复且取值不同',
+                'conflicting_values':deepcopy(grouped),'original':deepcopy(original)})
+            grouped={}
         if isinstance(grouped,dict):
             for key,value in grouped.items():
                 if key not in standard['dimension'] and key!='template_period_role':continue
@@ -5684,10 +5449,19 @@ def _per_cell_answer(reply, standard, sheet_names, default_sheet=None):
                     result['unresolved'].append({'id':key,'ranges':[where],'reason':'该格同一维度重复且取值不同',
                         'conflicting_values':[deepcopy(own.pop(key)),deepcopy(value)],'original':deepcopy(original)})
                 else:own[key]=value
-        if own.get('metric_id') is not None and own.get('dimension_id') is not None:
+        for key in list(own):
+            if conflicting(own[key]):
+                result['unresolved'].append({'id':key,'ranges':[where],'reason':'该格字段内部重复且取值不同',
+                    'conflicting_values':deepcopy(own.pop(key)),'original':deepcopy(original)})
+        if (isinstance(own.get('metric_id'),str) and own['metric_id'] in standard['metric']
+                and isinstance(own.get('dimension_id'),str) and own['dimension_id'] in standard['dimension']):
             for key in ('metric_id','dimension_id'):
                 result['unresolved'].append({'id':key,'ranges':[where],'reason':'该格同时给出槽位编号和维度编号，不能代选',
                     'conflicting_values':[deepcopy(own.pop(key))],'original':deepcopy(original)})
+        if own.get('metric_id') is None and isinstance(own.get('dimension_id'),str) and own['dimension_id'] in standard['dimension']:
+            own.pop('metric_id',None)
+        if own.get('dimension_id') is None and isinstance(own.get('metric_id'),str) and own['metric_id'] in standard['metric']:
+            own.pop('dimension_id',None)
         for key,value in own.items():
             row={'id':key,'ranges':[where],'original':deepcopy(original),'evidence':[],'逐格原字段':True}
             if key in ('metric_id','dimension_id'):
@@ -5714,20 +5488,33 @@ def _per_cell_answer(reply, standard, sheet_names, default_sheet=None):
         if isinstance(value,list):
             for item in value:objects(item)
         elif isinstance(value,dict):
+            if any(conflicting(value[k]) for k in ('coordinate','location','坐标','位置','range') if k in value):
+                result['unresolved'].append({'id':'location','reason':'本格位置字段重复且内容不同',
+                    'conflicting_values':[deepcopy(value)],'original':deepcopy(value)})
+                return
             own=next((location(value[k]) for k in ('coordinate','location','坐标','位置','range') if k in value and location(value[k])),None)
             if own:keep(own,value,value);return
             for key,item in value.items():
                 own=location(key)
-                if own and isinstance(item,dict):keep(own,item,item)
-                elif key in ('results','识别结果','坐标识别','cells'):objects(item)
+                if own and isinstance(item,ConflictingValues):
+                    result['unresolved'].append({'id':'location','ranges':[own],'reason':'同一本格位置重复且内容不同',
+                        'conflicting_values':deepcopy(item),'original':deepcopy(item)})
+                elif own and isinstance(item,dict):keep(own,item,item)
+                elif isinstance(item,(dict,list)):objects(item)
     text=reply.strip() if isinstance(reply,str) else None
     if text is not None:
-        fence=re.fullmatch(r'```(?:json)?\s*\n(.*)\n```',text,re.S)
-        if fence:text=fence[1]
-        try:value=json.loads(text)
+        def fenced_fields(match):
+            try:native=json.loads(match[1],object_pairs_hook=field_pairs)
+            except ValueError:return match[0]
+            if not isinstance(native,(dict,list)):return match[0]
+            objects(native)
+            return ''
+        text=re.sub(r'^```(?:json)?[ \t]*\r?\n(.*?)\r?\n```[ \t]*$',
+                    fenced_fields,text,flags=re.M|re.S)
+        try:value=json.loads(text,object_pairs_hook=field_pairs)
         except ValueError:
             try:
-                value=[];remaining=text.strip();decoder=json.JSONDecoder()
+                value=[];remaining=text.strip();decoder=json.JSONDecoder(object_pairs_hook=field_pairs)
                 if remaining.startswith('[') and remaining.endswith(']'):
                     try:decoder.raw_decode(remaining)
                     except ValueError:
@@ -5738,20 +5525,45 @@ def _per_cell_answer(reply, standard, sheet_names, default_sheet=None):
                     if remaining.startswith(','):
                         remaining=remaining[1:].lstrip()
                         if not remaining:raise ValueError('缺少下一个完整JSON对象')
-            except ValueError:value=None
+            except ValueError:
+                if value:
+                    objects(value);text=remaining
+                value=None
     else:value=reply
     if isinstance(value,(dict,list)):
         objects(value)
     elif text is not None:
         field_ids=set(standard['dimension'])|{'metric_id','dimension_id','dimensions','template_period_role','dimension_evidence','label_references'}
         table_fields=field_ids|{'dimensions'}
-        field_line=re.compile(r'^\s*(?:[-*]\s+)?`?('+'|'.join(re.escape(k) for k in sorted(table_fields,key=len,reverse=True))+r')`?\s*[:：=＝]\s*(?:`([^`]*)`|(\{.*\}|\[.*\]))\s*$')
+        field_line=re.compile(r'^\s*(?:[-*]\s+)?`?('+'|'.join(re.escape(k) for k in sorted(table_fields,key=len,reverse=True))+r')`?\s*[:：=＝→]\s*(?:`([^`]*)`|(\{.*\}|\[.*\]))\s*$')
         keys='|'.join(re.escape(k) for k in sorted(field_ids,key=len,reverse=True))
-        marker=re.compile(r'(?<![\w.])`?('+keys+r')`?\s*(?:(?:(?:[；;]\s*)?实际取值\s*)?[:：=＝]|为\s*|(?=`))\s*')
+        dimension_keys='|'.join(re.escape(k) for k in sorted(standard['dimension'],key=len,reverse=True))
+        marker=re.compile(r'(?<![\w.])`?(?:dimensions\.(?=(?:'+dimension_keys+r')`?\s*[:：=＝→]))?('+keys+r')`?\s*(?:(?:(?:[；;]\s*)?实际取值\s*)?[:：=＝→]|为\s*|(?=`))\s*')
         address=r"(?:(?:'[^']+'|[^\s!：:;；|]+)!)?\$?[A-Z]+\$?[1-9]\d*(?::\$?[A-Z]+\$?[1-9]\d*)?"
-        heading=re.compile(r'^\s*(?:[-*#]+\s*|\d+[.)、]\s*)?(?:(?:`?location`?|(?:[AB]\s*)?(?:来源|原?(?:位置|坐标)))(?:\s*[:：=＝]\s*|\s+))?`?('+address+r')`?\s*(?:[:：;；—|｜(（-]|$)')
+        heading=re.compile(r'^\s*(?:[-*#]+\s*|\d+[.)、]\s*)?(?:(?:`?location`?|(?:[AB]\s*)?(?:来源|原?(?:位置|坐标)))(?:\s*[:：=＝→]\s*|\s+))?`?('+address+r')`?\s*(?:[:：;；—|｜(（-]|$)')
         blocks=[];current=None;headers=None
         for line in text.replace('**','').splitlines():
+            try:native,end=json.JSONDecoder(object_pairs_hook=field_pairs).raw_decode(line.lstrip())
+            except ValueError:native=None
+            if isinstance(native,(dict,list)):
+                objects(native)
+                tail=line.lstrip()[end:].strip()
+                own=location(native.get('location')) if isinstance(native,dict) else None
+                pairs=[]
+                while own and tail.startswith(','):
+                    rest=tail[1:].lstrip()
+                    try:
+                        key,stop=json.JSONDecoder().raw_decode(rest)
+                        rest=rest[stop:].lstrip()
+                        if not isinstance(key,str) or key in ('location','coordinate','坐标','位置','range') or not rest.startswith(':'):break
+                        rest=rest[1:].lstrip()
+                        value,stop=json.JSONDecoder(object_pairs_hook=field_pairs).raw_decode(rest)
+                    except ValueError:break
+                    pairs.append((key,value));tail=rest[stop:].lstrip()
+                if pairs:keep(own,field_pairs(pairs),line)
+                if tail.strip(',}] \t\r\n'):
+                    result['unresolved'].append({'reason':'未给出本格归属的原文未接为字段','original':tail})
+                continue
             section=re.fullmatch(r'\s*#{1,6}\s+(.+?)\s*',line)
             if section:
                 name=section[1].strip('`').strip("'")
@@ -5772,9 +5584,15 @@ def _per_cell_answer(reply, standard, sheet_names, default_sheet=None):
                 if not positions:
                     if not all(re.fullmatch(r':?-+:?',v) for v in values):headers=values
                     current=None;continue
-                if headers and len(values)==len(headers):
+                if headers:
                     if len(positions)!=1:continue
                     column,own=positions[0]
+                    if len(values)!=len(headers):
+                        result['unresolved'].append({'ranges':[own],'reason':
+                            f'原答复表头{len(headers)}列、本行{len(values)}格；已保留明示标准编号，未移动或补齐其余字段','original':line})
+                        blocks.append((own,'',line,[(k,v) for k,v in zip(headers,values)
+                            if k in ('metric_id','dimension_id')]))
+                        continue
                     blocks.append((own,'；'.join(v for i,(k,v) in enumerate(zip(headers,values))
                         if i!=column and k not in table_fields and not re.search(r'依据|说明|证据',k)),line,
                         [(k,v) for i,(k,v) in enumerate(zip(headers,values)) if i!=column and k in table_fields]))
@@ -5816,13 +5634,23 @@ def _per_cell_answer(reply, standard, sheet_names, default_sheet=None):
             quoted=[(m.start(),m.end()) for m in re.finditer(r'`[^`]*`',body)]
             # 元数据里的字段名属于引用说明，不是本格第二份维度取值。
             for match in marker.finditer(body):
+                if matches:
+                    native_text=body[matches[-1].end():].lstrip('` \t\r\n')
+                    if native_text.startswith(('{','[','"')):
+                        try:_,stop=json.JSONDecoder().raw_decode(native_text)
+                        except ValueError:pass
+                        else:
+                            if match.start()<len(body)-len(native_text)+stop:continue
                 if matches and matches[-1][1] in ('metric_id','dimension_id') and not body[matches[-1].end():match.start()].strip(" \t\r\n`\"'“‘"):continue
                 grouped=(matches and matches[-1][1]=='dimensions' and
                     any(start+1==match.start(1) for start,end in quoted) and
-                    re.match(r'`?'+re.escape(match[1])+r'`?\s*[:：=＝]',match[0]))
+                    re.match(r'`?'+re.escape(match[1])+r'`?\s*[:：=＝→]',match[0]))
                 if matches and not grouped and any(start<=match.start(1)<match.end(1)<=end and
                     not body[matches[-1].end():start].strip() for start,end in quoted):continue
-                if not re.search(r'[:：=＝]|为',match[0]) and any(start<=match.start()<match.end()<=end for start,end in quoted):continue
+                if not re.search(r'[:：=＝→]|为',match[0]):
+                    following=body[match.end():].lstrip('` \t')
+                    if not following or following[0] in ',，;；]':continue
+                    if any(start<=match.start()<match.end()<=end for start,end in quoted):continue
                 if matches and matches[-1][1] in ('label_references','dimension_evidence') and '\n' not in body[matches[-1].end():match.start()]:continue
                 matches.append(match)
             for i,match in enumerate(matches):
@@ -5842,8 +5670,10 @@ def _per_cell_answer(reply, standard, sheet_names, default_sheet=None):
             # 独立字段行与表格列均以原有边界保留文字，不按句内标点截断。
             for key,raw,bounded_value in field_values:
                 literal=raw.lstrip('`')
+                if key in ('metric_id','dimension_id') and (identifier:=re.fullmatch(r'([A-Za-z_][A-Za-z0-9_.]*)[ \t]*[,，\r\n][ \t\r\n]*[\u4e00-\u9fff].*',literal,re.S)):
+                    literal=identifier[1]
                 try:
-                    parsed,end=json.JSONDecoder().raw_decode(literal)
+                    parsed,end=json.JSONDecoder(object_pairs_hook=field_pairs).raw_decode(literal)
                     tail=literal[end:].strip()
                     if tail and (bounded_value or tail[0] not in '`。；;') and not (parsed is None and tail[0] in '（('):raise ValueError('非完整字面值')
                 except ValueError:
@@ -5883,7 +5713,7 @@ def _per_cell_answer(reply, standard, sheet_names, default_sheet=None):
                             elif char==':' and containers and containers[-1][1]:
                                 formatted.append(' ');containers[-1][1]=False
                         def literal_value(node):
-                            if isinstance(node,yaml.MappingNode):return {key.value:literal_value(value) for key,value in node.value}
+                            if isinstance(node,yaml.MappingNode):return field_pairs((key.value,literal_value(value)) for key,value in node.value)
                             if isinstance(node,yaml.SequenceNode):return [literal_value(value) for value in node.value]
                             if node.style in ('\"',"'"):return node.value
                             try:return json.loads(node.value)
@@ -5920,7 +5750,7 @@ def _relocate_direct_reply(reply, mapping, standard, field_scope, source_hash, c
         _require(isinstance(reference,dict) and reference.get('path') and reference.get('sha256'),
                  '位置接续须引用已保存实际执行记录的文件及指纹')
         check(reference['path'],reference['sha256'],'实际执行记录已变化')
-        receipt=json.loads(Path(reference['path']).read_text(encoding='utf-8-sig'))
+        receipt=json.loads(Path(reference['path']).read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
         _require(receipt.get('schema')=='附注更新执行记录-v1','位置接续不是实际执行记录')
         refs=receipt['collections']
         _require(refs['A']['source_hash']==expected,'原答复源文件与实际执行链不一致')
@@ -5931,9 +5761,9 @@ def _relocate_direct_reply(reply, mapping, standard, field_scope, source_hash, c
             check(item['source_path'],item['source_hash'],'实际执行记录的原文件已变化')
             check(item['gold_path'],item['gold_hash'],'实际执行记录的金标准已变化')
         plan_path=Path(receipt['plan_path'])
-        seal=json.loads(plan_path.with_name('更新清单校验.json').read_text(encoding='utf-8-sig'))
+        seal=json.loads(plan_path.with_name('更新清单校验.json').read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
         check(plan_path,seal['sha256'],'实际清单已变化')
-        plan=json.loads(plan_path.read_text(encoding='utf-8-sig'))
+        plan=json.loads(plan_path.read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
         _require(plan['source_a_hash']==refs['A']['source_hash'] and plan['source_b_hash']==refs['B']['source_hash']
                  and plan['gold_hash']==mapping['gold_hash'] and plan['template_layout']==receipt['template_layout'],
                  '实际清单与位置记录不一致')
@@ -6010,7 +5840,10 @@ def direct_ingestion(answer, field_scope, standard, sheet_names):
     scoped=[];outside=[]
     for problem in problems:
         location=problem.get('location')
-        if location is None or problem.get('field') in requested.get(location,set()):scoped.append(problem)
+        chosen=selected.get(location)
+        if chosen and problem.get('field') in {'metric_id','dimension_id'} and problem['field']!=('metric_id' if chosen[0]=='metrics' else 'dimension_id'):
+            outside.append(problem);continue
+        if location is None or (location in requested and problem.get('field') is None) or problem.get('field') in requested.get(location,set()):scoped.append(problem)
         else:outside.append(problem)
     return {'complete':bool(requested) and not missing and not scoped,
             '请求格数':len(requested),'未接入字段':missing,'未确定字段':scoped,'范围外未接入问题':outside}
@@ -6090,11 +5923,11 @@ def save_direct_answer(mapping, reply, destination, *, field_scope=None, withdra
         from .表格 import file_hash
         from .统一勾稽 import _calculated_values
         _require(file_hash(evidence['path'])==evidence['sha256'],'公式计算依据已变化')
-        receipt=json.loads(Path(evidence['path']).read_text(encoding='utf-8-sig'))
+        receipt=json.loads(Path(evidence['path']).read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
         result['formula_values']=_calculated_values(result,receipt)
     result['封存校验']=direct_digest(result)
     path=Path(destination);path.parent.mkdir(parents=True,exist_ok=True);result['mapping_path']=str(path.resolve())
-    with path.open('x',encoding='utf-8') as file:json.dump(result,file,ensure_ascii=False,indent=2)
+    with path.open('x',encoding='utf-8') as file:json.dump(result,file,ensure_ascii=False,indent=2,default=json_date)
     return load_fact_mapping(path,{})
 
 
@@ -6818,7 +6651,7 @@ def resume_direct_output(receipt_path, snapshot, context, standard, field_scope=
     from .A语义阅读 import addresses
     from openpyxl.utils.cell import range_boundaries, get_column_letter
     receipt_path=Path(receipt_path)
-    receipt=json.loads(receipt_path.read_text(encoding='utf-8-sig'))
+    receipt=json.loads(receipt_path.read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
     _require(receipt.get('schema')=='附注更新执行记录-v1' and
         receipt.get('output_hash')==snapshot['sha256'] and
         Path(receipt.get('output_path','')).resolve()==Path(snapshot['path']).resolve(),
@@ -6832,9 +6665,9 @@ def resume_direct_output(receipt_path, snapshot, context, standard, field_scope=
         _require(file_hash(ref['source_path'])==ref['source_hash'],'执行记录引用的原件已变化')
         sources[side]=saved
     plan_path=Path(receipt['plan_path'])
-    seal=json.loads(plan_path.with_name('更新清单校验.json').read_text(encoding='utf-8-sig'))
+    seal=json.loads(plan_path.with_name('更新清单校验.json').read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
     _require(file_hash(plan_path)==seal['sha256'],'执行记录引用的更新清单已变化')
-    plan=json.loads(plan_path.read_text(encoding='utf-8-sig'))
+    plan=json.loads(plan_path.read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
     _require(plan['source_a_hash']==sources['A']['source_hash'] and plan['source_b_hash']==sources['B']['source_hash']
         and plan['gold_hash']==standard['sha256'] and plan['template_layout']==receipt['template_layout'],
         '执行记录的原件或位置移动与更新清单不一致')
@@ -6985,7 +6818,7 @@ def seal_collection(mapping, snapshot, standard):
     documents={};ordered=[]
     for ref in mapping.get('request_receipts',[]):
         path=Path(ref['path']);task_path=path.parent/'任务.json'
-        task=json.loads(task_path.read_text(encoding='utf-8-sig'))
+        task=json.loads(task_path.read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
         _stage_receipt(ref,mapping,task['payload']['task'])
         key=task['task_id']
         if key in documents:continue
@@ -7069,7 +6902,7 @@ def seal_collection(mapping, snapshot, standard):
                     '原答复位置':original_refs[0]['path']})
     result['机械记录']={'sheets':deepcopy(snapshot['sheets'])}
     if mapping.get('a_link'):
-        path=Path(mapping['a_link']);result['机械记录']['Excel—Word关联']={'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'content':json.loads(path.read_text(encoding='utf-8-sig'))}
+        path=Path(mapping['a_link']);result['机械记录']['Excel—Word关联']={'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'content':json.loads(path.read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)}
     result['原文证据']={'context':deepcopy(mapping['source_context']), 'cells':deepcopy(snapshot.get('_all_source_evidence',{}))}
     result['封存校验']=definition_hash({k:result.get(k) for k in FIELDS})
     validate_collection(result)

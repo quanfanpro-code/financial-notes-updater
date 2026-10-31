@@ -2,6 +2,7 @@
 """按统一业务身份生成更新计划；不以坐标、旧编号或金额相等寻找来源。"""
 from collections import defaultdict
 from copy import deepcopy
+from datetime import date
 import re
 import hashlib
 import json
@@ -128,7 +129,7 @@ def _calculated_values(mapping, receipt):
             elif value is None and cell.data_type not in ('str','s'):
                 state,reason='error','重算后仍未取得计算结果'
             elif value is None or value=='':state,reason='blank','公式结果为空，不解释成零'
-            elif not isinstance(value,(str,int,float,bool)):
+            elif not isinstance(value,(str,int,float,bool,date)):
                 state,reason='error','计算结果不是可搬运的数值或文字';value=str(value)
             else:state,reason='value','已由Excel原生重算并回读'
             result[location]={'formula':formula,'state':state,'value':value,'reason':reason,
@@ -184,7 +185,8 @@ def load_fact_mapping(path, standard, _ancestors=frozenset()):
     path=Path(path).resolve(); raw=path.read_bytes()
     _require(path not in _ancestors,'派生映射存在循环引用')
     ancestors=_ancestors|{path}
-    mapping=json.loads(raw.decode('utf-8-sig'),object_pairs_hook=_pairs,parse_constant=_invalid_number)
+    from .统一语义 import json_dates
+    mapping=json.loads(raw.decode('utf-8-sig'),object_pairs_hook=json_dates,parse_constant=_invalid_number)
     if isinstance(mapping,list):
         from .A合集 import combine_direct_collections
         parts=[]

@@ -249,7 +249,8 @@ def 清点(成果库, 五样式目录, 输出):
     清单 = {"说明": "结构索引与代码初筛本批输入清单；路径与指纹为开工实测", "条目": 条目}
     输出 = Path(输出)
     输出.parent.mkdir(parents=True, exist_ok=True)
-    输出.write_text(json.dumps(清单, ensure_ascii=False, indent=1) + "\n", encoding="utf-8-sig")
+    with 输出.open("x", encoding="utf-8-sig") as file:
+        file.write(json.dumps(清单, ensure_ascii=False, indent=1) + "\n")
     return 清单
 
 

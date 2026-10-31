@@ -15,7 +15,7 @@ from 附注更新.语义 import SemanticError
 from 测试.测试统一语义 import records
 
 
-WORK = Path(r'C:\Users\27651\Documents\Codex\2026-10-16\12-c-users-27651-documents-codex\work')
+WORK = Path(__file__).resolve().parents[1] / '测试结果'
 
 
 class 直接识别测试(unittest.TestCase):

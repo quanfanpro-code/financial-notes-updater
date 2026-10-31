@@ -73,7 +73,9 @@ class 维度格身份证入口测试(unittest.TestCase):
         for call in (calls[1],calls[3]):
             definitions=[json.loads(line) for line in call[1]['金标准.jsonl'].splitlines()]
             self.assertTrue(any(row['id']=='period' and 'meaning' in row for row in definitions))
-            self.assertIn('完整工作表原文',call[1].get('原文.json',call[1].get('B原文.json',{})))
+            source=call[1].get('原文.json',call[1].get('B原文.json',{}))
+            self.assertTrue(call[1].get('本次原表网格.txt'))
+            self.assertIn('本次原表网格.txt',call[1])
         mapping=load_fact_mapping(config['a_mapping'],{})
         validate_direct_collection(mapping,for_matching=True)
         rows=dict(_records(mapping))
@@ -102,7 +104,7 @@ class 维度格身份证入口测试(unittest.TestCase):
                 {'location':'合成表!C3','dimension_id':'period','dimensions':{'entity':'乙'}}]
         with patch.object(UnifiedSemanticEngine,'request_text',return_value=json.dumps(answer,ensure_ascii=False)):
             result=run_step('recognize_a',config)
-        self.assertEqual(result['status'],'complete',result)
+        self.assertEqual(result['status'],'partial',result)
         old=load_fact_mapping(result['files']['a_mapping'],{})
         reply=[{'location':'合成表!B3','dimension_id':'asset_selection','dimensions':{'entity':'越界'}},
                {'location':'合成表!C3','dimension_id':'asset_selection'}]
@@ -125,6 +127,8 @@ class 维度格身份证入口测试(unittest.TestCase):
 
     def test_副本接续和已定位来源的默认字段均保存本格维度编号(self):
         config={**self.case.config}
+        for side in ('a','b'):
+            config[side+'_target_table']={**config[side+'_target_table'],'data_ranges':['B3']}
         reply=json.dumps([{'location':'合成表!B3','dimension_id':'period',
             'dimensions':{'period':{'kind':'instant','date':'2025-12-31'}},
             'template_period_role':'closing'}],ensure_ascii=False)
@@ -141,7 +145,7 @@ class 维度格身份证入口测试(unittest.TestCase):
         for step,extra in scopes:
             with self.subTest(step=step),patch.object(UnifiedSemanticEngine,'request_text',return_value=changed) as request:
                 result=run_step(step,{**config,**extra})
-                self.assertEqual(result['status'],'complete',result)
+                self.assertEqual(result['status'],'partial',result)
                 request.assert_called_once()
                 mapping=load_fact_mapping(result['files']['a_mapping' if step=='recognize_a' else 'b_mapping'],{})
                 self.assertEqual(dict(_records(mapping))['合成表!B3']['dimension_id'],'asset_selection')
@@ -156,6 +160,8 @@ class 维度格身份证入口测试(unittest.TestCase):
         book.defined_names.add(DefinedName('合成位置区',attr_text="'合成表'!$A$2:$C$8"))
         book.save(source);book.close()
         config={**self.case.config,'a_path':str(source)}
+        for side in ('a','b'):
+            config[side+'_target_table']={**config[side+'_target_table'],'data_ranges':['B3']}
         reply=json.dumps({'合成表!B3':{'metric_id':'固定资产原值'}},ensure_ascii=False)
         with patch.object(UnifiedSemanticEngine,'request_text',return_value=reply):
             for step in ('recognize_a','recognize_b'):

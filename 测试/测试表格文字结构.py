@@ -54,6 +54,45 @@ class 表格文字结构测试(unittest.TestCase):
         self.assertNotIn('metric_id', text)
         self.assertNotIn('dimension_id', text)
 
+    def test_包含表区及同范围别名只列一次网格但保留表号(self):
+        cells={'A1':{'row':1,'column':1,'value':'完整标题'},
+               'A2':{'row':2,'column':1,'value':'期末余额'},
+               'A3':{'row':3,'column':1,'value':None}}
+        source={'names':{'原表号':[{'sheet':'表','range':'A2:B3'}],
+                         '另一原表号':[{'sheet':'表','range':'A2:B3'}]},
+                'sheets':[{'name':'表','cells':cells,'merges':['A2:B2']}]}
+        areas=[{'sheet':'表','range':'A1:B3'},{'sheet':'表','range':'A2:B3'}]
+        for order in (areas,list(reversed(areas))):
+            text=workbook_table_text(source,order)
+            self.assertEqual(text.count('| 行号 |'),1)
+            self.assertEqual(text.count('A2 "期末余额"'),1)
+            for value in ('完整标题','原表号','另一原表号','范围：A2:B3','并入A2','A3 null〔原格空白〕'):
+                self.assertIn(value,text)
+        text=workbook_table_text(source,[areas[1]])
+        self.assertEqual(text.count('| 行号 |'),1)
+        self.assertIn('另一原表号',text)
+
+    def test_不同工作表及部分交叉表区不能按包含关系省去(self):
+        source={'sheets':[{'name':name,'cells':{},'merges':[]} for name in ('甲','乙')]}
+        areas=[{'sheet':'甲','range':'A1:B3'},{'sheet':'甲','range':'B2:C4'},
+               {'sheet':'乙','range':'A1:B3'}]
+        text=workbook_table_text(source,areas)
+        self.assertEqual(text.count('| 行号 |'),3)
+        for area in areas:self.assertIn('工作表：'+area['sheet']+'；原表区：；范围：'+area['range'],text)
+
+    def test_已有Word表号和原标题与对应网格一起展示(self):
+        source={'names':{'原表':[{'sheet':'表','range':'A1:B2'}]},
+                'context':['普通说明不作为表号关联',{'sheet':'表','range_name':'原表','table_id':'/word/document.xml#body/20','title':'原组合标题'},
+                           {'sheet':'另一表','range_name':'原表','title':'另一工作表标题'},
+                           {'sheet':'表','range_name':'其他表','title':'其他表标题'}],
+                'sheets':[{'name':'表','cells':{'A1':{'row':1,'column':1,'value':'账龄'}},'merges':[]}]}
+        text=workbook_table_text(source,[{'sheet':'表','range':'A1:B2'}])
+        self.assertLess(text.index('工作表：表'),text.index('原组合标题'))
+        self.assertLess(text.index('原组合标题'),text.index('| 行号 |'))
+        self.assertIn('/word/document.xml#body/20',text)
+        self.assertNotIn('另一工作表标题',text)
+        self.assertNotIn('其他表标题',text)
+
     def test_Word段落顺序跨度和两套位置分别保留(self):
         case = Word原文材料测试()
         case.setUp()
@@ -67,6 +106,24 @@ class 表格文字结构测试(unittest.TestCase):
         self.assertIn('原提取Excel=合成表!C12；当前Excel=合成表!C20', text)
         self.assertIn('原文 \\| 不拆开', text)
         self.assertIn('原格空白', text)
+
+    def test_局部命名范围不能替掉指定整表的表头数据和空白(self):
+        cells={'A1':{'row':1,'column':1,'value':'项目'},
+               'B1':{'row':1,'column':2,'value':'期末余额'},
+               'A2':{'row':2,'column':1,'value':'明细甲'},
+               'B2':{'row':2,'column':2,'value':7},
+               'A3':{'row':3,'column':1,'value':'合计'},
+               'B3':{'row':3,'column':2,'value':None}}
+        source={'names':{'片段甲':[{'sheet':'表','range':'A2'}],
+                         '片段乙':[{'sheet':'表','range':'A3'}]},
+                'sheets':[{'name':'表','cells':cells,'merges':[]}]}
+        for include_parent in (False,True):
+            if include_parent:source['names']['整表']=[{'sheet':'表','range':'A1:B3'}]
+            text=workbook_table_text(source,[{'sheet':'表','range':'A1:B3'}])
+            self.assertIn('A1 "项目"',text)
+            self.assertIn('B1 "期末余额"',text)
+            self.assertIn('B2 7',text)
+            self.assertIn('B3 null〔原格空白〕',text)
 
     def test_网格以真实换行发送且目标置于末尾(self):
         case = fixture.直接识别测试()
@@ -111,7 +168,7 @@ class 表格文字结构测试(unittest.TestCase):
                 a = result['files']['a_mapping']
 
 
-    def test_B参考A完整网格及各自文件归属保留且基础字段不混A(self):
+    def test_B只用本方完整网格及说明并保留A已识别身份参照(self):
         from openpyxl import Workbook
         from openpyxl.workbook.defined_name import DefinedName
         from 附注更新.表格 import file_hash
@@ -144,6 +201,7 @@ class 表格文字结构测试(unittest.TestCase):
         cfg = {**case.config, 'a_path': str(a_source), 'b_path': str(b_source),
                'a_target_table': target, 'b_target_table': target,
                'a_context_text': 'A完整表外说明及其例外必须保留',
+               'b_context_text': 'B完整表外说明及其例外必须保留',
                'a_required_ranges': [{'sheet': '合成表', 'range': 'B4'}]}
         a_raw = '{"location":"合成表!B4","metric_id":"固定资产原值","currency":"CNY"}'
         b_raw = '{"location":"合成表!B4","metric_id":"固定资产原值","currency":"USD"}'
@@ -156,17 +214,13 @@ class 表格文字结构测试(unittest.TestCase):
         self.assertEqual(b_result['status'], 'complete', b_result)
         call.assert_called_once()
         materials = call.call_args.args[1]
-        self.assertIn('A原表网格.txt', materials)
-        grid = materials['A原表网格.txt']
-        self.assertIn('A完整表区', grid)
-        self.assertIn('$A$2:$C$4', grid)
-        self.assertIn('并入B2', grid)
-        self.assertIn('B4 null〔原格空白〕', grid)
-        self.assertNotIn('B4 77', grid)
+        self.assertNotIn('A原表网格.txt', materials)
+        self.assertNotIn('A原表.json', materials)
+        self.assertIn('A需要.json', materials)
+        self.assertIn('B完整表区', materials['本次原表网格.txt'])
         self.assertIn('B4 77', materials['本次原表网格.txt'])
-        self.assertIn('A完整表外说明及其例外必须保留', json.dumps(materials['A原表.json'], ensure_ascii=False))
-        self.assertEqual(materials['A原表.json']['源文件'], {'path': str(a_source), 'sha256': file_hash(a_source)})
         own = materials.get('B原文.json', materials.get('原文.json'))
+        self.assertIn('B完整表外说明及其例外必须保留', json.dumps(own, ensure_ascii=False))
         self.assertEqual(own['载体'], 'B')
         self.assertEqual(own['源文件'], {'path': str(b_source), 'sha256': file_hash(b_source)})
         with patch.object(UnifiedSemanticEngine, 'request_text', return_value='{"location":"合成表!B4","currency":"USD"}') as call:

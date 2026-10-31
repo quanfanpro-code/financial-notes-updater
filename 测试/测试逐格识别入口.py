@@ -33,30 +33,28 @@ class 逐格识别入口测试(unittest.TestCase):
     def recognize(self,side,reply,extra=None):
         with ExitStack() as stack:
             call=stack.enter_context(patch.object(UnifiedSemanticEngine,'request_text',return_value=reply))
-            for name in ('_attach_declared_name_refs','_attach_declared_row_labels','_attach_declared_source_periods','_save_direct_relations',
+            for name in ('_save_direct_relations',
                          '_plain_answer','_own_answer_text','_period_rows','_direct_table'):
                 stack.enter_context(patch('附注更新.A合集.'+name,side_effect=AssertionError('逐格身份不得经额外关系加工')))
             stack.enter_context(patch('附注更新.正常入口识别.answer_relations',side_effect=AssertionError('识别不生成取数安排')))
             result=run_step('recognize_'+side,{**self.config,**(extra or {})})
-        self.assertEqual(result['status'],'complete',result)
+        # 只答部分格子的保存反例应返回partial，不能把测试助手当作识别完成判定。
+        self.assertIn(result['status'],('complete','partial'),result)
         call.assert_called_once()
         prompt,materials=call.call_args.args
         self.assertTrue(prompt.endswith(CELL_IDENTITY_OUTPUT))
-        self.assertIn('金标准对应的是本格自身承载的业务含义和计量值',prompt)
-        self.assertIn('维度使用金标准原始ID',prompt)
-        self.assertIn('原位置字段沿用location，维度分组字段沿用dimensions',prompt)
-        self.assertIn('不另加自命名的外层包装',prompt)
-        self.assertIn('不用字段别名或解释文字代替',prompt)
-        self.assertIn('财务数据格的原值为空或具体成员未知则仍按已明确含义选择指标',prompt)
-        self.assertIn('selection使用含mode的取值对象',prompt)
-        self.assertIn('三位大写代码',prompt)
-        self.assertIn('closing为期末、opening为期初、current为本期、prior为上期',prompt)
+        self.assertLessEqual(len(prompt),2000)
+        self.assertIn('各格分别是什么意思',prompt)
+        self.assertIn('金标准原始维度ID',prompt)
+        self.assertIn('location、metric_id或dimension_id',prompt)
+        self.assertIn('空白业务格照常识别',prompt)
+        self.assertIn('不展开共同声明或解释同义句',prompt)
         for text in ('共同取值可以合并','共用取值可以合并','更新后的A排布由你','给出本次确定的安排',
                      '本次采用的必要来源及其他未采用候选'):
             self.assertNotIn(text,prompt)
         if side=='b' and 'A需要.json' in materials:
-            self.assertIn('使用A已保存且符合金标准的同一实际取值',prompt)
-            self.assertIn('双方原文不同或无法确定时照实保留',prompt)
+            self.assertIn('A、B同义使用同一金标准表达',prompt)
+            self.assertIn('本方原文不同或未知时照实保留',prompt)
         self.assertNotIn('本次需要确定来源的A位置',materials)
         self.assertNotIn('已保存的当前候选对应',materials)
         return load_fact_mapping(result['files'][side+'_mapping'],{}),materials
@@ -82,10 +80,9 @@ class 逐格识别入口测试(unittest.TestCase):
                         a_mapping=result['files']['a_mapping']
                     call.assert_called_once()
                     prompt,_=call.call_args.args
-                    self.assertIn('逐项以金标准原始维度ID为字段名',prompt)
-                    self.assertIn('不要把未具名的取值对象直接放进dimensions',prompt)
-                    self.assertIn('不能由维度分组里的属性ID代替',prompt)
-                    self.assertIn('文字、列表或表格均可，不限定JSON或固定模板',prompt)
+                    self.assertIn('dimensions（按金标准原始维度ID）',prompt)
+                    self.assertIn('location、metric_id或dimension_id',prompt)
+                    self.assertIn('文字、列表、表格或对象均可',prompt)
                     mapping=load_fact_mapping(result['files'][side+'_mapping'],{})
                     record=dict(_records(mapping))['合成表!A3']
                     self.assertEqual(record['dimension_id'],'asset_selection')
@@ -176,6 +173,69 @@ class 逐格识别入口测试(unittest.TestCase):
         self.assertEqual({row['id']:row['value'] for row in parsed['dimensions']},dims)
         self.assertFalse(parsed['metrics'])
         self.assertFalse(parsed['dimension_bindings'])
+
+    def test_AB本次新识别的位置按相同方式保存且不越出原表(self):
+        from copy import deepcopy
+        from 附注更新.A合集 import save_direct_answer
+        a,_=self.recognize('a',self.answer())
+        for side in ('a','b'):
+            with self.subTest(side=side):
+                current=a if side=='a' else self.recognize('b',self.answer(),{'a_mapping':a['mapping_path']})[0]
+                old=deepcopy(current);old.pop('target_table',None);old.pop('target_tables',None)
+                reply={'合成表!A3':{'dimension_id':'asset_selection','dimensions':{
+                    'asset_selection':{'mode':'members','members':['设备甲']}}}}
+                scope={'合成表!A3':['metric_id','dimension_id','asset_selection']}
+                saved=save_direct_answer(old,reply,self.case.folder/('新识别位置'+side+'.json'),field_scope=scope)
+                records=dict(_records(saved))
+                self.assertIn('合成表!A3',records)
+                self.assertEqual(records['合成表!A3']['dimension_id'],'asset_selection')
+                self.assertEqual(records['合成表!A3']['dimensions']['asset_selection'],reply['合成表!A3']['dimensions']['asset_selection'])
+                for loc,row in _records(old):
+                    for key in ('metric_id','dimension_id','dimensions','raw_value','raw_value_state'):
+                        self.assertEqual(records[loc].get(key),row.get(key))
+                with self.assertRaises(ValueError):
+                    save_direct_answer(old,{'合成表!Z999':reply['合成表!A3']},
+                        self.case.folder/('越界位置'+side+'.json'),field_scope={'合成表!Z999':scope['合成表!A3']})
+
+    def test_AB正常入口导出实际原答复而非解析后的字段(self):
+        original=self.answer();a_path=None
+        for side in ('a','b'):
+            config={**self.config}
+            if a_path:config['a_mapping']=a_path
+            with patch.object(UnifiedSemanticEngine,'request_text',return_value=original):
+                result=run_step('recognize_'+side,config)
+            self.assertEqual(result['status'],'complete',result)
+            self.assertEqual(Path(result['files']['recognition_answer']).read_text(encoding='utf-8-sig'),original)
+            saved=load_fact_mapping(result['files'][side+'_mapping'],{})
+            self.assertEqual(saved['本次逐格原答复'],original)
+            if side=='a':a_path=saved['mapping_path']
+
+    def test_AB本次重选主类别时不必用另一空键撤下旧类别(self):
+        from copy import deepcopy
+        from 附注更新.A合集 import save_direct_answer
+        a,_=self.recognize('a',self.answer())
+        for side in ('a','b'):
+            with self.subTest(side=side):
+                current=a if side=='a' else self.recognize('b',self.answer(),{'a_mapping':a['mapping_path']})[0]
+                old=deepcopy(current);old.pop('target_table',None);old.pop('target_tables',None)
+                prior=dict(_records(old))['合成表!B3']['metric_id']
+                reply={'合成表!B3':{'dimension_id':'asset_selection',
+                       'dimensions':{'asset_selection':{'mode':'members','members':['设备甲']}}}}
+                if side=='b':
+                    reply='- location: 合成表!B3\n  - dimension_id: asset_selection\n  - dimensions: {"asset_selection":{"mode":"members","members":["设备甲"]}}'
+                scope={'合成表!B3':['metric_id','dimension_id','asset_selection']}
+                with patch.object(UnifiedSemanticEngine,'request_text',side_effect=AssertionError('原答复保存不能调用模型')):
+                    saved=save_direct_answer(old,reply,self.case.folder/('新主类别维度'+side+'.json'),field_scope=scope)
+                    records=dict(_records(saved))
+                    self.assertIn('合成表!B3',records)
+                    self.assertEqual(records['合成表!B3']['dimension_id'],'asset_selection')
+                    self.assertNotIn('metric_id',records['合成表!B3'])
+                    restored=save_direct_answer(saved,{'合成表!B3':{'metric_id':prior}},
+                        self.case.folder/('新主类别指标'+side+'.json'),field_scope=scope)
+                    record=dict(_records(restored))['合成表!B3']
+                    self.assertEqual(record['metric_id'],prior)
+                    self.assertNotIn('dimension_id',record)
+                    self.assertEqual(restored['机械记录'],old['机械记录'])
 
     def test_AB旧展示标签不屏蔽本格直接编号且说明仍保留(self):
         from copy import deepcopy
@@ -549,8 +609,9 @@ class 逐格识别入口测试(unittest.TestCase):
         self.assertEqual([row['location'] for row in materials['已有身份.json']['需要']],['合成表!B3'])
         source=materials.get('B原文.json',materials.get('原文.json'))
         self.assertIn('合成表!A2:C4',[row['sheet']+'!'+row['range'] for row in source['本次读取范围']])
-        full=next(row for row in source['完整工作表原文']['sheets'] if row['sheet']=='合成表')
-        self.assertIn('5:',full['rows'])
+        self.assertNotIn('sheets',source)
+        self.assertNotIn('完整工作表原文',source)
+        self.assertNotIn('测试项目5',materials['本次原表网格.txt'])
         self.assertEqual(materials['本次字段范围.json']['字段范围'],{'合成表!B3':['asset_selection']})
         self.assertEqual(saved['机械记录'],b['机械记录'])
 
@@ -923,8 +984,10 @@ class 逐格识别入口测试(unittest.TestCase):
                 self.assertEqual(actual[row['location']]['metric_id'],row['metric_id'])
                 self.assertEqual(actual[row['location']]['dimensions'],
                                  {key:value for key,value in row.items() if key in standard['dimension']})
-        with self.assertRaises(ValueError):
-            _per_cell_answer(reply+'\n{"location":',standard,['合成表'])
+        partial=_per_cell_answer(reply+'\n{"location":',standard,['合成表'])
+        expected=_per_cell_answer(records,standard,['合成表'])
+        for kind in ('metrics','dimension_bindings','dimensions'):
+            self.assertEqual(partial[kind],expected[kind])
 
     def test_AB独立原字段行与JSON对象保存同一身份(self):
         from 附注更新.A合集 import _per_cell_answer
@@ -1011,8 +1074,10 @@ class 逐格识别入口测试(unittest.TestCase):
         self.assertEqual(_per_cell_answer(arrays,standard,['合成表']),expected)
         self.assertNotIn('currency',{x['id'] for x in expected['dimensions'] if x['ranges']==['合成表!B3']})
         for bad in (reply[:-1],reply[:-1]+'{"location":\n]',reply[:-1]+',]'):
-            with self.subTest(bad=bad),self.assertRaises(ValueError):
-                _per_cell_answer(bad,standard,['合成表'])
+            with self.subTest(bad=bad):
+                partial=_per_cell_answer(bad,standard,['合成表'])
+                for kind in ('metrics','dimension_bindings','dimensions'):
+                    self.assertEqual(partial[kind],expected[kind])
 
     def test_AB连续JSON对象保留逐格字段并拒绝半份对象(self):
         from 附注更新.A合集 import _per_cell_answer
@@ -1033,8 +1098,11 @@ class 逐格识别入口测试(unittest.TestCase):
                          [('period','2031-12-31'),('currency','CNY')])
         self.assertEqual(partial['dimension_bindings'],[])
         for malformed in (reply+',',reply+'\n{"location":',reply+' 未完成'):
-            with self.subTest(malformed=malformed),self.assertRaises(ValueError):
-                _per_cell_answer(malformed,standard,['合成表'])
+            with self.subTest(malformed=malformed):
+                partial=_per_cell_answer(malformed,standard,['合成表'])
+                expected=_per_cell_answer(records,standard,['合成表'])
+                for kind in ('metrics','dimension_bindings','dimensions'):
+                    self.assertEqual(partial[kind],expected[kind])
         unowned=_per_cell_answer('{"currency":"USD"},'+chunks[2],standard,['合成表'])
         self.assertNotIn('currency',{row['id'] for row in unowned['dimensions']})
         a,_=self.recognize('a',reply)
@@ -1159,6 +1227,29 @@ class 逐格代码赋值读取测试(unittest.TestCase):
         self.assertEqual({row['id']: row['value'] for row in parsed['dimensions']},
             {'currency': 'CNY', 'unit_scale': 1})
 
+
+    def test_本格dimensions原字段路径保留字段和值(self):
+        from 附注更新.A合集 import _per_cell_answer
+        value={'mode':'members','members':['类甲']}
+        raw='- `合成表!B3`：`dimension_id=asset_selection`；`dimensions.asset_selection='+json.dumps(value,ensure_ascii=False)+'`。'
+        for reply in (raw,raw.replace('`','')):
+            result=_per_cell_answer(reply,self.standard(),['合成表'])
+            self.assertEqual([(row['id'],row['value']) for row in result['dimensions']],[('asset_selection',value)])
+            self.assertEqual(result['dimensions'][0]['original'],reply)
+        own=_per_cell_answer('- 合成表!B3：dimensions.currency=CNY',self.standard(),['合成表'])
+        self.assertEqual(own['dimension_bindings'],[])
+        self.assertEqual(own['dimensions'][0]['value'],'CNY')
+
+    def test_字段路径不读取别名_其他层级或JSON值内赋值文字(self):
+        from 附注更新.A合集 import _per_cell_answer
+        raw='- 合成表!B3：dimension_id=asset_selection；metadata.currency=CNY；dimensions.metric_id=固定资产原值；dimensions.币种=CNY'
+        invalid=_per_cell_answer(raw,self.standard(),['合成表'])
+        self.assertEqual(invalid['metrics'],[])
+        self.assertEqual(invalid['dimensions'],[])
+        value={'mode':'members','members':['描述 dimensions.currency=USD']}
+        reply='- 合成表!B3：dimension_id=asset_selection；dimensions.asset_selection='+json.dumps(value,ensure_ascii=False)
+        parsed=_per_cell_answer(reply,self.standard(),['合成表'])
+        self.assertEqual([(row['id'],row['value']) for row in parsed['dimensions']],[('asset_selection',value)])
 
 class 逐格交付接入状态测试(unittest.TestCase):
     def check_reply(self, reply, fields):

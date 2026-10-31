@@ -7,7 +7,7 @@ from zipfile import ZipFile
 import unittest
 from openpyxl import Workbook
 
-from 附注更新.Word原文材料 import word_source_material, word_request_material
+from 附注更新.Word原文材料 import word_source_material, word_request_material, word_table_context
 from 附注更新.表格 import file_hash
 
 
@@ -100,6 +100,69 @@ class Word原文材料测试(unittest.TestCase):
                 row['cells'] = cells
         self.assertEqual(restored, original)
         self.assertLess(len(json.dumps(packed)), len(json.dumps(original)))
+
+
+    def section_material(self):
+        material = word_source_material(self.link)
+        positions=iter(range(100))
+        def p(text, level=None):
+            return {'kind':'paragraph','word_position':'/word/document.xml#body/'+str(next(positions)),'text':text,
+                    **({'word_outline_level':level} if level is not None else {})}
+        material['blocks'] = [p('合成企业2025年度'),p('基本情况',0),p('公司历史',1),p('无关历史正文'),
+            p('附注',0),p('所有金额人民币元；本期2025年度'),p('上一节',2),p('上一节无关正文'),
+            p('本节固定资产2024年度',2),p('本表期初期末说明'),material['blocks'][1],
+            p('表后例外说明'),p('下一节',2),p('下一节无关正文')]
+        return material
+
+    def test_按原生提纲保留上下文且不改表格(self):
+        from copy import deepcopy
+        material=self.section_material();before=deepcopy(material)
+        context,ranges=word_table_context(material,[{'sheet':'合成表','range':'C11'}])
+        for text in ('合成企业2025年度','附注','所有金额人民币元','本节固定资产2024年度',
+                     '本表期初期末说明','表后例外说明','合成表!B10:D12'):
+            self.assertIn(text,context['text'])
+        for text in ('无关历史正文','上一节无关正文','下一节无关正文'):
+            self.assertNotIn(text,context['text'])
+        self.assertEqual(ranges,[{'table_id':'/word/document.xml#body/1','sheet':'合成表','range':'B10:D12'}])
+        self.assertEqual(material,before)
+
+    def test_没有提纲或找不到表就保留原输入(self):
+        self.assertIsNone(word_table_context(word_source_material(self.link),[{'sheet':'合成表','range':'B10:D12'}]))
+        self.assertIsNone(word_table_context(self.section_material(),[{'sheet':'合成表','range':'X99'}]))
+
+    def test_明确引用另一节表格也完整保留(self):
+        from copy import deepcopy
+        material=self.section_material();table=deepcopy(next(block for block in material['blocks'] if block['kind']=='table'));table['table_id']='另一表';table['table_number']=2
+        for row in table['rows']:
+            for cell in row['cells']:
+                cell['source_excel']=cell['source_excel'].replace('10','30').replace('11','31').replace('12','32')
+        material['blocks'].append(table)
+        context,ranges=word_table_context(material,[{'sheet':'合成表','range':'C11'},{'sheet':'合成表','range':'C31'}])
+        self.assertIn('下一节无关正文',context['text'])
+        self.assertEqual(len(ranges),2)
+        self.assertEqual(context['text'].count('所有金额人民币元'),1)
+
+
+    def test_文档首标题不属于本表祖先时仍保留(self):
+        material=self.section_material()
+        material['blocks'].insert(1,{'kind':'paragraph','word_position':'/word/document.xml#body/999',
+                                     'word_outline_level':0,'text':'2025年度财务报表附注'})
+        context,ranges=word_table_context(material,[{'sheet':'合成表','range':'C11'}])
+        self.assertIn('2025年度财务报表附注',context['text'])
+        self.assertNotIn('无关历史正文',context['text'])
+
+
+    def test_其他报告级章节的开头说明保留而下级正文不混入(self):
+        material=self.section_material()
+        extra=[{'kind':'paragraph','word_position':'extra0','word_outline_level':0,'text':'报告共同说明'},
+               {'kind':'paragraph','word_position':'extra1','text':'跨章节的币种及期间原文候选'},
+               {'kind':'paragraph','word_position':'extra2','word_outline_level':1,'text':'其他政策'},
+               {'kind':'paragraph','word_position':'extra3','text':'不相关政策的长篇正文'}]
+        material['blocks'][1:1]=extra
+        context,ranges=word_table_context(material,[{'sheet':'合成表','range':'C11'}])
+        self.assertIn('跨章节的币种及期间原文候选',context['text'])
+        self.assertNotIn('不相关政策的长篇正文',context['text'])
+        self.assertNotIn('无关历史正文',context['text'])
 
 
 if __name__ == '__main__':

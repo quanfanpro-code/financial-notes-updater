@@ -28,22 +28,20 @@ class 章节与既有身份参照测试(unittest.TestCase):
                           'dimensions': {'asset_selection': self.selection, 'currency': currency,
                                          'period': str(year) + '-12-31'}}, ensure_ascii=False)
         with patch.object(UnifiedSemanticEngine, 'request_text', return_value=raw) as call:
-            result = run_step('recognize_' + side, {**self.case.config, **extra})
+            result = run_step('recognize_' + side, {**self.case.config,
+                side+'_target_table':{'id':'本表','sheet':'合成表','range':'A2:C4','data_ranges':['B3']},**extra})
         self.assertEqual(result['status'], 'complete', result)
         call.assert_called_once()
         saved = json.loads(Path(result['files'][side + '_mapping']).read_text('utf-8-sig'))
         return saved, call.call_args.args
 
-    def test_A有既有B时原样参照且不自动抄写本方事实(self):
+    def test_A有既有B也只读本方原文及金标准(self):
         a, _ = self.recognize('a', 2025)
         b, _ = self.recognize('b', 2024, a_mapping=a['mapping_path'])
         result, (prompt, materials) = self.recognize(
             'a', 2025, 'USD', b_mapping=b['mapping_path'], a_allowed_metrics=['固定资产原值'])
-        reference = materials['既有另一方身份证表达.json']
-        self.assertEqual(reference['sha256'], file_hash(b['mapping_path']))
-        self.assertEqual(reference['原样身份']['需要'][0]['dimensions'],
-                         dict(_records(b))['合成表!B3']['dimensions'])
-        self.assertIn('不能为对应抄写另一方事实', prompt)
+        self.assertNotIn('既有另一方身份证表达.json',materials)
+        self.assertIn('依据本方完整原文及相关金标准', prompt)
         own = dict(_records(result))['合成表!B3']['dimensions']
         self.assertEqual((own['period'], own['currency']), ('2025-12-31', 'USD'))
         self.assertEqual(own['asset_selection'], self.selection)

@@ -32,6 +32,50 @@ class 公式共用原文测试(unittest.TestCase):
         self.assertIn('底稿!B301',original['公式引用依据']['原文'])
         self.assertEqual(material['公式原文'],original['公式原文'])
 
+    def test_同列上方文字公式保留原文而不牵入其他表来源(self):
+        from 附注更新.A语义阅读 import compact_formula_material
+        snapshot={'path':'小例.xlsx','semantic_formula_sources':4,'sheets':[
+            {'name':'展示','merges':[],'cells':{'B5':原格(5,2,formula="='汇总'!B5")}},
+            {'name':'汇总','merges':['B1:C1'],'cells':{
+                'B1':{**原格(1,2,formula="='说明'!A1"),'cached_value':'单位：元'},
+                'B3':{**原格(3,2,formula="='其他'!A1"),'cached_value':'上一张表原文'},
+                'B5':原格(5,2,5)}},
+            {'name':'说明','merges':[],'cells':{'A1':原格(1,1,'单位：元')}},
+            {'name':'其他','merges':[],'cells':{'A1':原格(1,1,'上一张表原文')}}]}
+        tables=[{'sheet':'展示','range':'B5','data_ranges':['B5']}]
+        material,_=source_material(snapshot,[],tables)
+        proof=material['公式引用依据']
+        self.assertIn('说明!A1',proof['原文'])
+        self.assertNotIn('其他!A1',proof['原文'])
+        text=compact_formula_material(snapshot,material)
+        summary=next(row for row in text['公式及来源']['来源行列原文'] if row['sheet']=='汇总')
+        self.assertIn('上一张表原文',summary['rows'])
+        self.assertEqual(text['公式及来源']['公式原文']['汇总!B3'],"='其他'!A1")
+        snapshot['sheets'][0]['cells']['B5']['formula']="='汇总'!B3"
+        actual,_=source_material(snapshot,[],tables)
+        self.assertIn('其他!A1',actual['公式引用依据']['原文'])
+
+    def test_定向追溯只跟随作答格并保留无缓存表头来源(self):
+        snapshot={'path':'小例.xlsx','semantic_formula_sources':4,'sheets':[
+            {'name':'展示','merges':[],'cells':{
+                'A1':{**原格(1,1,formula="='说明'!A1"),'cached_value':'本表完整标题'},
+                'B2':原格(2,2,formula="='明细'!B2"),
+                'C2':{**原格(2,3,formula="='其他'!C2"),'cached_value':12}}},
+            {'name':'说明','merges':[],'cells':{'A1':原格(1,1,'本表完整标题')}},
+            {'name':'明细','merges':[],'cells':{'A2':原格(2,1,'实际业务'),'B2':原格(2,2,5)}},
+            {'name':'其他','merges':[],'cells':{'C2':原格(2,3,12)}}]}
+        tables=[{'sheet':'展示','range':'A1:C2','data_ranges':['B2']}]
+        material,_=source_material(snapshot,[],tables)
+        self.assertIn('本表完整标题',material['sheets'][0]['rows'])
+        self.assertEqual(material['公式原文']['展示!C2'],"='其他'!C2")
+        self.assertIn('明细!B2',material['公式引用依据']['原文'])
+        self.assertNotIn('其他!C2',material['公式引用依据']['原文'])
+        snapshot['sheets'][0]['cells']['A1']['cached_value']=None
+        missing,_=source_material(snapshot,[],tables)
+        self.assertIn('说明!A1',missing['公式引用依据']['原文'])
+        all_cells,_=source_material(snapshot,[],[{'sheet':'展示','range':'A1:C2','data_ranges':[]}])
+        self.assertIn('其他!C2',all_cells['公式引用依据']['原文'])
+
     def test_整段引用不重复携带共同文字(self):
         cells = {'A1': 原格(1, 1, '父项共同说明')}
         cells.update({f'B{row}': 原格(row, 2, f'分类项目{row:03}的原始说明') for row in range(2, 202)})

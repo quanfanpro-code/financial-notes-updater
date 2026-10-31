@@ -53,7 +53,7 @@ class 唯一身份证匹配测试(unittest.TestCase):
         from 附注更新.分步流程 import _match, _prepare_update_v2, _write_v2
         with patch('附注更新.分步流程._path',return_value=Path('旧映射')), \
              patch('附注更新.分步流程._read',return_value={'schema_version':1}), \
-             patch('附注更新.分步流程.build_update_plan') as legacy:
+             patch('附注更新.表格.build_update_plan') as legacy:
             with self.assertRaisesRegex(ValueError,'已保存身份证合集'):
                 _match({},None,None,None)
             legacy.assert_not_called()

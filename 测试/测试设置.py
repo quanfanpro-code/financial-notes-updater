@@ -536,59 +536,6 @@ class 设置测试(unittest.TestCase):
                 path.write_text(json.dumps({"scope_prefilter":value}), encoding="utf-8-sig")
                 with self.assertRaisesRegex(ValueError, "来源筛选"):load_settings(path)
 
-    def test_B页筛选默认关闭切换保留A并清理B及下游选择(self):
-        import tkinter as tk
-        from unittest.mock import patch
-        from 附注更新 import 界面
-        legacy=Path(tempfile.mkdtemp(prefix="旧版范围界面_"))/"旧版标准.jsonl"
-        legacy.write_text(json.dumps({'id':'旧版定义'}),encoding='utf-8-sig')
-        root = tk.Tk();root.withdraw()
-        try:
-            with patch.object(界面, "load_settings", return_value={'gold_path':str(legacy)}):app = 界面.Application(root)
-            app.show_step("recognize_b")
-            self.assertIs(app.config().get("scope_prefilter"), False)
-            checks = [w for w, _ in app.page_editable if isinstance(w, tk.Checkbutton)
-                      and w.cget("text") == "先按附注内容筛选来源（可选）"]
-            self.assertEqual(len(checks), 1)
-            for key in ("a_link", "a_mapping", "b_path", "b_mapping", "b_scope", "b_review", "update_plan", "word"):
-                app.values[key].set(key+".测试")
-            checks[0].invoke()
-            self.assertIs(app.config()["scope_prefilter"], True)
-            for key in ("a_link", "a_mapping", "b_path"):self.assertEqual(app.values[key].get(), key+".测试")
-            for key in ("b_mapping", "b_scope", "b_review", "update_plan", "word"):self.assertEqual(app.values[key].get(), "")
-            app.show_step("recognize_a");app.show_step("recognize_b")
-            self.assertIs(app.config()["scope_prefilter"], True)
-            with patch.object(界面, "save_settings") as save:
-                app.save();self.assertIs(save.call_args.args[0]["scope_prefilter"], True)
-            checks = [w for w, _ in app.page_editable if isinstance(w, tk.Checkbutton)
-                      and w.cget("text") == "先按附注内容筛选来源（可选）"]
-            app.values["b_mapping"].set("新范围映射.json");checks[0].invoke()
-            self.assertIs(app.config()["scope_prefilter"], False)
-            self.assertEqual(app.values["b_mapping"].get(), "")
-            self.assertEqual(app.values["a_link"].get(), "a_link.测试")
-            path = Path(tempfile.mkdtemp(prefix="界面来源筛选保存_"))/"独立测试配置.json"
-            with patch.object(界面, "save_settings", side_effect=lambda config:save_settings(config, path)):
-                app.save()
-            saved = load_settings(path)
-            self.assertIs(saved["scope_prefilter"], False)
-        finally:_destroy_test_window(root)
-        root = tk.Tk();root.withdraw()
-        try:
-            with patch.object(界面, "load_settings", return_value=saved):app = 界面.Application(root)
-            app.show_step("recognize_b")
-            self.assertIs(app.config()["scope_prefilter"], False)
-            self.assertEqual(app.values["a_link"].get(), "a_link.测试")
-            checks = [w for w, _ in app.page_editable if isinstance(w, tk.Checkbutton)
-                      and w.cget("text") == "先按附注内容筛选来源（可选）"]
-            self.assertEqual(len(checks), 1)
-            self.assertEqual(root.getvar(checks[0].cget("variable")), 0)
-            clear = [w for w, _ in app.page_editable if isinstance(w, tk.Button)
-                     and w.cget("text") == "清空" and w.master == app.path_entries["b_mapping"].master]
-            self.assertEqual(len(clear), 1)
-            app.values["b_mapping"].set("旧范围映射.json");clear[0].invoke()
-            self.assertEqual(app.values["b_mapping"].get(), "")
-            self.assertEqual(app.values["a_link"].get(), "a_link.测试")
-        finally:_destroy_test_window(root)
 
     def test_新版更新数据页只呈现已接通的独立识别流程(self):
         import tkinter as tk

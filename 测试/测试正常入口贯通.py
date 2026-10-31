@@ -282,40 +282,7 @@ class 正常入口贯通测试(unittest.TestCase):
         self.assertEqual(source_relation(a,b,raw,['原表!C9','原表!D9'])['bindings'],[
             {'target':'原表!C9','source':'来源一!I18'},{'target':'原表!D9','source':'来源二!C29'}])
 
-    def test_明确标签文字与普通来源搬运只写一次(self):
-        from 附注更新.模板更新编排 import direct_update_plan
-        a={'source_hash':'a','gold_hash':'g','facts':[],'outline':{'subtables':[]},
-            '机械记录':{'names':{},'sheets':[{'name':'原表','cells':{'B1':{'value':'旧标签'}},'merges':[]}]}}
-        b={**a,'source_hash':'b','机械记录':{'sheets':[{'name':'来源','cells':{'A2':{'value':'合计'}},'merges':[]}]},
-            '已确认关系':[{'kind':'取数对应','source_a_hash':'a','source_b_hash':'b','gold_hash':'g',
-                'bindings':[{'target':'原表!B1','source':'来源!A2'}],
-                'label_actions':[{'action':'set','target':'原表!B1','value':'合计（指定期间）'}]}]}
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value={'dimension':{}}):
-            plan=direct_update_plan(a,b)
-        self.assertEqual(plan['updates'],[])
-        self.assertEqual([(r['cell'],r['value']) for r in plan['labels']],[('B1','合计（指定期间）')])
 
-    def test_插入后新行引用不覆盖原合计(self):
-        from 附注更新.正常入口识别 import answer_relations
-        from 附注更新.模板更新编排 import direct_update_plan
-        a={'source_hash':'a','gold_hash':'g','facts':[],'outline':{'subtables':[]},'机械记录':{
-            'names':{'表区':[{'sheet':'原表','range':'B2:D5'}]},
-            'sheets':[{'name':'原表','cells':{col+str(row):{'value':'合计' if col=='B' and row==5 else 9} for row in range(2,6) for col in 'BCD'},'merges':[]}]}}
-        b={'source_hash':'b','gold_hash':'g','facts':[],'outline':{'subtables':[]},'a_required_ranges':[{'sheet':'原表','range':'B2:D5'}],
-            '机械记录':{'sheets':[{'name':'来源','cells':{'A10':{'value':None},'B10':{'value':None},'C10':{'value':'#DIV/0!','excel_data_type':'e'},'B11':{'value':99},'C11':{'value':88}},'merges':[]}]},
-            '已确认关系':[{'kind':'取数对应','source_a_hash':'a','source_b_hash':'b','gold_hash':'g','bindings':[{'target':'原表!C5','source':'来源!B11'},{'target':'原表!D5','source':'来源!C11'}]}]}
-        b['识别答复']=('新增成员\n| A位置（插入后） | 本次采用的B来源 |\n|---|---|\n'
-            '| 原表!B5 | 来源!A10 |\n| 原表!C5 | 来源!B10 |\n| 原表!D5 | 来源!C10 |\n沿用A原样式，原合计后移一行。')
-        with patch('附注更新.正常入口识别.direct_reference',return_value={'需要':[]}):
-            relations=answer_relations(a,b,[],[],{'dimension':{}},b['a_required_ranges'],targets=['原表!B5','原表!C5','原表!D5'])
-        b['已确认关系'].extend(relations)
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value={'dimension':{}}):
-            plan=direct_update_plan(a,b)
-        values={r['cell']:r['value'] for r in plan['updates']}
-        self.assertEqual((values['C6'],values['D6']),(99,88))
-        self.assertIsNone(values['C5'])
-        self.assertEqual(values['D5'],'#DIV/0!')
-        self.assertIn({'cell':'B5','value':None},[{k:r[k] for k in ('cell','value')} for r in plan['labels']])
 
     def test_明确替换合并单元格文字落到承载格(self):
         from 附注更新.A合集 import source_relation
@@ -339,38 +306,7 @@ class 正常入口贯通测试(unittest.TestCase):
         self.assertEqual(tables[0]['totals'],[{'target_row':6,'source_row':13}])
         self.assertEqual(tables[0]['operations'],[{'axis':'row','action':'insert','index':4,'count':1,'template_index':2}])
 
-    def test_定向名单不扩大到其他表或覆盖未请求列(self):
-        from 附注更新.正常入口识别 import answer_relations
-        from 附注更新.A合集 import append_declared_relation
-        a={'source_hash':'a','机械记录':{'names':{'甲':[{'sheet':'原表','range':'B2:D5'}],'乙':[{'sheet':'原表','range':'B8:D11'}]}}}
-        old={'range_name':'甲','first_row_offset':1,'old_detail_count':2,'source_sheet':'来源','source_rows':[10,11],
-            'columns':{'C':'B','D':'C'},'labels':{'B':'A'},'totals':[{'target_row':5,'source_row':12}]}
-        changed={**old,'columns':{'C':'F','D':'G'}}
-        b={'source_hash':'b','gold_hash':'g','识别答复':'名单更新',
-            '已确认关系':[{'kind':'名单编排','answer_hash':'old','tables':[old]}]}
-        with patch('附注更新.正常入口识别.direct_reference',return_value={'需要':[]}),\
-             patch('附注更新.正常入口识别.source_relation',return_value={'bindings':[],'label_actions':[],'caption_updates':[]}),\
-             patch('附注更新.A合集.declared_named_row_relations',return_value=([],[changed,{**changed,'range_name':'乙'}])):
-            fresh=answer_relations(a,b,[],[],{'dimension':{}},[{'sheet':'原表','range':'B2:D5'}],targets=['原表!C3'])
-        self.assertEqual([t['range_name'] for t in fresh[0]['tables']],['甲'])
-        relations=b['已确认关系']
-        append_declared_relation(relations,fresh[0])
-        table=relations[-1]['tables'][0]
-        self.assertEqual(table['row_columns']['10'],{'C':'F','D':'C'})
-        self.assertEqual(table['row_sources']['10']['D'],'来源!C10')
-        self.assertEqual(table['row_sources']['11']['C'],'来源!B11')
 
-    def test_同一来源的标签搬运只安排一次(self):
-        from 附注更新.A合集 import source_relation
-        from 附注更新.模板更新编排 import direct_update_plan
-        a={'source_hash':'a','gold_hash':'gold','facts':[],'outline':{'subtables':[]},
-           '机械记录':{'names':{},'sheets':[{'name':'原表','cells':{'B1':{'value':'旧标签'}},'merges':[]}]}}
-        b={**a,'source_hash':'b','机械记录':{'names':{},'sheets':[{'name':'来源','cells':{'C2':{'value':'新标签'}},'merges':[]}]}}
-        b['已确认关系']=[source_relation(a,b,'A 原表!B1 采用 B 来源!C2；标签：A B1 → B 来源!C2。',['原表!B1'])]
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value={'dimension':{}}):
-            plan=direct_update_plan(a,b)
-        self.assertEqual(plan['updates'],[])
-        self.assertEqual([(r['cell'],r['value']) for r in plan['labels']],[('B1','新标签')])
 
     def test_两方合并表头引用落到实际保存文字的位置(self):
         from 附注更新.A合集 import source_relation
@@ -433,25 +369,12 @@ class 正常入口贯通测试(unittest.TestCase):
             '来源!C3':'metric.allowance','来源!C4':'metric.allowance',
             '来源!B10':'metric.allowance','来源!B11':'metric.allowance'})
 
-    def test_来源对应表复用同段明确日期且不扩展字段范围(self):
-        from 附注更新.A合集 import _attach_declared_source_periods
-        answer={'sheet':'来源','data_ranges':['B3:C4'],'dimensions':[{'id':'period','ranges':['B3:C4'],'value':'旧日期'}]}
-        mapping={'机械记录':{'sheets':[{'name':'来源'}]}}
-        raw=('## 表一\n副本应标为：期末2025年12月31日，期初2024年12月31日。\n'
-             '期间标签：A C1 采用 B 来源!B1 的期末余额，A D1 采用 B 来源!C1 的期初余额。\n'
-             '| A位置 | B位置 | 含义 |\n|---|---|---|\n'
-             '| C3 | 来源!B3 | 期末余额 |\n| D3 | 来源!C3 | 期初余额 |')
-        _attach_declared_source_periods(answer,mapping,raw,{'来源!B3:C3':['period','template_period_role']})
-        dates={cell:r['value'] for r in answer['dimensions'] if r['id']=='period' for cell in r['ranges']}
-        self.assertEqual(dates,{'B4':'旧日期','C4':'旧日期','B3':'2025-12-31','C3':'2024-12-31'})
-        periods=[r for r in answer['dimensions'] if r['id']=='template_period_role']
-        self.assertEqual([r['value'] for r in periods],['closing','opening'])
-        self.assertEqual(periods[0]['label_references'],['来源!B1'])
-        _attach_declared_source_periods(answer,mapping,
-            '来源!B3:C4：期末部分实际日期为2026年12月31日；期初部分实际日期为2026年1月1日。',
-            {'来源!B3:C4':['period']})
-        dates={cell:r['value'] for r in answer['dimensions'] if r['id']=='period' for cell in r['ranges']}
-        self.assertEqual(dates,{'B4':'旧日期','C4':'旧日期','B3':'2026-12-31','C3':'2026-01-01'})
+    def test_共同日期声明不能补成本格期间(self):
+        from 附注更新.A合集 import _per_cell_answer
+        reply='期末实际日期为2025年12月31日。\n- 来源!B3：metric_id=m1。'
+        saved=_per_cell_answer(reply,{'metric':{'m1':{}},'dimension':{'period':{}}},['来源'])
+        self.assertEqual([r['id'] for r in saved['metrics']],['m1'])
+        self.assertFalse(saved['dimensions'])
 
     def test_明确新名单引用及原成员原值单列保留(self):
         from 附注更新.A合集 import declared_named_row_relations,source_relation
@@ -544,22 +467,6 @@ class 正常入口贯通测试(unittest.TestCase):
         self.assertEqual(table['retained_members'][0]['cells']['F'],{'source':'原表!F4'})
         self.assertEqual(table['operations'],[{'axis':'row','action':'insert','index':3,'count':1,'template_index':1}])
 
-    def test_同一名单的指标段不得截断其他段已声明的来源与排布(self):
-        from 附注更新.正常入口识别 import answer_relations
-        raw=('## 来源\nmember＝原答复列明的名单，金额取来源表。\n'
-             '## 对应与排布\nmetric.example 采用原有明细含义。\n'
-             '### 名单更新后的排布\n四段来源与保留项沿用上述说明。')
-        standard={'dimension':{'member':{'value_type':'selection'}},
-                  'metric':{'metric.example':{'dimension_refs':[{'id':'member'}]}}}
-        a={'source_hash':'a'};b={'source_hash':'b','gold_hash':'g','识别答复':raw}
-        relation={'bindings':[],'label_actions':[],'caption_updates':[]}
-        with patch('附注更新.正常入口识别.direct_reference',return_value={'需要':[]}),\
-             patch('附注更新.正常入口识别.source_relation',return_value=relation),\
-             patch('附注更新.A合集.declared_named_row_relations',return_value=([],[])),\
-             patch('附注更新.正常入口识别._declared_list_tables',return_value=[]) as parse,\
-             patch('附注更新.正常入口识别._list_relation_conflicts',return_value=([],[])):
-            answer_relations(a,b,[],[],standard,[])
-        self.assertEqual(parse.call_args.args[1],raw)
 
     def test_原成员名称与明示来源行接入且新增空白位置不丢失(self):
         from 附注更新.A合集 import declared_named_row_relations
@@ -604,40 +511,6 @@ class 正常入口贯通测试(unittest.TestCase):
         self.assertEqual(result[0]['row_sources']['31']['F'],'来源!I91')
         self.assertEqual(result[0]['operations'],[{'axis':'row','action':'insert','index':2,'count':2,'template_index':1}])
 
-    def test_新名单位置与原表分开并复用明确的旧成员关系(self):
-        from 附注更新.正常入口识别 import answer_relations
-        a={'source_hash':'a','gold_hash':'g','facts':[],'机械记录':{'names':{'表区':[{'sheet':'原表','range':'B20:D23'}]},
-            'sheets':[{'name':'原表','merges':[],'cells':{'B21':{'value':'旧项'},'B22':{'value':'乙'}}}]},
-            'outline':{'subtables':[{'sheet':'原表','range':'B20:D23','dimensions':[{'id':'member'}]}]}}
-        b={'source_hash':'b','gold_hash':'g','facts':[],'机械记录':{'sheets':[{'name':'来源','merges':[],'cells':{}}]},
-           '已确认关系':[{'content':'A现有项目“乙”对应B 来源!A82“乙”。'}]}
-        raw=('## 名单：沿用 A 的名单维度，按 B 更新成员\nA 原表!B20:D23 是原表。按 B 来源!A80:A82 的实际名单更新。\n'
-             '建议排布为：A 原表!B21:B23 依次列“甲、空白业务位置、乙”；A 原表!B24 保留原“旧项”及其原值；A 原表!B25 为合计。\n'
-             '- A 原表!C21 → B 来源!B80。\n- A 原表!C22 → B 来源!B81。\n- A 原表!C23 → B 来源!B82。\n- A 原表!C25 → B 来源!B85。\n\n'
-             'A 原表!D21:D23 及 D25 是期初位置；无来源，保留原内容。')
-        standard={'dimension':{'member':{'value_type':'selection'}},'metric':{}}
-        with patch('附注更新.正常入口识别.direct_reference',return_value={'需要':[]}):
-            relations=answer_relations(a,{**b,'识别答复':raw},[{'sheet':'来源','range':'A80:C85'}],[],standard,[])
-        table=next(r for r in relations if r['kind']=='名单编排')['tables'][0]
-        self.assertEqual(table['source_rows'],[80,81,82])
-        self.assertEqual(table['columns'],{'C':'B'})
-        self.assertEqual(table['totals'],[{'target_row':23,'source_row':85}])
-        self.assertEqual(table['retained_members'][0]['cells']['D'],{'source':'原表!D21'})
-        self.assertEqual(table['blank_values']['80']['D'],{'value':None})
-        self.assertEqual(table['blank_values']['81']['C'],{'value':None})
-        self.assertEqual(table['blank_values']['82']['D'],{'source':'原表!D22'})
-        from 附注更新.模板更新编排 import direct_update_plan
-        a['机械记录']['sheets'][0]['cells'].update({col+str(row):{'value':10 if col=='C' else None} for row in range(20,24) for col in 'CD'})
-        a['机械记录']['sheets'][0]['cells']['B23']={'value':'合计'}
-        b['机械记录']['sheets'][0]['cells']={col+str(row):{'value':value} for row,name,value in [(80,'甲',20),(81,None,None),(82,'乙',30),(85,'合计',50)] for col,value in [('A',name),('B',value)]}
-        b['已确认关系']=relations
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value=standard):
-            plan=direct_update_plan(a,b)
-        updates={r['cell']:r['value'] for r in plan['updates']}
-        self.assertEqual(updates['C23'],30)
-        self.assertEqual(updates['C24'],10)
-        self.assertIsNone(updates['C22'])
-        self.assertIn({'cell':'B22','value':None},[{k:r[k] for k in ('cell','value')} for r in plan['labels']])
 
     def test_保留指令标题覆盖其后位置且不越过下一标题(self):
         from 附注更新.A合集 import source_relation
@@ -666,22 +539,6 @@ class 正常入口贯通测试(unittest.TestCase):
         result=source_relation(a,b,raw,['原表!C3','原表!D3'])
         self.assertEqual(result['label_actions'],[{'action':'copy','target':'原表!C2','source':'来源!B8'},{'action':'copy','target':'原表!D2','source':'来源!C8'}])
 
-    def test_补来源同次答复的名单安排进入同一合集(self):
-        from 附注更新.A合集 import save_source_relations
-        root=Path('测试输出')/('来源与名单_'+uuid.uuid4().hex);root.mkdir(parents=True)
-        a={'source_hash':'a','gold_hash':'g','facts':[],'机械记录':{'sheets':[{'name':'原表','merges':[]}]}}
-        b={'source_hash':'b','facts':[],'机械记录':{'sheets':[{'name':'来源','merges':[]}]}}
-        declared={'kind':'名单编排','dimension':'member','answer_hash':'list','tables':[]}
-        b['答复接入来源']={'本次原答复':'旧的另一份答复'}
-        with patch('附注更新.A合集._standard',return_value={}),\
-             patch('附注更新.正常入口识别.answer_relations',autospec=True,return_value=[declared]) as parser,\
-             patch('附注更新.A合集.direct_digest',return_value='digest'),\
-             patch('附注更新.统一勾稽.load_fact_mapping',side_effect=lambda path,_:json.loads(path.read_text(encoding='utf-8'))):
-            result=save_source_relations(a,b,'A原表!C3采用B来源!D7。名单沿用已有安排。',['原表!C3'],root/'合集.json')
-        self.assertEqual([r['kind'] for r in result['已确认关系']],['取数对应','名单编排'])
-        part=parser.call_args.args[1]
-        self.assertEqual(part.get('答复接入来源',{}).get('本次原答复',part['识别答复']),'A原表!C3采用B来源!D7。名单沿用已有安排。')
-        self.assertEqual(result['已确认关系'][0]['bindings'],[{'target':'原表!C3','source':'来源!D7'}])
 
     def test_名单位置表的期间来源沿用已识别列角色(self):
         from 附注更新.A合集 import _declared_list_tables
@@ -766,39 +623,7 @@ class 正常入口贯通测试(unittest.TestCase):
             {'range_name':'TA_003','old_text':'原名单标题','text':'模型明确的新名单标题。'}])
         self.assertEqual(result['label_actions'],[])
 
-    def test_模型明示搬运不因目标编号未接入而丢失(self):
-        from 附注更新.模板更新编排 import direct_update_plan
-        a={'source_hash':'a','gold_hash':'gold','facts':[],'outline':{'subtables':[]},
-           'unresolved':[{'sheet':'原表','cell':'C3','reason':'编号尚未接入'}],
-           '机械记录':{'names':{},'sheets':[{'name':'原表','merges':[],'cells':{
-               'C3':{'value':9},'C4':{'value':None},'C5':{'value':5}}}]}}
-        b={'source_hash':'b','gold_hash':'gold','facts':[],'outline':{'subtables':[]},
-           '机械记录':{'sheets':[{'name':'来源','merges':[],'cells':{'D7':{'value':20},'D8':{'value':None}}}]},
-           '已确认关系':[{'kind':'取数对应','source_a_hash':'a','source_b_hash':'b','gold_hash':'gold',
-               'bindings':[{'target':'原表!C3','source':'来源!D7'},{'target':'原表!C4','source':'来源!D8'}]}]}
-        before=json.dumps(a,ensure_ascii=False,sort_keys=True)
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value={'dimension':{}}):
-            plan=direct_update_plan(a,b)
-        self.assertEqual([(r['cell'],r['value'],r['metric_id']) for r in plan['updates']],[('C3',20,None)])
-        self.assertEqual(plan['updates'][0]['original_dimensions'],{})
-        self.assertEqual({r['cell'] for r in plan['identity_matches']},{'C3','C4'})
-        self.assertEqual([r['cell'] for r in plan['retained_blanks']],['C4'])
-        self.assertEqual(json.dumps(a,ensure_ascii=False,sort_keys=True),before)
 
-    def test_明示来源关系保留尚未接入编号的原有需要(self):
-        from 附注更新.正常入口识别 import answer_relations
-        a={'source_hash':'a','gold_hash':'g','facts':[],
-           'source_identities':[{'source_reference':{'location':'原表!C4'}}],
-           'unresolved':[{'sheet':'原表','cell':'C3','reason':'尚未接入编号','raw_value_state':'blank'},
-                         {'sheet':'原表','cell':'C9','reason':'另一范围'}],
-           '机械记录':{'sheets':[{'name':'原表','merges':[]}]}}
-        b={'source_hash':'b','gold_hash':'g','facts':[],
-           '识别答复':'A 原表!C3:C4采用B 来源!D7:D8。A 原表!C9采用B 来源!D9。',
-           '机械记录':{'sheets':[{'name':'来源','merges':[]}]}}
-        before=json.dumps(a,ensure_ascii=False,sort_keys=True)
-        result=answer_relations(a,b,[],[],{'dimension':{}},[{'sheet':'原表','range':'C3:C4'}])
-        self.assertEqual(result[0]['bindings'],[{'target':'原表!C3','source':'来源!D7'},{'target':'原表!C4','source':'来源!D8'}])
-        self.assertEqual(json.dumps(a,ensure_ascii=False,sort_keys=True),before)
 
     def test_分列分行来源引用和分组坐标直接接通(self):
         from 附注更新.A合集 import source_relation
@@ -905,22 +730,6 @@ class 正常入口贯通测试(unittest.TestCase):
         self.assertEqual(result['old_detail_count'],2)
         self.assertEqual(result['totals'],[{'target_row':13,'source_row':33}])
 
-    def test_名单按原文更新使用本段明示指标的维度引用(self):
-        from 附注更新.正常入口识别 import answer_relations
-        raw=("## 性质名单\n名单按原文更新为三行明细加一行合计，明细金额编号metric.one。\n"
-             "## 分类比例\n分母other_selection为该表总体。")
-        standard={'metric':{'metric.one':{'dimension_refs':[{'id':'member_selection'}]}},
-                  'dimension':{key:{'value_type':'selection'} for key in ['member_selection','other_selection']}}
-        a={'source_hash':'a','gold_hash':'g'}
-        b={'source_hash':'b','gold_hash':'g','识别答复':raw}
-        empty={'bindings':[],'label_actions':[],'caption_updates':[]}
-        with patch('附注更新.正常入口识别.direct_reference',return_value={'需要':[]}),\
-             patch('附注更新.正常入口识别.source_relation',return_value=empty),\
-             patch('附注更新.正常入口识别._declared_list_tables',return_value=[]),\
-             patch('附注更新.正常入口识别._list_relation_conflicts',return_value=([],[])):
-            result=answer_relations(a,b,[],[],standard,[])
-        self.assertEqual([r['dimension'] for r in result],['member_selection'])
-        self.assertNotIn('other_selection',result[0]['content'])
 
     def test_列期间声明旁列标签原文引用随明确金额范围保存(self):
         from 附注更新.A合集 import direct_answer
@@ -1356,29 +1165,6 @@ A 原表!E9 ← B 来源!D8：metric.one；selection 同上。
         self.assertEqual(next(r['value'] for r in result['dimensions'] if r['id']=='selection' and '来源!C8:D8' in r['ranges']),'融资租入固定资产')
         self.assertEqual(next(r['value'] for r in result['dimensions'] if r['id']=='form'),'未知')
 
-    def test_模型撤销来源经共用入口保留原内容且不沿用旧对应(self):
-        from 附注更新.正常入口识别 import answer_relations
-        from 附注更新.模板更新编排 import direct_update_plan
-        targets=['原表!C704','原表!D704']
-        a={'source_hash':'a','gold_hash':'gold','facts':[],'outline':{'subtables':[]},
-           'slot_bindings':[{'sheet':'原表','cell':col+'704','partial_semantics':{'metric_id':'测试','dimensions':{}}} for col in 'CD'],
-           '机械记录':{'names':{},'sheets':[{'name':'原表','merges':[],'cells':{'C704':{'value':9},'D704':{'value':None}}}]}}
-        raw='撤销A原先 **原表!C704:D704** 从 **来源!C27:D27** 取数的对应；A原内容保留，不填金额。'
-        b={'source_hash':'b','gold_hash':'gold','facts':[],'slot_bindings':[],'outline':{'subtables':[]},'识别答复':raw,
-           '机械记录':{'sheets':[{'name':'来源','merges':[],'cells':{'C27':{'value':20},'D27':{'value':30}}}]}}
-        old={'kind':'取数对应','source_a_hash':'a','source_b_hash':'b','gold_hash':'gold',
-             'bindings':[{'target':targets[i],'source':'来源!'+col+'27'} for i,col in enumerate('CD')]}
-        b['已确认关系']=[old]
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value={'dimension':{}}):
-            self.assertEqual(len(direct_update_plan(a,b)['updates']),2)
-        with patch('附注更新.正常入口识别.direct_reference',return_value={'需要':[{'location':loc} for loc in targets]}):
-            relations=answer_relations(a,b,[{'sheet':'来源','range':'A24:D27'}],[],{'dimension':{}},[])
-        self.assertEqual(relations[0]['retained_targets'],targets)
-        b['已确认关系'].extend(relations)
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value={'dimension':{}}):
-            plan=direct_update_plan(a,b)
-        self.assertEqual(plan['updates'],[])
-        self.assertEqual({r['cell'] for r in plan['retained_values']},{'C704','D704'})
 
     def test_原句重接撤下误铺字段且保留范围外原声明(self):
         from 附注更新.A合集 import _merge_direct_table
@@ -1750,33 +1536,6 @@ B的B列是本期、C列是上期。
         self.assertEqual(tables[0]['totals'],[{'target_row':4,'source_row':7}])
         self.assertEqual(tables[0]['operations'],[{'axis':'row','action':'insert','index':2,'count':1,'template_index':1}])
 
-    def test_组合期间表头及明示名称位置保存回读(self):
-        from 附注更新.A合集 import save_direct_answer, _records
-        from 附注更新.统一勾稽 import load_fact_mapping
-        cfg={**self.config,'a_target_table':{'id':'范围1','sheet':'原表','range':'A2:C3','data_ranges':['A3:C3']}}
-        old='原表!A3:C3：metric_id=固定资产原值；entity=旧主体；report_scope=standalone；currency=CNY；unit_scale=1；period=2024-12-31；asset_selection=members[设备]。'
-        with patch.object(UnifiedSemanticEngine,'request_text',return_value=old):
-            cfg.update(run_step('recognize_a',cfg)['files'])
-        a=json.loads(Path(cfg['a_mapping']).read_text(encoding='utf-8-sig'))
-        raw=('范围1（原表!A3:C3）：共同指标为固定资产原值；主体为合成企业；报表范围为 `standalone`；币种为CNY，金额倍率为1元。比较排除另行保留。\n'
-             '| 原表位置及原文 | 期间角色（`template_period_role`）及 `period` 实际日期 |\n|---|---|\n'
-             '| B3 设备 | 本期；2025-01-01至2025-12-31 |\n'
-             '| C3 设备 | 上期；2024-01-01至2024-12-31 |\n'
-             '期间列标签在 B2“本期发生额”、C2“上期发生额”。A3为对应的行项目名称，不是金额格。')
-        saved=save_direct_answer(a,raw,self.folder/'明示字段.json',field_scope={
-            '原表!A3:C3':['metric_id','entity','report_scope','currency','unit_scale','period','template_period_role']})
-        engine=UnifiedSemanticEngine(self.config,self.gold,self.folder/'回读')
-        read=load_fact_mapping(self.folder/'明示字段.json',engine.standard);rows=dict(_records(read))
-        self.assertNotIn('原表!A3',rows)
-        self.assertTrue(any(r['cell']=='A3' and r['category']=='label' for r in read['excluded']))
-        for cell,year,role in [('B3',2025,'current'),('C3',2024,'prior')]:
-            row=rows['原表!'+cell]
-            self.assertEqual(row['dimensions']['entity'],'合成企业')
-            self.assertEqual(row['label_references']['period'],['原表!'+cell[0]+'2'])
-            self.assertEqual(row['dimensions']['unit_scale'],1)
-            self.assertEqual(row['dimensions']['period'],{'kind':'duration','start':str(year)+'-01-01','end':str(year)+'-12-31'})
-            self.assertTrue(any(r.get('template_period_role')==role and cell in r['ranges']
-                for t in read['outline']['subtables'] for r in t['metrics']))
 
     def test_相对名单顺序沿用原表并按已选公式引用取值(self):
         from 附注更新.A合集 import _declared_list_tables
@@ -1803,22 +1562,6 @@ B的B列是本期、C列是上期。
         self.assertEqual(tables[0]['blank_values'],{'21':{'C':{'value':None}}})
         self.assertEqual([t['operations'][0]['count'] for t in tables],[1,1])
 
-    def test_B共同字段在指定范围保存且不依赖重述编号(self):
-        from 附注更新.A合集 import save_direct_answer, _records
-        cfg=dict(self.config)
-        def answer(engine,prompt,payload):
-            if '整份原文.json' in payload['materials']:
-                return '工作表：原表；完整范围：A1:C3；数据范围：B3:C3；相关标准：固定资产原值；对应A：原表!A1:C3'
-            return '原表!B3:C3：metric_id=固定资产原值；entity=合成企业；report_scope=standalone；currency=CNY；unit_scale=1；period=2025-12-31；asset_selection=members[设备]。'
-        with patch.object(UnifiedSemanticEngine,'_http',answer):
-            for step in ('recognize_a','recognize_b'):cfg.update(run_step(step,cfg)['files'])
-        b=json.loads(Path(cfg['b_mapping']).read_text(encoding='utf-8-sig'))
-        saved=save_direct_answer(b,'共同取值：currency=USD；unit_scale=1000。',self.folder/'共同字段.json',
-                                field_scope={'原表!B3':['currency','unit_scale']})
-        rows=dict(_records(saved))
-        self.assertEqual(rows['原表!B3']['dimensions']['currency'],'USD')
-        self.assertEqual(rows['原表!B3']['dimensions']['unit_scale'],1000)
-        self.assertEqual(rows['原表!C3']['dimensions']['currency'],'CNY')
 
     def test_同表列限定与仅行号范围沿用答复已声明列(self):
         from 附注更新.A合集 import direct_answer
@@ -2004,7 +1747,7 @@ B的B列是本期、C列是上期。
         from 附注更新.A语义阅读 import recognize_a,read_workbook,source_material
         engine=UnifiedSemanticEngine(self.config,self.gold,self.folder/'字段材料')
         snapshot=read_workbook(self.folder/'B.xlsx');snapshot['sheets'][0]['cells']['B3']['formula']='=1'
-        a={'机械记录':read_workbook(self.folder/'A.xlsx'),'source_context':[]}
+        a={'gold_hash':engine.gold_hash,'机械记录':read_workbook(self.folder/'A.xlsx'),'source_context':[]}
         a['机械记录']['names']={'表区1':[{'sheet':'原表','range':'A1:C3'}]}
         b={'recognition_method':'direct','source_hash':file_hash(self.folder/'B.xlsx'),
            'gold_hash':engine.gold_hash,'source_context':[],'金标准原文':'','机械记录':snapshot}
@@ -2025,15 +1768,13 @@ B的B列是本期、C列是上期。
             recognize_a(engine,self.folder/'B.xlsx',context=[],target_mapping=a,source_snapshot=snapshot,
                         previous_result=previous,artifact_metadata=metadata)
         self.assertEqual(material.call_args_list[0].args[0]['semantic_formula_sources'],4)
-        original=request.call_args.args[1]['A原表.json']
-        self.assertEqual(original['本次读取范围'],[{'sheet':'原表','range':'A1:C3'}])
-        self.assertIn('A=设备',original['sheets'][0]['rows'])
-        self.assertIn('A=项目',original['sheets'][0]['rows'])
+        self.assertNotIn('A原表.json',request.call_args.args[1])
+        self.assertNotIn('A原表网格.txt',request.call_args.args[1])
         reference=request.call_args.args[1]['A需要.json']
         self.assertEqual([row['location'] for row in reference['需要']],['原表!B3','原表!C3'])
         self.assertTrue(all('locations' not in row for row in reference['需要']))
-        self.assertEqual(reference['unresolved'][0]['cell'],'C3')
-        self.assertEqual(reference['source_identities'][0]['原文'],'已识别的含义')
+        self.assertNotIn('unresolved',reference)
+        self.assertNotIn('source_identities',reference)
 
     def test_冒号行号和角色前置表头保持各自字段与期间(self):
         from 附注更新.A合集 import direct_answer
@@ -2051,22 +1792,6 @@ B的B列是本期、C列是上期。
             self.assertEqual(periods['原表!C'+row],'2025-12-31')
             self.assertEqual(periods['原表!D'+row],'2024-12-31')
 
-    def test_表外说明原文与替换文字经共用关系进入更新清单(self):
-        from 附注更新.A合集 import source_relation
-        from 附注更新.模板更新编排 import direct_update_plan
-        a={'source_hash':'a','gold_hash':'gold','facts':[],'outline':{'subtables':[]},
-           '机械记录':{'names':{},'sheets':[{'name':'原表','cells':{},'merges':[]}]}}
-        b={**a,'source_hash':'b'}
-        raw='原段落：“旧共同说明。”\n\n**替换文字（TA_012表前）：**\n“新的完整说明。”'
-        relation=source_relation(a,b,raw,['原表!B3']);b['已确认关系']=[relation]
-        expected=[{'range_name':'TA_012','old_text':'旧共同说明。','text':'新的完整说明。'}]
-        self.assertEqual(relation['caption_updates'],expected)
-        self.assertEqual(relation['bindings'],[])
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value={'dimension':{}}):
-            plan=direct_update_plan(a,b)
-        self.assertEqual(plan['caption_updates'],expected)
-        self.assertEqual(plan['updates'],[])
-        self.assertEqual(source_relation(a,b,'建议调整本表说明，但没有给出替换原文。',['原表!B3'])['caption_updates'],[])
 
     def test_期间标签直接采用答复明列文字且不重建金额身份(self):
         from 附注更新.A合集 import source_relation
@@ -2085,7 +1810,7 @@ B的B列是本期、C列是上期。
     def test_旧定向来源入口只识别各格且保留完整原文(self):
         from 附注更新.A语义阅读 import recognize_a,read_workbook
         engine=UnifiedSemanticEngine(self.config,self.gold,self.folder/'关系材料')
-        a={'机械记录':read_workbook(self.folder/'A.xlsx'),
+        a={'gold_hash':engine.gold_hash,'机械记录':read_workbook(self.folder/'A.xlsx'),
            'source_context':['表外共同期间原文，不能在定向来源入口丢掉。',
                              {'title':'Word正文','text':'保存为原文记录的完整正文同样保留。'}]}
         b={'recognition_method':'direct','source_hash':file_hash(self.folder/'B.xlsx'),
@@ -2098,10 +1823,10 @@ B的B列是本期、C列是上期。
         previous=self.folder/'来源已有合集.json'
         previous.write_text(json.dumps(b,ensure_ascii=False),encoding='utf-8')
         def answer(prompt,materials):
-            self.assertIn('只回答每个格子对应哪个金标准',prompt)
+            self.assertIn('各格分别是什么意思',prompt)
             self.assertNotIn('本次采用的必要来源及其他未采用候选',prompt)
-            self.assertIn('表外共同期间原文',json.dumps(materials['A原表.json'],ensure_ascii=False))
-            self.assertIn('保存为原文记录的完整正文同样保留',json.dumps(materials['A原表.json'],ensure_ascii=False))
+            self.assertNotIn('A原表.json',materials)
+            self.assertNotIn('A原表网格.txt',materials)
             self.assertNotIn('已保存的当前候选对应',materials)
             self.assertNotIn('本次需要确定来源的A位置',materials)
             self.assertIn('A需要.json',materials)
@@ -2193,24 +1918,6 @@ B的B列是本期、C列是上期。
                 'row_sources':{'4':{'B':'来源!J31'},'8':{'B':'来源!I41','C':'来源!I81'}},'totals':[{'source_row':8}]}]}]}
         self.assertEqual(set(_calculation_formulas(mapping)),{'来源!J31','来源!I14','来源!A4','来源!I41','来源!I81'})
 
-    def test_名单已声明随成员保留原值不再停在旧行(self):
-        from 附注更新.模板更新编排 import direct_update_plan
-        a={'source_hash':'a','gold_hash':'g','facts':[],'slot_bindings':[],'outline':{'subtables':[]},
-           '机械记录':{'names':{'名单':[{'sheet':'原表','range':'A1:B3'}]},
-             'sheets':[{'name':'原表','merges':[],'cells':{'A2':{'value':'甲'},'A3':{'value':'乙'},'B2':{'value':12},'B3':{'value':34}}}]}}
-        b={'source_hash':'b','gold_hash':'g','facts':[],'slot_bindings':[],
-           '机械记录':{'sheets':[{'name':'来源','merges':[],'cells':{'A8':{'value':'乙'},'A9':{'value':'甲'},'B8':{'value':None},'B9':{'value':None}}}]},
-           '已确认关系':[
-             {'kind':'取数对应','source_a_hash':'a','source_b_hash':'b','gold_hash':'g','retained_targets':['原表!B2','原表!B3'],
-              'bindings':[{'target':'原表!A2','source':'来源!A9'}]},
-             {'kind':'名单编排','dimension':None,'source_a_hash':'a','source_b_hash':'b','gold_hash':'g','tables':[{'range_name':'名单','source_sheet':'来源','source_rows':[8,9],
-               'old_detail_count':2,'first_row_offset':1,'columns':{'B':'B'},'labels':{'A':'A'},
-               'blank_values':{'8':{'B':{'source':'原表!B3'}},'9':{'B':{'source':'原表!B2'}}}}]}]}
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value={'dimension':{},'metric':{}}):
-            plan=direct_update_plan(a,b)
-        self.assertEqual({r['cell']:r['value'] for r in plan['updates']},{'B2':34,'B3':12})
-        self.assertEqual({r['cell']:r['value'] for r in plan['labels']},{'A2':'乙','A3':'甲'})
-        self.assertFalse(plan.get('retained_values'))
 
     def test_移除表头引用后的空引号不吞入期间解释(self):
         from 附注更新.A合集 import direct_answer,_direct_table
@@ -2234,80 +1941,7 @@ B的B列是本期、C列是上期。
         self.assertEqual({cell:m['template_period_role'] for m in table['metrics'] for cell in m['ranges']},
                          {'C3':'closing','C4':'closing','D3':'opening','D4':'opening'})
 
-    def test_名单段落沿用答复表头维度且新增行不覆盖旧合计(self):
-        from 附注更新.正常入口识别 import answer_relations
-        from 附注更新.模板更新编排 import direct_update_plan
-        a={'source_hash':'a','gold_hash':'gold','facts':[],'slot_bindings':[
-            {'sheet':'原表','cell':f'{col}{row}','partial_semantics':{'metric_id':'测试','dimensions':{}}} for row in range(3,7) for col in 'BC'],
-            '机械记录':{'names':{'名单表':[{'sheet':'原表','range':'A2:C6'}]},
-                'sheets':[{'name':'原表','cells':{f'{col}{row}':{'value':row} for row in range(2,7) for col in 'ABC'},'merges':[]}]},
-            'outline':{'subtables':[{'sheet':'原表','range':'A2:C6','metrics':[]}]}}
-        reply=('## 原文身份\n共同 currency_selection=all。\n'
-            '|A需要位置及角色|采用的B来源位置|`asset_selection`|\n|---|---|---|\n'
-            '|原表!B3|来源!B4|成员甲|\n|原表!C3|来源!C4|成员甲|\n'
-            '|原表!B4|来源!B5|成员乙|\n|原表!C4|来源!C5|成员乙|\n'
-            '|原表!B5|来源!B7|总体|\n|原表!C5|来源!C7|总体|\n'
-            'B的 来源!A6、B6、C6 为“新成员”及其两期余额，是B名单中的新成员。\n'
-            '## 名单与A排布\nA原有明细为 原表!A3:A4；第5行为合计。沿用明细样式行：'
-            '第5行用作该明细，将合计移至第6行，原第6行条件项移至第7行。')
-        b={'source_hash':'b','gold_hash':'gold','carrier':'B','识别答复':reply,'facts':[],'slot_bindings':[],
-            '机械记录':{'sheets':[{'name':'来源','cells':{f'{col}{row}':{'value':row*10} for row in range(3,8) for col in 'ABC'},'merges':[]}]},
-            'outline':{'subtables':[]}}
-        standard={'dimension':{'asset_selection':{'value_type':'selection'},'currency_selection':{'value_type':'selection'}}}
-        needed=[{'location':f'原表!{col}{row}'} for row in range(3,7) for col in 'BC']
-        with patch('附注更新.正常入口识别.direct_reference',return_value={'需要':needed}):
-            relations=answer_relations(a,b,[{'sheet':'来源','range':'A1:C7'}],[],standard,[])
-        b['已确认关系']=relations
-        table=next(r for r in relations if r['kind']=='名单编排')['tables'][0]
-        self.assertEqual(table['selection_dimension'],'asset_selection')
-        self.assertEqual(table['target_row_offsets'],[3])
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value=standard):
-            plan=direct_update_plan(a,b)
-        updates={r['cell']:r for r in plan['updates']}
-        self.assertEqual(updates['B5']['sources'][0]['cell'],'B6')
-        self.assertEqual(updates['B6']['sources'][0]['cell'],'B7')
-        self.assertEqual(plan['template_layout']['positions']['原表!B6'],'原表!B7')
-        self.assertTrue(any(r['cell']=='A5' and r['value']=='新成员' for r in plan['labels']))
 
-    def test_分段来源矩阵与已声明别名保留原内容(self):
-        from copy import deepcopy
-        from 附注更新.A合集 import _declared_list_tables
-        from 附注更新.模板更新编排 import direct_update_plan
-        cells={f'{col}{row}':{'value':row*10+index} for row in range(2,13) for index,col in enumerate('ABCDE')}
-        for row in (4,7,10):
-            cells[f'A{row}']={'value':'其中：保留项'};cells[f'A{row+1}']={'value':'旧名称'}
-        a={'机械记录':{'names':{'分段表':[{'sheet':'原表','range':'A2:E11'}]},
-            'sheets':[{'name':'原表','cells':cells,'merges':[]}]},'source_hash':'a','gold_hash':'gold',
-            'facts':[],'slot_bindings':[{'sheet':'原表','cell':f'{col}{row}',
-                'partial_semantics':{'metric_id':'测试','dimensions':{}}} for row in range(2,13) for col in 'BCDE'],
-            'outline':{'subtables':[{'sheet':'原表','range':'A2:E12','metrics':[]}]}}
-        b={'已确认关系':[{'dimension':'测试名单','content':'A“旧名称”对应 B“新名称”。'}],
-            '机械记录':{'sheets':[{'name':'来源表','cells':{f'{col}{row}':{'value':row} for row in range(20,100) for col in 'DE'},'merges':[]}]},
-            'source_hash':'b','gold_hash':'gold','facts':[],'slot_bindings':[],'outline':{'subtables':[]}}
-        reply=('每段由原来的 2 行扩为 3 行；另保留 A 原有的保留项行。B:E 的期初、本期增加、本期减少、期末列角色不变。\n'
-            '插入明细行后，各段位置为：甲计量合计第3行、明细4–6行；乙计量合计7行、明细8–10行；丙计量合计11行、明细12–14行。\n'
-            '下表中 B 坐标均为 来源表 工作表。明细来源按年初、增加、减少、年末排列；乙计量余额仅有年初、年末两项。\n'
-            '|成员|甲计量明细 B 来源|乙计量余额 B 来源|\n|---|---|---|\n'
-            '|新名称|D20、D30、D40、D50|E60、E77|\n|新增项|D23、D33、D43、D53|E63、E79|\n'
-            '丙计量明细：B 无可对应来源。原有格内容按原项目保留，新增新增项没有 B 来源。')
-        before=deepcopy((a,b));tables=_declared_list_tables(a,reply,'测试名单',[{'sheet':'来源表','range':'A1:E99'}],b)
-        self.assertEqual((a,b),before)
-        self.assertEqual([t['first_row_offset'] for t in tables],[2,5,8])
-        self.assertEqual(tables[1]['columns'],{'B':'E','E':'E'})
-        self.assertEqual(tables[1]['row_sources']['23']['E'],'来源表!E79')
-        self.assertEqual(tables[2]['blank_values']['20']['C'],{'source':'原表!C11'})
-        self.assertEqual(tables[2]['blank_values']['23']['C'],{'value':None})
-        self.assertEqual(_declared_list_tables(a,reply,'测试名单',[{'sheet':'来源表','range':'A1:E99'}],{**b,'已确认关系':[]}),[])
-        with patch('附注更新.A合集.validate_direct_collection'),patch('附注更新.A合集._standard',return_value={'dimension':{}}):
-            plan=direct_update_plan(a,b,{'tables':tables})
-        updates={r['cell']:r for r in plan['updates']}
-        self.assertEqual(updates['B4']['sources'][0]['cell'],'D20')
-        self.assertEqual(updates['E9']['sources'][0]['cell'],'E79')
-        self.assertEqual(updates['C8']['retained_from'],'原表!C8')
-        self.assertEqual(updates['C12']['retained_from'],'原表!C11')
-        self.assertIsNone(updates['C13']['value'])
-        self.assertEqual(updates['C14']['retained_from'],'原表!C10')
-        self.assertEqual(plan['template_layout']['positions']['原表!B12'],'原表!B15')
 
     def test_共同说明不继承槽位且重复引用不阻断合集(self):
         from copy import deepcopy
@@ -2673,64 +2307,6 @@ B的B列是本期、C列是上期。
         self.assertEqual([r['metric_ids'] for r in rows],[['metric.amount']]*3)
         self.assertFalse(unread)
 
-    def test_标题不作业务门槛且模型所选范围贯通Word副本(self):
-        from docx import Document
-        from lxml import etree
-        doc=Document()
-        doc.add_paragraph('本段共同说明只在原文出现一次，不重复铺到各表。')
-        doc.add_paragraph('其他资料，未要求更新')
-        other=doc.add_table(rows=2,cols=3)
-        for row,values in zip(other.rows,[['说明','数值','备注'],['保留项目','777','原文']]):
-            for cell,value in zip(row.cells,values):cell.text=value
-        doc.add_paragraph('合并财务报表重要项目的说明')
-        table=doc.add_table(rows=2,cols=3)
-        for row,values in zip(table.rows,[['项目','2024年末','2023年末'],['设备','10','']]):
-            for cell,value in zip(row.cells,values):cell.text=value
-        doc.add_paragraph('最后一张表后的说明同样保留。')
-        word=self.folder/'不同标题原件.docx';doc.save(word)
-        original=file_hash(word);calls=[]
-        def answer(engine,prompt,payload):
-            material=payload['materials'];calls.append(prompt)
-            is_b='A需要.json' in material
-            if '整份原文.json' in material:
-                if not is_b:
-                    text=json.dumps(material['整份原文.json'],ensure_ascii=False)
-                    self.assertIn('合并财务报表重要项目的说明',text)
-                    self.assertIn('保留项目',text)
-                    self.assertEqual(text.count('本段共同说明只在原文出现一次，不重复铺到各表。'),1)
-                    self.assertIn('[原文此处为表格：sheet1!B7:D8]',text)
-                    self.assertIn('最后一张表后的说明同样保留。',text)
-                    return '工作表：sheet1；完整范围：B7:D8；数据范围：C8:D8；相关标准：固定资产原值'
-                return '工作表：原表；完整范围：A1:C3；数据范围：B3:C3；相关标准：固定资产原值；对应A：sheet1!B7:D8'
-            sheet='原表' if is_b else 'sheet1';left,right=('B3','C3') if is_b else ('C8','D8')
-            labels=('B2','C2') if is_b else ('C7','D7');year=2025 if is_b else 2024
-            reply=(f'{sheet}!{left}:{right}：metric_id=固定资产原值；entity=合成企业；report_scope=standalone；currency=CNY；unit_scale=1；asset_selection=members[设备]。\n'
-                   f'{sheet}!{left}：period={year}-12-31；template_period_role=closing；期间标签为{sheet}!{labels[0]}。\n'
-                   f'{sheet}!{right}：period={year-1}-12-31；template_period_role=opening；期间标签为{sheet}!{labels[1]}。')
-            if is_b:reply+='\nA sheet1!C8 采用 B 原表!B3。\nA sheet1!D8 采用 B 原表!C3。'
-            return reply
-        config={**self.config,'word_path':str(word)}
-        with patch.object(UnifiedSemanticEngine,'_http',answer):
-            for step in ('extract_a','recognize_a','recognize_b','match','write'):
-                result=run_step(step,config);self.assertEqual(result['status'],'complete',result);config.update(result['files'])
-        self.assertEqual(len(calls),4)
-        actual=Document(config['word'])
-        self.assertEqual(actual.tables[1].cell(1,1).text,'20')
-        self.assertEqual(actual.tables[1].cell(1,2).text,'')
-        self.assertEqual(actual.tables[1].cell(0,1).text,'2025年末')
-        def content(node):
-            copied=etree.fromstring(node.xml,etree.XMLParser(remove_blank_text=True))
-            for link in copied.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tblDescription'):
-                link.getparent().remove(link)
-            return etree.tostring(copied,method='c14n')
-        self.assertEqual(content(actual.tables[0]._tbl),content(doc.tables[0]._tbl))
-        self.assertEqual(file_hash(word),original)
-        from 附注更新.分步流程 import _load_link
-        link=_load_link(config['a_link'],config['a_path'])
-        link['scope']={'chapter_title':'合并财务报表重要项目的说明'}
-        legacy=self.folder/'已有不同标题位置关联.json'
-        legacy.write_text(json.dumps(link,ensure_ascii=False),encoding='utf-8')
-        self.assertEqual(_load_link(legacy)['scope'],link['scope'])
 
     def test_表格同某格引用只继承未改写的字段(self):
         from 附注更新.A合集 import direct_answer
@@ -2780,7 +2356,7 @@ B的B列是本期、C列是上期。
         self.assertEqual(name['label_actions'],[{'action':'copy','target':'原表!B3','source':'来源表!A5'}])
 
     def setUp(self):
-        self.folder=Path(r'C:\Users\27651\Documents\Codex\2026-10-16\12-c-users-27651-documents-codex\work')/('正常入口贯通_'+uuid.uuid4().hex)
+        self.folder=Path(__file__).resolve().parents[1]/'测试结果'/('正常入口贯通_'+uuid.uuid4().hex)
         self.folder.mkdir(parents=True)
         self.gold=self.folder/'标准.jsonl'
         self.gold.write_text('\n'.join(json.dumps(row,ensure_ascii=False) for row in records()),encoding='utf-8')
@@ -3073,7 +2649,7 @@ B的B列是本期、C列是上期。
                  'b_additional_context':'本次新来源需要与原有需要一并说明。'}
         with patch.object(UnifiedSemanticEngine,'request_text',return_value=reply) as call:
             result=run_step('recognize_b',request);self.assertEqual(result['status'],'complete',result);cfg.update(result['files'])
-        self.assertIn('A原表.json',call.call_args.args[1]);call.assert_called_once()
+        self.assertNotIn('A原表.json',call.call_args.args[1]);call.assert_called_once()
         self.assertIn(request['b_additional_context'],call.call_args.args[0])
         with patch.object(UnifiedSemanticEngine,'_http',side_effect=AssertionError('不重复调用')):
             cfg.update(run_step('recognize_b',cfg)['files'])
@@ -3099,9 +2675,11 @@ B的B列是本期、C列是上期。
             'b_source_targets':['原表!B3'],'b_field_scope':{'原表!B3':['period']}}
         with patch.object(UnifiedSemanticEngine,'_http',return_value='A 原表!B3 ← B 原表!B3。') as call:
             result=run_step('recognize_b',request)
-        self.assertEqual(result['status'],'failed',result);call.assert_called_once()
+        self.assertEqual(result['status'],'partial',result);call.assert_called_once()
         self.assertEqual(json.loads(Path(cfg['b_mapping']).read_text('utf-8-sig')),before)
-        self.assertNotIn('b_mapping',result['files'])
+        saved=json.loads(Path(result['files']['b_mapping']).read_text('utf-8-sig'))
+        self.assertEqual(saved['本次逐格原答复'],'A 原表!B3 ← B 原表!B3。')
+        self.assertFalse(saved['本次逐格接入']['complete'])
         self.assertTrue(any(json.loads(path.read_text(encoding='utf-8-sig')).get('text')=='A 原表!B3 ← B 原表!B3。'
                             for path in self.folder.rglob('答复.json')))
 
@@ -3279,26 +2857,6 @@ B的B列是本期、C列是上期。
         rows=[r for r in answer['dimensions'] if r['id']=='asset_selection']
         self.assertTrue(any(r['ranges']==['原表!B3','原表!C3'] and r['value']=='members：设备' for r in rows))
 
-    def test_分列日期和带标记成员保存回读不制造冲突(self):
-        from 附注更新.A合集 import _records
-        def answer(engine,prompt,payload):
-            if '整份原文.json' in payload['materials']:
-                return '工作表：原表；完整范围：A1:C3；数据范围：B3:C3；相关标准：固定资产原值。'
-            return ('B各格共同维度：A1原文说明，entity为合成企业。B2原文说明，report_scope=standalone。C2原文说明，currency=CNY；unit_scale=1。\n'
-                '指标编号：固定资产原值。\n'
-                'B列角色为 `template_period_role=期末`，实际日期为2025年12月31日；C列角色为 `template_period_role=期初`，实际日期为2024年12月31日。\n'
-                '|坐标|asset_selection|\n|---|---|\n|B3、C3|`members`：设备|')
-        with patch.object(UnifiedSemanticEngine,'_http',answer):result=run_step('recognize_a',self.config)
-        self.assertEqual(result['status'],'complete',result)
-        saved=json.loads(Path(result['files']['a_mapping']).read_text(encoding='utf-8-sig'))
-        rows=dict(_records(saved))
-        for cell,year in [('B3',2025),('C3',2024)]:
-            row=rows['原表!'+cell]
-            self.assertEqual(row['dimensions']['period'],{'kind':'instant','date':str(year)+'-12-31'})
-            self.assertEqual(row['dimensions']['asset_selection']['members'],['设备'])
-            self.assertEqual(row['dimensions']['entity'],'合成企业')
-            self.assertEqual(row['dimensions']['unit_scale'],1)
-            self.assertEqual(row['dimensions']['currency'],'CNY')
 
     def test_同一需要的候选共同识别且保留各自位置(self):
         from 附注更新.正常入口识别 import group_source_ranges
@@ -3343,7 +2901,8 @@ B的B列是本期、C列是上期。
         self.assertEqual(len(calls),4)
         book=load_workbook(config['a_prime']);ws=book.active
         self.assertEqual(ws['B3'].value,20);self.assertIsNone(ws['C3'].value)
-        self.assertEqual(ws['B2'].value,'2025年末');book.close()
+        # 未识别表头自身身份时，不从数据格的引用推导新日期。
+        self.assertEqual(ws['B2'].value,'2024年末');book.close()
         plan=json.loads(Path(config['update_plan']).read_text(encoding='utf-8-sig'))
         self.assertEqual(plan['comparison_requirements'],self.config['comparison_requirements'])
         for key in ('a_mapping','b_mapping'):
@@ -3437,46 +2996,6 @@ B的B列是本期、C列是上期。
         self.assertEqual(table['labels'],{'A':'A'})
         self.assertEqual(table['operations'],[{'axis':'row','action':'insert','index':3,'count':1,'template_index':2}])
 
-    def test_正常入口同次名单关系扩展且后方既定来源随表移动(self):
-        from openpyxl.workbook.defined_name import DefinedName
-        config=dict(self.config)
-        for side in ('A','B'):
-            book=Workbook();ws=book.active;ws.title='原表'
-            ws.append(['合成企业；单体；人民币；元']);ws.append(['项目','期末','期初'])
-            ws.append(['设备',10 if side=='A' else 20,None])
-            if side=='B':ws.append(['其他设备',30,None])
-            ws.append(['合计',10 if side=='A' else 50,None])
-            ws.cell(7 if side=='A' else 8,1,'后方内容');ws.cell(7 if side=='A' else 8,2,7 if side=='A' else 80)
-            if side=='A':book.defined_names.add(DefinedName('附注名单',attr_text="'原表'!$A$1:$C$4"))
-            path=self.folder/(side+'名单.xlsx');book.save(path);book.close();config[side.lower()+'_path']=str(path)
-        def answer(engine,prompt,payload):
-            material=payload['materials'];is_b='B' in prompt[:12] if '整份原文.json' in material else 'A需要.json' in material
-            end=8 if is_b else 7;total=5 if is_b else 4
-            if '整份原文.json' in material:
-                if is_b:
-                    needs=material['A需要.json']['已识别明细与范围']
-                    self.assertTrue(any(row['dimensions'].get('asset_selection',{}).get('members')==['设备'] for row in needs))
-                return f'工作表：原表；完整范围：A1:C{end}；数据范围：B3:C{total}、B{end}:C{end}；相关标准：固定资产原值；对应A：原表!A1:C7'
-            reply=f'原表!B3:C{total}、B{end}:C{end}：metric_id=固定资产原值；entity=合成企业；report_scope=standalone；currency=CNY；unit_scale=1；period=2025-12-31；template_period_role=closing。\n'
-            reply+='原表!B3:C3：asset_selection=members[设备]。\n'
-            if is_b:reply+='原表!B4:C4：asset_selection=members[其他设备]。\n'
-            reply+=f'原表!B{total}:C{total}：asset_selection=all。\n原表!B{end}:C{end}：asset_selection=members[后方内容]。\n'
-            if is_b:
-                reply+=('### asset_selection 名单更新\nB表 A列名称、B列期末、C列期初分别对应A表 A列名称、B列期末、C列期初。\n'
-                    'B!3 → A!3\nB!4 → A!4\n合计 B5:C5 → 原表!B5:C5。\n原合计行 A4。\n'
-                    'A 原表!B7 采用 B 原表!B8。\nA 原表!C7 采用 B 原表!C8。')
-            return reply
-        with patch.object(UnifiedSemanticEngine,'_http',answer):
-            for step in ('recognize_a','recognize_b','match','write'):
-                result=run_step(step,config);self.assertEqual(result['status'],'complete',result);config.update(result['files'])
-        book=load_workbook(config['a_prime']);ws=book.active
-        self.assertEqual([ws.cell(row,1).value for row in (3,4,5)],['设备','其他设备','合计'])
-        self.assertEqual([ws.cell(row,2).value for row in (3,4,5,8)],[20,30,50,80]);book.close()
-        previous=config['b_mapping']
-        with patch.object(UnifiedSemanticEngine,'request_text',side_effect=AssertionError('续跑不应再识别')):
-            resumed=run_step('recognize_b',config)
-        self.assertEqual(resumed['status'],'complete',resumed)
-        self.assertEqual(resumed['files']['b_mapping'],previous)
 
     def test_答复用原文标题引用唯一来源页及后续省略页名(self):
         from 附注更新.A合集 import source_relation
@@ -3599,14 +3118,8 @@ B的B列是本期、C列是上期。
         local='A表头 原表!C2、原表!D2 的“期末余额”“期初余额”角色保留。仅就A本表适用的期间说明，将“期末为旧日期”替换为“期末为新日期”；不据此修改其他表的说明。'
         self.assertEqual(source_relation(a,b,local,['原表!C3'])['caption_updates'],
                          [{'range_name':'TA_001','old_text':'余额表','text':'余额表 期末为新日期'}])
-        root=Path('测试输出')/('表外说明范围_'+uuid.uuid4().hex);root.mkdir(parents=True)
-        scoped={**parsed,'caption_updates':[]}
-        with patch('附注更新.A合集._standard',return_value={}),\
-             patch('附注更新.正常入口识别.answer_relations',return_value=[scoped]),\
-             patch('附注更新.A合集.direct_digest',return_value='digest'),\
-             patch('附注更新.统一勾稽.load_fact_mapping',side_effect=lambda path,_:json.loads(path.read_text(encoding='utf-8'))):
-            result=save_source_relations(a,b,raw,['原表!C3'],root/'合集.json')
-        self.assertEqual(result['已确认关系'][0]['caption_updates'],[])
+        with self.assertRaisesRegex(ValueError,'旧位置取数安排入口已停用'):
+            save_source_relations(a,b,raw,['原表!C3'],self.folder/'不应保存旧安排.json')
 
     def test_明说来源及目标之间的公式引用不混为搬运来源(self):
         from 附注更新.A合集 import source_relation

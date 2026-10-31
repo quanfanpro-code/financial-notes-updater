@@ -1,41 +1,29 @@
-"""仅补正格式错误格；有效格不重识别，失败时保留原未决。"""
-import copy
-from pathlib import Path
+"""旧双轮和格式补问入口拒绝执行，不生成第二次请求。"""
 import unittest
-from 附注更新.统一识别 import UnifiedSemanticEngine,build_payload
-from 附注更新.统一语义 import validate_records
-from 测试.测试统一识别 import packet,answer
-from 测试.测试统一语义 import records
+from unittest.mock import patch
+from 附注更新.语义 import SemanticEngine, SemanticError
+from 附注更新.统一识别 import UnifiedSemanticEngine
 
 
 class 格式补正测试(unittest.TestCase):
-    def test_只重试坏格且不修改已经通过的结果(self):
-        self.assertTrue(hasattr(UnifiedSemanticEngine,'_classification_round'))
-        standard=validate_records(records());source=packet()
-        payload=build_payload(source,standard);payload['round']=1
-        calls=[];valid=answer();broken=copy.deepcopy(valid)
-        broken['cells']['F9']['dimensions']['asset_selection'].pop('completeness')
-        class Controlled(UnifiedSemanticEngine):
-            def _request(self,system,payload,validator):
-                calls.append(payload['candidate_cells'])
-                return validator(broken if len(calls)==1 else {'cells':{'F9':valid['cells']['F9']}})
-        engine=object.__new__(Controlled);engine.standard=standard;engine.log=lambda message:None;engine.settings={}
-        result,repair=engine._classification_round(payload,source)
-        self.assertEqual(calls,[['D7','F9'],['F9']])
-        self.assertEqual(result['D7']['kind'],'metric_fact')
-        self.assertEqual(result['F9']['kind'],'metric_fact')
-        self.assertEqual(repair['cells'],['F9'])
-        self.assertEqual(repair['remaining_invalid'],[])
-        calls.clear()
-        class Failed(Controlled):
-            def _request(self,system,payload,validator):
-                if payload.get('format_correction'):raise ValueError('合成补正请求失败')
-                return super()._request(system,payload,validator)
-        failed=object.__new__(Failed);failed.standard=standard;failed.log=lambda message:None;failed.settings={}
-        preserved,report=failed._classification_round(payload,source)
-        self.assertEqual(preserved['D7'],result['D7'])
-        self.assertEqual(preserved['F9']['kind'],'invalid_response')
-        self.assertEqual(report['remaining_invalid'],['F9'])
+    def test_旧入口不执行双轮或格式补问(self):
+        for cls, method in [(SemanticEngine, 'recognize'), (UnifiedSemanticEngine, 'classify_packet')]:
+            engine=object.__new__(cls)
+            with patch.object(engine,'_http') as request:
+                with self.assertRaisesRegex(SemanticError,'旧.*识别入口已停用'):
+                    getattr(engine,method)({})
+                request.assert_not_called()
+        self.assertFalse(hasattr(UnifiedSemanticEngine,'_classification_round'))
+        self.assertFalse(hasattr(UnifiedSemanticEngine,'_classify_reviewed_packet'))
+
+    def test_旧位置取数和名单安排不能保存为对应(self):
+        from 附注更新.A合集 import save_source_relations, save_list_relations
+        from 附注更新.正常入口识别 import answer_relations
+        for call in [lambda:save_source_relations({}, {}, '旧安排', [], '不应写入'),
+                     lambda:save_list_relations({}, {}, '旧安排', '范围', '不应写入')]:
+            with self.assertRaisesRegex(ValueError,'旧.*安排入口已停用'):call()
+        self.assertEqual(answer_relations({}, {'识别答复':'A 原表!B3采用 B 来源!C3'}, [], [], {}, []),[])
+
 
 
 if __name__=='__main__':unittest.main()

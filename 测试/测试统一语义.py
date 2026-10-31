@@ -59,8 +59,7 @@ class UnifiedSemanticsTests(unittest.TestCase):
         self.assertEqual(self.api.semantic_key(left, self.standard), self.api.semantic_key(right, self.standard))
 
     def test_instance_changes_do_not_require_new_metric_but_do_change_fact(self):
-        for key, replacement in [("report_scope", "consolidated"),
-                                 ("period", {"kind": "instant", "date": "2024-12-31"}),
+        for key, replacement in [("period", {"kind": "instant", "date": "2024-12-31"}),
                                  ("asset_selection", {"domain": "固定资产", "mode": "members", "members": ["办公设备"], "completeness": "complete"})]:
             with self.subTest(key=key):
                 other = fact()
@@ -71,9 +70,12 @@ class UnifiedSemanticsTests(unittest.TestCase):
     def test_主体原文保留但不作为额外对应门槛(self):
         other = fact()
         other['dimensions']['entity'] = '合成企业乙'
+        other['dimensions']['report_scope'] = 'consolidated'
+        other['dimension_evidence']['entity'] = []
         self.api.validate_fact(other, self.standard)
         self.assertEqual(self.api.semantic_key(fact(), self.standard), self.api.semantic_key(other, self.standard))
         self.assertEqual(other['dimensions']['entity'], '合成企业乙')
+        self.assertEqual(other['dimensions']['report_scope'], 'consolidated')
 
     def test_source_scope_is_not_business_exclusivity(self):
         self.api.validate_fact(fact(), self.standard)
@@ -101,7 +103,6 @@ class UnifiedSemanticsTests(unittest.TestCase):
         variants = []
         one = fact(); del one["dimensions"]["period"]; variants.append(one)
         one = fact(); one["dimensions"]["任意指标"] = "净额"; variants.append(one)
-        one = fact(); one["dimension_evidence"]["entity"] = []; variants.append(one)
         one = fact(); one["dimensions"]["period"]["date"] = "2025-02-30"; variants.append(one)
         one = fact(); one["dimensions"]["unit_scale"] = True; variants.append(one)
         for other in variants:

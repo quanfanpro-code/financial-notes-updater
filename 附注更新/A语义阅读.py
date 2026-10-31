@@ -9,70 +9,18 @@ import time
 
 from openpyxl.utils.cell import range_boundaries, get_column_letter
 from openpyxl.formula.tokenizer import TokenizerError
-from .统一语义 import _require, definition_hash, validate_facts, required_cell_dimensions, _dimension_value, MEASUREMENT_PROMPT
+from .统一语义 import _require, definition_hash, validate_facts, required_cell_dimensions, _dimension_value, json_dates
 from .统一证据 import context_catalog, applicable_context
 from .表格 import read_workbook, materialize_candidate_blanks, file_hash, Tokenizer, _REFERENCE
-from .表格编排 import stage_proofs, _stage_receipt
+from .表格编排 import _stage_receipt
 
-READ_PROMPT = '''读懂整份文件的编排、全部科目和子表，再说明各表行列及说明的实际含义，共同信息只说一次。只识别语义，不推算或补填数值；空白财务格和业务说明也不能漏掉。
-金额、比例等列与业务行交叉的数据位置，空白时仍是待更新数据；与纯排版空白区分。
-返回JSON：{"tables":[{"id":"本文件内编号","sheet":"工作表","range":"含标题表头的范围","subject":"科目","meaning":"行列、上下级、期间及例外含义","data_ranges":["全部待更新数据范围"]}],"notes":"公共理解及不明确之处"}。
-一表可列多个数据范围；范围内其余格表示标题、表头或标签。续表保留所属科目；不把整张混合工作表当一张表。'''
 
-SELECT_PROMPT = '''根据已经读懂的原文语义，从简明目录召回可能适用的指标，供后续核对完整定义。本步不发身份证；目录摘录不等于完整标准。相关经济对象、计量含义及可能同义的指标均可列为候选，不能因名称不同或尚未核对完整定义就断言标准缺项。不能只按表名匹配，不能把最接近的候选当作已对应。
-结合原表文字逐项查看行列，不能只看整表概括；上级汇总包含多种经济对象时也查找相应组合指标。
-按每个项目自身的经济对象和计量含义选标准，同一业务事实换表展示不换标准。复合表的总项与子项分别选择适用指标；已有更直接的对象标准能完整表达子项时优先使用，不给子项追加原文没有的父项限定。
-明显无关的对象和计量不选；仍须查看完整定义才能确定的相关指标保留在metric_ids，并在missing说明待核对之处。后续绑定须严格核对对象和计量边界；维度的新取值不能扩大指标已明确排除的对象，也不能把费用、累计账项变动、单项支出与净损益相互替代。
-返回JSON：{"tables":[{"id":"原表编号","metric_ids":["完整指标ID"],"missing":"未找到的业务含义，无则空字符串"}]}。每张表都登记。'''
 
-READ_CHECK_PROMPT = '''沿用整份认识，只解决列出的范围疑点，返回这些表修正后的原reading格式。数字在数据范围外，确认它是表头序号还是漏掉的财务值；文字在数据范围内，区分独立披露的业务事实和用于说明对象/类别/账龄的身份标签。独立的款项内容、未偿还原因仍是数据，名称或分类标签保留为语义依据；不因没有金标准删掉真正的数据。空白财务位置仍保留，不能因范围调整漏掉。
-只返回{"tables":[原表记录]}；保持原表编号、工作表和总范围，只修正meaning和data_ranges。不改数值。'''
 
-BIND_PROMPT = '''依据A原文，把全部待更新格准确对应到金标准，保存标准指标及其维度。共同信息写一次并注明适用位置，空白数据位置同样有身份；不补算数值。
-识别成功必须完整对应金标准。不能只保存文字含义、最近标准或改写标准定义作为另一种成功结果。对不上先检查阅读、共同说明、标准选择和维度解释；继续修正识别，不因一次未匹配就认定标准缺漏，也不凭空补条件。
-公司、币种等可以共用；不同行的单位、项目、类别不能合并。例如甲单位行和乙单位行各有自己的对象，不能给两行都写甲乙合集。合计保留其总体，不能变成当前唯一明细；共同信息不得覆盖行列差异。
-本任务确定“这里应填写什么”，不是判断现有金额是否为零或是否计提；已读出的data_ranges全部需要身份，不能因为没有数值而放入unresolved。依据引用解释含义的表头、行名或说明，不引用数据值本身。
-业务范围必须写实际业务含义，不用“某表某行合计”或当前展示的几条明细代替。位置只写在ranges和evidence里。
-返回JSON：{"tables":[{"id":"原编号","metrics":[{"ranges":["范围"],"id":"指标ID"}],"dimensions":[{"ranges":["范围或*表示本表全部数据"],"id":"维度ID","value":"实际取值","evidence":["逐字一致的原文短语或单独的@C编号"]}],"unresolved":[{"range":"范围","reason":"缺什么"}]}]}。
-只用metrics和dimensions保存成功身份。仍未解决的识别错误列unresolved并指出具体位置和原因；只有列出原文证据、已查标准及无法表达的具体语义，才能报告金标准缺项。标准必填字段暂未识别出来，本身不是标准缺项的证据。
-若材料含已确认维度取值，它们是对应标准维度中已有的规范表达，供本次识别复用。原文与其完整含义相同时使用该取值，避免同义内容另造写法；包含不同父项、条件、组成或边界时仍按本次原文表达，不为匹配抄用。每项维度依据必须来自正在识别的原文，取值目录本身不是原文证据。
-各指标范围互不重叠；同一维度的不同取值范围互不重叠。期间用{"kind":"instant","date":"YYYY-MM-DD"}或{"kind":"duration","start":"YYYY-MM-DD","end":"YYYY-MM-DD"}。集合用{"mode":"all"}、{"mode":"members","members":["完整类别"]}或{"mode":"predicate","predicate":"完整限定条件"}，不确定就注明。程序补入定义中的domain，按该指标允许的维度保存。'''
 
-REVIEW_PROMPT = '''核查已有身份证是否忠实表达A原文，重点看共同含义、行列差异、例外及全部目标覆盖。只改错误，不重新生成身份。
-确认每个成功身份已准确对应金标准指标及维度；未对应的先检查并修正阅读、共同说明、标准选择和维度。不得改用source_identities或最近标准宣布成功。确实发现标准缺漏时，issues须提供具体原文、已查标准及无法表达的语义；不能把识别错误或未读到字段当成标准缺项。
-有review_focus时，本次只检查该范围；原表其他部分用于理解上下文，不重写其身份。
-这里不填金额、不查金额是否发生。每个data_ranges位置均须有身份，空白不是未决理由。父项和子项、不同类别分别保留；合计不能缩成当前明细名单。检查program_issues和semantic_questions中的具体疑点。
-返回JSON：{"tables":[{"id":"原表编号","corrections":{"metrics":[{"ranges":["范围"],"id":"正确指标ID"}],"patches":[{"ranges":["范围"],"id":"维度ID","value":"按标准类型填写","evidence":["原文短语或单独的@C编号"]}],"resolved_ranges":["已经解决的旧未决范围"]},"issues":[{"range":"仍不明确的范围","reason":"缺少什么含义","evidence":["原文依据"]}]}]}。
-每表登记；无更正或问题时相应数组为空。维度更正仅作用于声明范围；集合用all、members或predicate对象，期间遵守指标的时点/期间要求。evidence只引用逐字一致的原文短语或适用的@C编号，不把地址和编号拼在一起。确需排除身份标签时用corrections.non_business，标准外字段用remove_dimensions移除；财务目标不能排除。'''
 
 # 用户指定的A/B格子对应不以整份报表口径为前提，标准原文件保持不变。
-BIND_PROMPT += '\nreport_scope是报表共同信息，不作为格子绑定的必填维度，也不参与A/B格子对应；原文有明确说明时保留，没有时省略，不询问或猜测。其余业务维度仍须准确绑定。'
-REVIEW_PROMPT += '\nreport_scope不参与格子对应，不因缺少该项提出未决；检查其余指标和业务维度。'
-BIND_PROMPT += '\n槽位、维度定义、实际取值分别确认。原文未填写具体名称或其他实际取值时，仍在metrics保留已确认标准；dimensions只填有据部分，集合可用unknown或partial，不把空白成员改成all或合计。实际取值未提供不等于槽位未识别，不因此放入unresolved或要求补姓名。'
-REVIEW_PROMPT += '\n核查槽位与维度定义是否符合原文，并检查已有取值是否有据。具体维度取值尚未填写但槽位已明确时，保留已知部分和未知状态，不仅因缺具体取值提出issues；错误指标、错误已有取值或无法确认的语义仍须指出。'
-BIND_PROMPT += '\n本格明确表头及适用说明决定其含义；执行者的推断、文件名或金额公式引用另一表，不覆盖本格明确的期间和业务范围。公式可补充原文字段的引用线索，不用于按数字猜含义。'
-REVIEW_PROMPT += '\n核对指标及维度定义允许的对象和计量边界，不能用维度取值容纳被指标排除的对象或改变计量基础。核查已有取值是否来自本格原文；执行者推断、文件名或金额公式引用另一表不能覆盖明确表头。'
-FORMAT_PROMPT = '\n回执格式须与维度定义一致：value_type=selection时value必须是含mode的对象，不能填类别字符串；成员用{"mode":"members","members":["原文实际类别"]}，总体用{"mode":"all"}，有条件的范围用{"mode":"predicate","predicate":"原文限定条件"}。currency填写原文币种的三位大写代码，unit_scale为数值；allowed_values已列出时只能用其中的准确取值，不把原文近义词直接作为编码。evidence优先引用本次source中的单格地址或单独的@C编号；引用原文短语必须逐字存在，不能把自行概括的公司、日期或业务解释当成原文。以上只约束格式，不替代业务判断。'
-BIND_PROMPT += FORMAT_PROMPT
-REVIEW_PROMPT += FORMAT_PROMPT + '\ncorrections.non_business中的每项须完整填写{"range":"单格或矩形范围","category":"label或annotation","reason":"原文角色依据","evidence":["本次原文引用"]}。只排除模型已核实的标签或注释，不能省略category，也不能以排除方式处理未读懂的财务格。'
-CELL_REQUIREMENTS_PROMPT = '\n本次逐格要求见cell_requirements：它说明本次实际采用的完整事实字段要求，不改标准原文。标准通用dimension_refs中的report_scope required标记不是本次单格门槛；报告口径未提供时省略，不填unknown，也不得仅因此提出未决。其余实际取值未提供时，保留已确认指标槽位及有据维度，不捏造值，不把未知字符串塞进固定编码；已读懂槽位不因实际取值尚未提供而失效。ratio_definitions补全原标准的比例计量关系，只用于理解，不计算数值。固定经济对象或计量定义与原文不符仍须保留未决；本规则不放宽标准边界。修正了旧问题时须明确列resolved_ranges，不能只漏报旧问题。'
-BIND_PROMPT += CELL_REQUIREMENTS_PROMPT
-REVIEW_PROMPT += CELL_REQUIREMENTS_PROMPT
-BIND_PROMPT += '\n'+MEASUREMENT_PROMPT
-REVIEW_PROMPT += '\n'+MEASUREMENT_PROMPT
-SELECT_PROMPT += '\n'+MEASUREMENT_PROMPT
-REVIEW_PROMPT += '\n核查后仍存在格式或原文引用错误时，必须修正或在issues明确保留具体位置及原因，不能用空issues宣布通过。补充候选定义后沿用已核实的其他格及标题分类，仅修正本次未决范围。'
-REVIEW_PROMPT += '\n本次回执采用标准派生的结构约束。period的value必须为{"kind":"instant","date":"YYYY-MM-DD"}或{"kind":"duration","start":"YYYY-MM-DD","end":"YYYY-MM-DD"}，不能只返回日期字符串。corrections逐项返回metrics、patches、resolved_ranges、non_business、remove_dimensions数组，无更正时为空；移除维度须明确id和ranges。结构只约束格式及有效编码，不代替原文判断。'
 
-# 旧提示词仅供旧任务审计；新A不把比较要求写成身份豁免。
-IDENTITY_RULE='全部必需维度（包括report_scope）按完整金标准列缺项；已知值和未知照实保留，缺项不否定已确认指标槽位。完整性与本次是否比较分开，更新要求不能提供任何身份取值。selection的domain和completeness须由你依完整标准及原文明确填写，程序不补值。证据可引用本次实际提供的跨表原文、共同说明与公式引用原文；存在或同文不自动证明适用，由你确认真实适用范围及例外。'
-RELATION_RULE='每表另存relations数组，只记录本次原文已经确认的角色、期间/标签适用范围、父子/成员/总体及比例等关系，不从更新要求生成。每项格式为{"content":"原有关系的明确内容","record_ranges":[{"table_id":"本次表编号","ranges":["明确本方财务范围，*只限所指表"]}],"exceptions":[{"table_id":"表编号","ranges":["明确例外范围"],"content":"例外原判断"}],"evidence":["本次实际原文引用"]}。尚未确认的关系不填写假值，在notes或issues保留缺口。自然语言概述不能代替上述实际范围。'
-NEW_BIND_PROMPT=BIND_PROMPT.replace(CELL_REQUIREMENTS_PROMPT,'').replace(
-    'report_scope是报表共同信息，不作为格子绑定的必填维度，也不参与A/B格子对应；原文有明确说明时保留，没有时省略，不询问或猜测。其余业务维度仍须准确绑定。','').replace(
-    '程序补入定义中的domain，按该指标允许的维度保存。','domain及completeness必须明确填写，不交给程序补。')+'\n'+IDENTITY_RULE+'\n'+RELATION_RULE
-NEW_REVIEW_PROMPT=REVIEW_PROMPT.replace(CELL_REQUIREMENTS_PROMPT,'').replace(
-    'report_scope不参与格子对应，不因缺少该项提出未决；检查其余指标和业务维度。','')+'\n'+IDENTITY_RULE+'\n'+RELATION_RULE+'\n只核查已有关系，不另生一套关系。每表checked_relations列出实际确认的原relations序号（从0开始）；有明确修正时corrections.relations填写[{index:原序号,value:完整修正关系}]，原记录仍保留。无法确认的关系不勾选，按范围列issues。缺项如实保存，缺少关系不能靠文字推成执行对应。'
-NEW_READ_PROMPT=READ_PROMPT+'\n逐表明确需要共同阅读的context_references:[{sheet:原工作表,range:原范围}]，可跨表，只选本次已读原文中真实相关的说明、表头或依赖，不改变该表数据范围；没有则空数组。程序不按邻近或同文替你决定适用性。'
 
 
 def addresses(area):
@@ -175,7 +123,7 @@ def formula_source_material(snapshot, selected):
             if c.get('formula'):
                 if a!=address and (a in merged_anchors or (c['row']==row and c['column']<col) or isinstance(c.get('cached_value'),str)):
                     text[name+'!'+a]={'公式':c['formula']}
-                    if not direct or isinstance(c.get('cached_value'),str):queue.append((name,a))
+                    if not direct or isinstance(c.get('cached_value'),str) and (a in merged_anchors or c['row']==row):queue.append((name,a))
             elif isinstance(c.get('value'),str) and c['value'].strip():text[name+'!'+a]=c['value']
         # 共用文字按原位置只保存一次；每格保留适用范围，避免公式链平方复制全文。
         if not compact:return text
@@ -324,7 +272,15 @@ def source_material(snapshot, context, tables=None, semantic_only=False):
             for address,cell in sheet['cells'].items() if address in selected.get(sheet['name'],set()) and cell.get('formula')}
         material['公式用途']='仅用于理解构成和引用来源。与文字说明不一致时核对原文及直接来源，保留冲突依据；不计算新金额，不按数值相等判断身份。'
         if snapshot['semantic_formula_sources']>=2 and material['公式原文']:
-            material['公式引用依据']=formula_source_material(snapshot,selected)
+            formula_selected=selected
+            if snapshot['semantic_formula_sources']==4 and any(table.get('data_ranges') for table in tables or []):
+                formula_selected={}
+                for table in tables:
+                    formula_selected.setdefault(table['sheet'],set()).update(a for area in table.get('data_ranges',[]) for a in addresses(area))
+                for sheet in snapshot['sheets']:
+                    formula_selected.setdefault(sheet['name'],set()).update(a for a,c in sheet['cells'].items()
+                        if a in selected.get(sheet['name'],set()) and c.get('formula') and c.get('cached_value') is None)
+            material['公式引用依据']=formula_source_material(snapshot,formula_selected)
     if semantic_only:material['数值处理']='仅身份确认阶段隐藏已确定数据范围内的数值及空白状态；全部位置都要确认含义，原件及最终保存的原值不变。'
     if common:material['共同原文']={key:text for text,key in common.items()}
     def text_parts(value):
@@ -373,6 +329,7 @@ def source_material(snapshot, context, tables=None, semantic_only=False):
         for ref,c in evidence.items():
             value=c.get('cached_value') if c.get('formula') else c.get('value')
             if isinstance(value,str) and value.strip():aliases.setdefault(value,[]).append({'ref':ref,'scope':None})
+    aliases['_material_positions']=selected
     return material,aliases
 
 
@@ -1278,7 +1235,7 @@ def batch_origin(batch, mapping, cache):
     key=(reference['path'],reference['sha256'])
     if key not in cache:
         _require(file_hash(reference['path'])==reference['sha256'],'复用的旧语义映射发生变化')
-        old=json.loads(Path(reference['path']).read_text(encoding='utf-8-sig'))
+        old=json.loads(Path(reference['path']).read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
         _require(old['source_hash']==mapping['source_hash'] and old.get('source_context',[])==mapping.get('source_context',[]),
                  '复用的原件或上下文不一致')
         _require(file_hash(old['gold_path'])==old['gold_hash'],'复用的历史标准发生变化')
@@ -1321,20 +1278,8 @@ def checked_reading(mapping):
     return reading if {t['id'] for t in reading['tables']}<=reviewed else None
 
 
-def correction_scope(mapping, *, gold_hash=None):
-    """只有全部子表已核查才纠正实际未决，整份最多一轮。"""
-    proof=mapping.get('semantic_reading') or mapping.get('a_semantic_reading',{})
-    if not mapping.get('unresolved') or (proof.get('correction_pass') and proof.get('correction_rules_hash')==correction_rules_hash()
-                                        and (gold_hash is None or gold_hash==mapping['gold_hash'])):return {}
-    reading=checked_reading(mapping)
-    if reading is None:return {}
-    pending={(r['sheet'],r['cell']) for r in mapping['unresolved']}
-    return {t['id']:cells for t in reading['tables']
-            if (cells:=sorted(a for a in addresses(t['range']) if (t['sheet'],a) in pending))}
 
 
-def correction_rules_hash():
-    return definition_hash({'read':READ_PROMPT,'read_check':READ_CHECK_PROMPT,'select':SELECT_PROMPT,'bind':BIND_PROMPT,'review':REVIEW_PROMPT})
 
 
 def scope_material(snapshot, context):
@@ -1401,41 +1346,9 @@ def compact_formula_material(snapshot, material):
     return result
 
 
-DIRECT_PROMPT = """按完整上下文和相关金标准识别本次每个待更新格。只回答每个格子对应哪个金标准，以及该格的维度实际取值、期间、来源和原文依据。使用金标准已有编号和维度名，不计算或填写金额；空白财务格同样识别。原文已明确指标含义而具体名称、成员或其他维度取值未提供时，仍给出该格已确定的金标准编号；未知只记在相关维度，不把维度取值缺失当作指标无法识别，不把空白成员改成全体或合计。原文的总体、明细、其中项及例外分别如实保留，不能用当前明细名单替代总体，不反用标准缩小原文范围。未知及与标准的差异照实保存在该格结果中，不补造，不另作核查或重答。"""
+DIRECT_PROMPT = '表中指定的各格分别是什么意思，和金标准里的哪个槽位或维度最接近？ 按本格承载的内容选标准：名称或类别格可选相应维度，不套用同行金额格的指标。请逐格答完作答位置列表，不只给示例。'
 
-CELL_IDENTITY_OUTPUT = ('槽位编号、维度定义、维度实际值是三层：metric_id选择本格计量槽位，维度ID选择金标准已有属性，属性下保存本格原文实际值；不得互相替代，也不以维度值缺失否定已确定槽位。'
-    '答复只包含本次各格的金标准对应结果，每格独立写明原位置及本次识别字段的实际取值；'
-    '金标准对应的是本格自身承载的业务含义和计量值。指标格按指标定义的economic_object、measure、value_type及time_kind判断；'
-    '维度格按自身维度定义的meaning、value_type及取值规则判断，不套用指标定义字段。'
-    '不能只因表题或项目名提到某指标，就把仅列示名称、表头或说明的格子当成该指标的金额或比例数据格；'
-    '本格承载维度值时使用现有维度标准dimension_id，并独立给出本格自己的具名维度实际值及依据；不能借用数据格身份或从owner_reference、共同声明和标签引用中推导。'
-    '没有适用的指标或维度标准时如实给出相应编号为null及本格依据。财务数据格的原值为空或具体成员未知则仍按已明确含义选择指标。'
-    '共同上下文由你读懂并分别落实到各格自己的身份，不能交付待展开规则或后续执行安排。'
-    '只回答请求字段，未请求的指标、期间、来源及其他字段沿用，不重述或重新裁定。'
-    '直接交付每格已经确定的身份证字段：指标标准使用metric_id，维度标准使用dimension_id，每格只选自身对应的一个金标准；维度使用金标准原始ID，期间角色使用template_period_role。'
-    '使用对象或字段列时，原位置字段沿用location，维度分组字段沿用dimensions，分组内仍逐项以金标准原始维度ID为字段名保存实际值；不要把未具名的取值对象直接放进dimensions，也不要用通用id/value或dimension_id/value列表代替具名维度字段。本格金标准dimension_id独立声明，不能由维度分组里的属性ID代替；逐格结果直接列出，不另加自命名的外层包装。'
-    'A、B交付和保存共用上述字段名；本次请求的字段逐格直接交付，无法确定时仍用原字段写null并另列依据，不能用省略代替未知。'
-    '字段名和实际取值由你直接给出，不用字段别名或解释文字代替，不要求程序从自然语言中推导、翻译或补成身份证。'
-    '实际取值遵循所给金标准的value_type和meaning：currency使用原文币种的三位大写代码，unit_scale使用数值；'
-    '标准列有allowed_values时使用其中的准确取值；期间按金标准说明保留实际日期或实际起止日期，不能只写期初期末等角色。'
-    '槽位的定义、所引用维度的定义和本格实际值分别理解，维度定义说明本维度描述什么，不能抄成该格实际值。'
-    'A、B共用所给金标准原文；先依据各自完整原文判断本格对应的槽位、描述该槽位的维度及实际值，同一含义沿用同一标准表达。'
-    '语义相同与否由你在本次识别中判断，程序只保存你直接写出的字段并比较身份证，不会理解或改写同义句。'
-    '已有身份用于沿用本方正确结果；识别B时，A需要中已经按本次金标准保存的实际值用于统一相同含义的表达。'
-    '本方原文支持同一含义时，直接采用该已有值的原字段写法及实际内容，不另造一个同义表达；双方事实不同或未知时照实保留，不能复制另一方事实。'
-    '标准没有规定的答复包装或额外字段不能成为填写要求；未知只影响相关维度，不能为了凑齐字段放弃槽位或其他已知值。'
-    'selection使用含mode的取值对象，'
-    '按金标准含义确定all、members、predicate或complement，并保存实际成员、条件或补集范围，不用类别字符串代替selection对象。'
-    '请求template_period_role时，它只记录本格原文所指的期间角色：closing为期末、opening为期初、current为本期、prior为上期；'
-    '这是执行用户换期要求的既有字段，不是新增金标准，不替代period中的实际期间。不能确定时给null，理由另列。'
-    '原文引用、证据坐标、公式和解释另列为该格依据，不混入身份字段的实际取值。'
-    '完整识别或本次字段列有label_references时，逐格给出本方维度的标签原文引用：'
-    '使用既有label_references字段，按金标准维度ID分别保存本方原文坐标列表；是否属于本格由你依据完整上下文判断。'
-    '它只记录本格维度的原文依据，不是可搬运文本或A位置取B位置的安排，不能据此更新被引用的其他格。引用未知照实保留，不按相邻位置补造。'
-    '只请求label_references时，只给每格这项引用，已有指标、维度实际值和期间角色不重答。'
-    '不能合并格子、共用取值、写“同上”或让程序按行列展开。'
-    '不得另给A/B位置对应、取数指令、名单编排或写回安排。'
-    '文字、列表或表格均可，不限定JSON或固定模板。')
+CELL_IDENTITY_OUTPUT = '逐格给出location、metric_id或dimension_id、dimensions（按金标准原始维度ID）和template_period_role，值依本格原文；标准编号分别用metric_id或dimension_id写明，不合写字段名。dimensions填维度ID到实际值的对象，不只列名称。适用于本格的共同属性也各格写明，未知照实写。不把金额列的期间、币种或单位套给名称格；本格明示的限定照实保留。period用kind=instant及date，或kind=duration及start/end，日期为YYYY-MM-DD。集合值写在该集合维度原始ID下，mode用（all/members/predicate/complement/unknown），按实际给members、predicate或base/excluded。期间角色closing/opening/current/prior分别为期末/期初/本期/上期。同一金标准维度下，本格与已有参照含义相同时，直接复用参照的完整实际值对象，不另换mode或改写members、predicate等表达；本方原文不同或未知时照实保留；空白业务格照常识别，项目未写只将范围记未知。原文依据可另列，不展开共同声明或解释同义句，不交A/B位置取数或写回安排。文字、列表、表格或对象均可。'
 
 
 def _with_declared_context(mapping, ranges):
@@ -1490,7 +1403,7 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
     snapshot['semantic_identity_version'] = 2
     previous=None;execution=None;original_collections={}
     if previous_result:
-        stored=json.loads(Path(previous_result).read_text(encoding='utf-8-sig'))
+        stored=json.loads(Path(previous_result).read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
         if stored.get('schema')=='附注更新执行记录-v1':
             from .A合集 import resume_direct_output, direct_digest
             _require(carrier=='A','更新执行记录仅用于A副本接续')
@@ -1540,13 +1453,26 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
         named=[area for areas in snapshot.get('names',{}).values() for area in areas
                if any(area['sheet']+'!'+cell in requested for cell in addresses(area['range']))]
         if named:selected=named
+    reading_context=context; word_ranges=[]
+    if carrier=='A' and target_table is not None and metadata.get('a_link'):
+        from .Word原文材料 import word_source_material, word_table_context
+        areas=[*selected, *(ref for area in selected for ref in area.get('context_references',[]))]
+        scoped=word_table_context(word_source_material(metadata['a_link']),areas)
+        if scoped is not None:
+            section,word_ranges=scoped; linked={row['table_id'] for row in word_ranges}
+            reading_context=[item for item in context if not isinstance(item,dict) or
+                (item.get('title')!='原Word正文顺序（表格引用指向实际表区，各段适用范围由模型判断）'
+                 and (not item.get('table_id') or item['table_id'] in linked))]+[section]
+            selected=[{**area,'context_references':list({json.dumps(ref,sort_keys=True):ref for ref in
+                [*area.get('context_references',[]),*word_ranges]}.values())} for area in selected]
+    material_aliases={}
     if carrier=='B' and target_mapping is None:
-        material=scope_material(snapshot,context)
+        material=scope_material(snapshot,reading_context)
     else:
         direct_formula_input=carrier=='B'
         reading_snapshot=({**snapshot,'semantic_formula_sources':4}
                           if direct_formula_input else snapshot)
-        material, _ = source_material(reading_snapshot, context, selected)
+        material, material_aliases = source_material(reading_snapshot, reading_context, selected)
         if carrier=='B':
             proof=material.get('公式引用依据',{})
             material=compact_formula_material(reading_snapshot,material)
@@ -1556,8 +1482,9 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
                 material['公式及来源']['公式写法']=material['公式及来源']['公式写法'].replace(
                     '所有递归引用来源及共用文字保留在来源行列原文中。',
                     '保留直接引用和标题公式链，不展开数值公式下层，具体范围见本段说明。')
-    if selected and (carrier!='B' or target_mapping is not None):
-        # 作答范围不能裁掉父项说明；按工作表保留原文，不由程序挑选适用文字。
+    word_context=carrier=='A' and any(item.get('title')=='原Word正文顺序（表格引用指向实际表区，各段适用范围由模型判断）' for item in reading_context if isinstance(item,dict))
+    if selected and carrier!='B' and not word_context and not all(area.get('context_references') for area in selected):
+        # 已有完整Word正文或模型声明的阅读范围时，不再附上其他整表。
         context_sheets={area['sheet'] for area in selected}
         requested={}
         for span in field_scope or []:
@@ -1570,8 +1497,10 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
         complete_ranges=[{'sheet':sheet['name'],'range':f'A1:{get_column_letter(sheet["max_column"])}{sheet["max_row"]}'}
                          for sheet in snapshot['sheets'] if sheet['name'] in context_sheets]
         complete,_=source_material({**snapshot,'semantic_formula_sources':1},context,complete_ranges)
-        material['完整工作表原文']={key:complete[key] for key in ('sheets','公式原文','原有表区') if key in complete}
-        material['完整工作表原文']['说明']='目标工作表及直接引用涉及工作表的完整原文和公式；仅作上下文，不扩大本次逐格作答范围。'
+        full={key:complete[key] for key in ('sheets','公式原文','原有表区')
+              if key in complete and complete[key]!=material.get(key)}
+        if full:
+            material['完整工作表原文']={**full,'说明':'目标及直接引用工作表的其余完整原文和公式；不扩大作答范围。'}
     gold_text = Path(engine.gold_path).read_text(encoding='utf-8-sig')
     # 只去除旧转换及历史样例，指标与维度定义的原行保持完整。
     definitions = '\n'.join(line for line in gold_text.splitlines() if line.strip()
@@ -1587,65 +1516,34 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
     material['源文件']={'path':snapshot['path'],'sha256':snapshot['sha256']}
     materials = {'原文.json': material, '金标准.jsonl': definitions}
     if selected:
-        from .表格文字 import workbook_table_text
-        materials['本次原表网格.txt']=workbook_table_text(snapshot,selected)
+        from .表格文字 import workbook_table_text, workbook_table_ranges
+        grid_areas=[*selected,*word_ranges]
+        whole=material.get('完整工作表原文',{})
+        full_sheets={row['sheet'] for row in whole.get('sheets',[])}
+        grid_areas.extend({'sheet':s['name'],'range':f'A1:{get_column_letter(s["max_column"])}{s["max_row"]}'}
+                          for s in snapshot['sheets'] if s['name'] in full_sheets)
+        materials['本次原表网格.txt']=workbook_table_text(snapshot,grid_areas)
     if metadata.get('update_purpose'):materials['本次明确更新要求.json']=deepcopy(metadata['update_purpose'])
-    prompt = DIRECT_PROMPT + (' A、B只通过唯一、相同的金标准身份证连接；本次完成本方身份识别，'
-        '不要另给“A位置取B位置”的对应表；同义判断须在本次识别中完成，不能另交同义对照表让程序解释。'
-        '确属同一含义时使用相同的标准维度取值表示，原文及其差异保留为依据；'
-        '未确定的内容留在识别结果中，不交给后续程序猜测或选择。')
-    if metadata.get('normal_entry'):
-        prompt += ' 在每格身份中明确本期、上期、期初或期末角色（template_period_role），实际日期仍照实保留；该格的期间依据注明原表标签位置和原文。'
     if metadata.get('comparison_requirements'):
         materials['用户明确的比较排除.json']=metadata['comparison_requirements']
-        prompt += ' 用户明确排除的维度只是不参与本次对应，双方实际身份仍分别保存，不能因被排除维度不同拒绝已要求的搬运关系。'
-    if metadata.get('既有另一方身份参照'):
-        materials['既有另一方身份证表达.json'] = deepcopy(metadata['既有另一方身份参照'])
-        prompt += (' 已保存另一方身份仅供同一金标准实际取值的表达参照；依据本方完整原文判断，'
-                   '确属相同含义且符合金标准时，在本次识别中直接沿用同一实际取值对象，'
-                   '不要另造同义表达或交给程序转换。本方原文不同或未知时照实保留；'
-                   '主体、报告范围、实际日期及单位仍依本方原文，不能为对应抄写另一方事实。')
+    if metadata.get('既有另一方身份参照',{}).get('source_ranges'):
+        materials['既有另一方身份证表达.json']=deepcopy(metadata['既有另一方身份参照'])
     if target_table is not None:
         materials['原文.json']['固定目标'] = target_table
-        prompt += ' 本次范围已由固定目标给出，保留全部指定位置，不重新圈范围。'
     if metadata.get('target_tables'):
         materials['原文.json']['范围认识声明的候选表区']=metadata['target_tables']
     if carrier == 'B':
-        prompt += ' 原文.json是B来源，A原表.json及A原表网格.txt是A模板；表内A、B、C等是各自的原列号，不能把A模板的列位置套到B来源。本次只回答B身份，A材料仅说明更新需要。'
         if target_mapping is None:
-            prompt = '了解整份B各科目和子表的用途、位置与边界。按工作表列出各子表的行列范围、相关共同说明和明显的主体期间差异，包括空白模板。现在只保存目录认识，不逐格识别、不选金标准、不判定最终对应。简洁作答，文字或表格均可，不要求固定格式。'
             materials.pop('金标准.jsonl')
         else:
             _require(target_mapping['gold_hash']==engine.gold_hash,'A需要与本次识别没有使用同一金标准')
-            prompt += ' 本次识别B：依据A需要及本次明确更新要求确定必要范围。要求名单随B更新时，指定名单范围中的新成员也属于需要，不能因A没有同名成员而排除；仍只处理本次指定范围和字段。A只说明查找需要，B坐标和身份均依据B自己的原文，不沿用A的行列号。同一范围的认识复用，未找到的需要照实保留。'
-            prompt += ' 依据本方完整原文和所给金标准确定各格身份。双方原文在同一金标准字段下含义相同时，使用A已保存且符合金标准的同一实际取值；selection的mode、成员或条件及对象结构均保持相同，不另写同义表达，程序不会替你合并同义身份。双方原文不同或无法确定时照实保留，不能为了对应抄写A事实。'
-            if not field_scope:
-                prompt += ' 请逐格完成候选格的识别，各格分别给出所选槽位及其维度实际取值，使用金标准维度名，不用表结构描述代替实际取值。'
             materials['A需要.json'] = {'载体':'A','目标表区':deepcopy(metadata.get('a_required_ranges',[])),
                 **direct_reference(target_mapping,compact=True,ranges=metadata.get('a_required_ranges'))}
-            if not period_labels_only:
-                snapshot_a=target_mapping['机械记录'];requested=metadata.get('a_required_ranges',[])
-                owned={area['sheet']+'!'+cell for area in requested for cell in addresses(area['range'])}
-                named={name:areas for name,areas in snapshot_a.get('names',{}).items()
-                       if not requested or any(area['sheet']+'!'+cell in owned for area in areas for cell in addresses(area['range']))}
-                tables=[area for areas in named.values() for area in areas]
-                if not tables and requested:
-                    tables=[{'sheet':row['sheet'],'range':row['range']} for row in target_mapping.get('outline',{}).get('subtables',[])
-                            if any(row['sheet']+'!'+cell in owned for cell in addresses(row['range']))]
-                context_a=[row for row in target_mapping.get('source_context',[])
-                           if not requested or not named or isinstance(row,str) or isinstance(row,dict) and (not row.get('sheet') or row.get('range_name') in named)]
-                reference_ranges=tables or requested or [{'sheet':s['name'],
-                    'range':f'A1:{get_column_letter(s["max_column"])}{s["max_row"]}'} for s in snapshot_a['sheets']]
-                materials['A原表.json'],_=source_material(snapshot_a,context_a,reference_ranges)
-                materials['A原表.json']['载体']='A'
-                materials['A原表.json']['源文件']={'path':snapshot_a['path'],'sha256':snapshot_a['sha256']}
-                from .表格文字 import workbook_table_text
-                materials['A原表网格.txt']=workbook_table_text(snapshot_a,reference_ranges)
-                prompt += (' 同次识别明确每个B数据格的身份证和期间原文依据。按用户要求换期时，明确期初、期末、本期、上期角色，两个合集分别保留原实际日期；不能根据旧日期相等改变角色。'
-                    '名单中的成员及其计量字段也分别保存各格身份，新增成员不能因A没有同名成员而遗漏。'
-                    'A、B的连接只凭相同身份证。缺少标准或原文时在相应格说明具体问题，不编编号。')
-    else:
-        prompt += ' 本次识别A：覆盖本次原文全部待更新财务格，包括待填空白。'
+            saved=materials['A需要.json']
+            materials['A需要.json']={key:saved[key] for key in
+                ('载体','目标表区','source_hash','gold_hash','outline') if key in saved}
+            materials['A需要.json']['需要']=[row for row in saved.get('需要',[])
+                if allowed_metrics is None or any(row.get(key) in ids for key in ('metric_id','dimension_id'))]
     if previous_result:
         if execution:
             materials['上次搬运记录.json']={key:deepcopy(execution[key]) for key in
@@ -1669,14 +1567,10 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
                 # 原工作表及逐格公式完整保留，不重复嵌入递归来源副本。
                 materials['上次'+side+'原文.json'],_=source_material(
                     {**saved['机械记录'],'semantic_formula_sources':1},saved['source_context'],complete_ranges)
-            prompt += (' 上次搬运记录只说明实际动作，两边原判断和原文分别保留。'
-                '本次只识别指定位置自己的金标准身份；不能把模板格、另一方身份或搬运记录当成新格的身份。'
-                '已保存的旧格身份仅随明确版式移动复用，没有要求重跑其他范围。')
         if previous is not None and (previous.get('source_hash') == snapshot['sha256'] and previous.get('gold_hash') == engine.gold_hash
                 and previous.get('source_context') == context):
             if previous.get('recognition_method') != 'direct':
                 materials['已有结果.json'] = direct_reference(previous)
-                prompt += ' 已有结果仍适用的部分直接复用；缺项照实保留，不重新安排一轮核查。'
     if field_scope:
         _require(previous is not None and previous.get('recognition_method')=='direct'
                  and previous.get('source_hash')==snapshot['sha256'] and previous.get('gold_hash')==engine.gold_hash,
@@ -1692,48 +1586,48 @@ def recognize_a(engine, source, context, progress=None, artifact_metadata=None, 
             materials['已有期间只读参照.json']={location:deepcopy(row['dimensions']['period'])
                 for location,row in _records(previous)
                 if location in selected_locations and 'period' in row['dimensions']}
-            prompt = ('本次只补字段范围内每格身份的期间原文依据。'
-                '每格分别指出原表标签坐标及标签原文。'
-                '已有期间只作只读参照，不按日期反推标签，不重答日期、编号或其他身份维度。'
-                '只依据本方原文及明确的行列关系，包括空白数据格；未能明确的对应关系照实保留。'
-                '原有表区是提取时保留的子表边界，不能把前一张表的标题沿用到后一张表；行上的期间文字也可能是标签。'
-                '使用自然文字即可，不要求JSON或固定模板。')
-            if any('template_period_role' in fields for fields in field_scope.values()):
-                prompt += ' 对列有template_period_role的范围，同时明确本期、上期、期初或期末角色；只补标签的格不重答角色。'
-        else:
-            prompt += f' 本次字段范围只列{carrier}端需要识别的字段，不是另一方的目标位置。本次只识别其中列明的坐标和字段，使用金标准已有维度名；未列出的正确内容由保存入口沿用，无需重答。给出实际取值，未知照实保留，不用“按各行选取”等描述代替。'
     request_materials=({key:value for key,value in materials.items() if key!='A需要.json'}
                        if period_labels_only else materials)
     if field_scope and all(set(fields)<={'period','template_period_role','entity','report_scope','currency','unit_scale'} for fields in field_scope.values()) and not period_labels_only and not metadata.get('source_targets'):
-        request_materials={key:value for key,value in materials.items() if key not in ('A需要.json','A原表.json','A原表网格.txt')}
-        prompt=('本次逐格识别字段范围列明的身份取值，其他已有结果复用。'
-            '依据本方整份材料的报告信息和各表原文判断共同说明是否适用，包括实际期间、主体、币种、口径；不能借用另一方事实。'
-            '使用所给金标准字段名，每格分别写明本格实际取值，不另作核查或重答。')
-        if metadata.get('additional_context'):prompt+='\n'+metadata['additional_context']
+        request_materials={key:value for key,value in materials.items() if key!='A需要.json'}
     source_targets=metadata.get('source_targets')
     if metadata.get('normal_entry') and 'A需要.json' in request_materials:
         request_materials['B原文.json']=request_materials.pop('原文.json')
-        prompt+=' B身份和位置以B原文为准；A原表及A需要只说明更新目标，A的单位、日期与共同说明不属于B事实。'
-    if 'A原表.json' in request_materials:
-        prompt+=' A原表中“本次读取范围”是本次目标；原Word正文中的其他表区引用仅供上下文，同名标题也不能改接范围外的表。'
-    if metadata.get('additional_context') and metadata['additional_context'] not in prompt:
-        prompt+='\n本次具体要求：'+metadata['additional_context']
     if '本次原表网格.txt' in request_materials:
         from .表格文字 import TABLE_STRUCTURE_READING
-        prompt+=TABLE_STRUCTURE_READING
     if metadata.get('source_images'):
         _require(all(image.get('source_hash')==snapshot['sha256'] for image in metadata['source_images']),
                  '原表图片不属于本次原件，未发送识别')
         request_materials['原表图片.json']=deepcopy(metadata['source_images'])
-        prompt+=' 所附原表图片保留实际版式；先依据目标位置与图中行列、合并表头确认本格，再按同一金标准直接给出本格身份。标色只定位作答对象，不表示金标准或维度值；其他位置仍只作上下文。'
     if target_table is not None:
         request_materials['本次作答位置.json']={'载体':carrier,'位置':[target_table['sheet']+'!'+cell
             for area in target_table['data_ranges'] for cell in addresses(area)]}
-        prompt+=' 本次作答位置单独列在材料末尾；location使用其中所列原位置，不添加A或B等载体前缀。原文中的其他坐标仅作证据，不另选作答位置。'
-    if carrier != 'B' or target_mapping is not None:
+    if carrier=='B' and target_mapping is None:
+        prompt='读懂B整份文件的科目、子表、位置和共同说明，保存范围认识，包括空白模板；本次不逐格识别。'
+    else:
+        prompt=DIRECT_PROMPT+' 本次识别'+carrier+'，只回答材料列出的作答位置和字段，依据本方完整原文及相关金标准。'
+        if '本次原表网格.txt' in request_materials:
+            prompt+=TABLE_STRUCTURE_READING
+        if metadata.get('additional_context'):
+            prompt+='\n'+metadata['additional_context']
         prompt+='\n'+CELL_IDENTITY_OUTPUT
-    if field_scope:
-        prompt+='\n本次字段范围按每格分别限定作答：未列metric_id或dimension_id的位置，只补其已保存身份证的属性，不重新为该格选择标准，也不能把待补字段名填作本格标准编号。列有标准编号的位置，才按所给原文和金标准选择该格自身的标准。本次指定字段不能适用或不能确定时，仍用该原字段给null并另列本方依据，不改写未请求字段。'
+    if '本次原表网格.txt' in request_materials and '_material_positions' in material_aliases:
+        covered={}
+        for _,sheet,span in workbook_table_ranges(snapshot,grid_areas):
+            covered.setdefault(sheet,set()).update(addresses(span))
+        extra=[]
+        for sheet in snapshot['sheets']:
+            positions=material_aliases['_material_positions'].get(sheet['name'],set())-covered.get(sheet['name'],set())
+            if positions:
+                extra.append({**sheet,'cells':{a:c for a,c in sheet['cells'].items() if a in positions}})
+        outside,_=source_material({**snapshot,'sheets':extra,'semantic_identity_version':0,'semantic_formula_sources':0},[])
+        request_materials=dict(request_materials)
+        for key in ('原文.json','B原文.json'):
+            if key not in request_materials:continue
+            reading_material={k:v for k,v in request_materials[key].items() if k not in ('sheets','完整工作表原文')}
+            if outside['sheets']:reading_material['sheets']=outside['sheets']
+            request_materials[key]=reading_material
+    _require(len(prompt)<=2000,'识别提示词超过2000字符；未发送，原材料保留。')
     answer = engine.request_text(prompt, request_materials)
     _require(file_hash(source) == snapshot['sha256'] and file_hash(engine.gold_path) == engine.gold_hash,
              '识别期间原件或金标准已变化；原答复已经保留')
@@ -1813,6 +1707,7 @@ def direct_reference(record, *, compact=False, ranges=None):
             copied={'sheet':table['sheet'],'metrics':[],'dimensions':[]}
             for kind in ('metrics','dimensions'):
                 for row in table.get(kind,[]):
+                    if record.get('逐格字段版本')==1 and (kind!='dimensions' or row.get('逐格原字段') is not True):continue
                     if not (kind=='metrics' and 'template_period_role' in row or
                             kind=='dimensions' and row.get('id')=='template_period_role'):continue
                     declared=[part for span in row['ranges'] for part in
@@ -1872,7 +1767,7 @@ def verify_mapping(mapping, standard, *, rebuild=False):
         prepare_reuse(snapshot,b_scope,b_outline,historical)
     if mapping.get('dimension_vocabulary_version')!=1:snapshot.pop('semantic_known_targets',None)
     receipt_mapping=mapping;origin_cache={}
-    def read(proofs,task_name,prompt,payload):
+    def read(proofs,task_name,payload):
         _require(len(proofs)==1,'每个阶段只采纳一个完整回执')
         task,answer=_stage_receipt(proofs[0],receipt_mapping,task_name)
         # 提示词原文已包含在实际任务哈希中；以后改进措辞不能使已保存的合法成果失效。
@@ -1883,10 +1778,10 @@ def verify_mapping(mapping, standard, *, rebuild=False):
     if no_candidates:
         _require(not any(proof.values()),'无候选不能伪造语义回执')
         reading={'tables':[],'notes':'未找到必要候选，原A需要继续保留。'}
-    else:reading=validate_scoped_reading(read(proof['reading'],'a_semantic_read',READ_PROMPT,read_input),snapshot,b_scope,b_outline)
+    else:reading=validate_scoped_reading(read(proof['reading'],'a_semantic_read',read_input),snapshot,b_scope,b_outline)
     if proof.get('reading_check'):
         questions=reading_questions(reading,snapshot)
-        answer=read(proof['reading_check'],'a_semantic_read_check',READ_CHECK_PROMPT,
+        answer=read(proof['reading_check'],'a_semantic_read_check',
                     reading_check_payload(reading,questions,snapshot,context))
         reading=apply_reading_check(reading,answer,questions,snapshot)
         validate_scoped_reading(reading,snapshot,b_scope,b_outline)
@@ -1895,7 +1790,7 @@ def verify_mapping(mapping, standard, *, rebuild=False):
         old_task,_=_stage_receipt(proof['selection'][0],mapping,'a_semantic_select')
         select_input=selection_payload(reading,snapshot,historical,include_basis=any('basis' in m for m in old_task['payload']['catalog']))
         if '原表文字' not in old_task['payload']:select_input.pop('原表文字')
-        selection=validate_selection(read(proof['selection'],'a_semantic_select',SELECT_PROMPT,select_input),reading,historical)
+        selection=validate_selection(read(proof['selection'],'a_semantic_select',select_input),reading,historical)
         index={t['id']:t for t in reading['tables']}
         selected={r['id']:r for r in selection['tables']}
         for reference in proof.get('selection_additions',[]):
@@ -1904,7 +1799,7 @@ def verify_mapping(mapping, standard, *, rebuild=False):
             _require(all(t==index.get(t['id']) for t in partial['tables']),'补检索改变了原表理解')
             select_input=selection_payload(partial,snapshot,historical,include_basis=any('basis' in m for m in task['payload']['catalog']))
             if 'selection_questions' in task['payload']:select_input['selection_questions']=task['payload']['selection_questions']
-            addition=validate_selection(read([reference],'a_semantic_select',SELECT_PROMPT,select_input),partial,historical)
+            addition=validate_selection(read([reference],'a_semantic_select',select_input),partial,historical)
             selected.update((r['id'],r) for r in addition['tables'])
         selection={'tables':[selected[t['id']] for t in reading['tables']]}
         for item in proof['batches']:
@@ -1920,7 +1815,7 @@ def verify_mapping(mapping, standard, *, rebuild=False):
             payload['standards']=standard_material(supplied,historical)
             if 'cell_requirements' in task['payload']:payload['cell_requirements']=cell_requirements(supplied,historical)
             else:payload.pop('cell_requirements',None)
-            binding=validate_bindings(read(item['binding'],'a_semantic_bind',BIND_PROMPT,payload),tables,snapshot,context,historical,candidate=True)
+            binding=validate_bindings(read(item['binding'],'a_semantic_bind',payload),tables,snapshot,context,historical,candidate=True)
             earlier=[]
             seen={t['id']:{a:set(supplied) for a in table_packet(t,snapshot,context)['candidate_cells']} for t in tables}
             def record_definitions(answer,review_task):
@@ -1947,7 +1842,7 @@ def verify_mapping(mapping, standard, *, rebuild=False):
                 else:prior_payload.pop('cell_requirements',None)
                 for key in ('program_issues','semantic_questions','previous_issues','返回骨架'):
                     if key in old_task['payload']:prior_payload[key]=old_task['payload'][key]
-                old_review=validate_review(read([reference],'a_semantic_review',REVIEW_PROMPT,prior_payload),tables,snapshot,context,focus)
+                old_review=validate_review(read([reference],'a_semantic_review',prior_payload),tables,snapshot,context,focus)
                 record_definitions(old_review,old_task)
                 binding=reviewed_binding(binding,old_review,tables,snapshot);earlier.append(old_review)
             review_payload={**payload,'task':'a_semantic_review','recognized':binding}
@@ -1971,7 +1866,7 @@ def verify_mapping(mapping, standard, *, rebuild=False):
                 if 'semantic_questions' in old_task['payload']:review_payload['semantic_questions']=old_task['payload']['semantic_questions']
                 if '返回骨架' in old_task['payload']:review_payload['返回骨架']=old_task['payload']['返回骨架']
                 if 'previous_issues' in old_task['payload']:review_payload['previous_issues']=old_task['payload']['previous_issues']
-            review=validate_review(read(item['review'],'a_semantic_review',REVIEW_PROMPT,
+            review=validate_review(read(item['review'],'a_semantic_review',
                 review_payload),tables,snapshot,context,review_payload.get('review_focus')) if item['review'] else {'tables':[]}
             if item['review']:record_definitions(review,old_task)
             final_binding=reviewed_binding(binding,review,tables,snapshot)

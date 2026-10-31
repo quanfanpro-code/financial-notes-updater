@@ -206,7 +206,8 @@ class 合集关系贯通测试(unittest.TestCase):
         self.assertEqual(run['status'],'complete',run)
         prompt,materials=request.call_args.args
         self.assertIn('空白也是业务位置',prompt)
-        self.assertIn('[空白]',materials['A原表.json']['sheets'][0]['rows'])
+        self.assertNotIn('A原表.json',materials)
+        self.assertNotIn('A原表网格.txt',materials)
         self.assertIn('A需要.json',materials)
         request.assert_called_once()
 

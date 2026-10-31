@@ -1026,9 +1026,6 @@ class Application:
             messagebox.showerror("标准已保存，设置尚未保存", "新标准已在本窗口使用，请修正设置后点击保存设置。\n" + str(exc), parent=self.root)
         self.status.configure(text="已使用新版本；引用定义变化的映射需重新识别。", fg=GREEN)
 
-    def change_scope_prefilter(self):
-        self.apply_values({key: "" for key in STEP_INVALIDATED["recognize_b"]})
-        self.append_log("来源筛选方式已改变，已清空更新数据及后续成果的选择；原成果文件仍保留，请重新识别更新数据。")
 
     def config(self):
         requirements = [row for row in self.comparison_requirements if row['维度ID'] not in self.comparison_choices
@@ -1039,7 +1036,7 @@ class Application:
         return {**{key: value.get().strip() for key, value in self.values.items() if key != 'update_requirements'},
                 'update_purpose': {**self.update_purpose, 'reason': self.values['update_requirements'].get().strip()},
                 'comparison_requirements': requirements,
-                "scope_prefilter": self.scope_prefilter.get(), "current_step": self.current_step if self.current_step in STEPS else "extract_a"}
+                "scope_prefilter": False, "current_step": self.current_step if self.current_step in STEPS else "extract_a"}
 
     def refresh_ready(self):
         if not hasattr(self, "status"):

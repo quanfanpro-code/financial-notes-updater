@@ -6,7 +6,7 @@ import copy
 import hashlib
 import json
 import re
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
@@ -24,8 +24,22 @@ MEASUREMENT_PROMPT = '''先确定独立的经济计量，再理解它在当前�
 原文包含事项、用途或其他限定时，保留限定的实际对象范围，不能只保存一个宽泛类别。以上知识不能充当企业本期的事实证据，evidence仍须引用本次原文。'''
 
 
+def json_date(value):
+    """只封存日期原值的类型，不解释期间维度。"""
+    if isinstance(value, date):
+        return {"__excel_date__": value.isoformat(), "type": type(value).__name__}
+    raise TypeError("不能保存的原值类型：" + type(value).__name__)
+
+
+def json_dates(pairs):
+    value = _pairs(pairs)
+    if set(value) == {"__excel_date__", "type"} and value["type"] in ("date", "datetime"):
+        return {"date": date, "datetime": datetime}[value["type"]].fromisoformat(value["__excel_date__"])
+    return value
+
+
 def _json(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False, default=json_date)
 
 
 def definition_hash(value):

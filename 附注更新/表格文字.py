@@ -41,8 +41,8 @@ def grid_text(rows, columns, values, merges, coordinate):
     return '\n'.join(lines)
 
 
-def workbook_table_text(snapshot, areas):
-    """优先呈现既有物理表区；没有表区记录时原样使用调用方阅读范围。"""
+def workbook_table_ranges(snapshot, areas):
+    """读取已有物理表区，不判断内容含义。"""
     tables = []
     for area in areas:
         candidates = []
@@ -52,14 +52,28 @@ def workbook_table_text(snapshot, areas):
                 if part['sheet'] != area['sheet']:
                     continue
                 l, t, r, b = range_boundaries(part['range'])
-                if l <= right and r >= left and t <= bottom and b >= top:
+                if l <= left and r >= right and t <= top and b >= bottom:
                     candidates.append((name, part['sheet'], part['range']))
         tables.extend(candidates or [('', area['sheet'], area['range'])])
-    lines = ['以下为原文件二维网格。并入表示明确的合并覆盖，不是独立空白；原格空白与未记录分开列示。',
-             '这里只呈现原位置和内容，表头角色、行列约束及业务含义由识别模型依据完整上下文判断。']
-    for name, sheet_name, span in dict.fromkeys(tables):
+    return list(dict.fromkeys(tables))
+
+
+def workbook_table_text(snapshot, areas):
+    """优先呈现既有物理表区；没有表区记录时使用明确阅读范围。"""
+    tables = workbook_table_ranges(snapshot, areas)
+    bounds = [range_boundaries(span) for _, _, span in tables]
+    lines = ['以下为原文件二维网格。并入表示明确的合并覆盖，不是独立空白；原格空白与未记录分开列示。']
+    for index, (name, sheet_name, span) in enumerate(tables):
+        left, top, right, bottom = bounds[index]
+        containing = [j for j, (_, sheet, _) in enumerate(tables) if sheet == sheet_name
+                      and bounds[j][0] <= left and bounds[j][1] <= top
+                      and bounds[j][2] >= right and bounds[j][3] >= bottom]
+        parent = max(containing, key=lambda j: ((bounds[j][2]-bounds[j][0]+1)*(bounds[j][3]-bounds[j][1]+1), -j))
+        if parent != index:
+            lines.append('原表区：' + name + '；工作表：' + sheet_name + '；范围：' + span +
+                         '；原内容已列在同工作表网格 ' + tables[parent][2] + ' 中。')
+            continue
         sheet = next(s for s in snapshot['sheets'] if s['name'] == sheet_name)
-        left, top, right, bottom = range_boundaries(span)
         values = {coordinate_to_tuple(address): (cell.get('cached_value') if cell.get('formula') else cell.get('value'))
                   for address, cell in sheet['cells'].items()
                   if top <= cell['row'] <= bottom and left <= cell['column'] <= right}
@@ -72,6 +86,11 @@ def workbook_table_text(snapshot, areas):
                     lines.append('范围外合并起点原文：' + sheet_name + '!' + get_column_letter(l) + str(t) +
                                  ' ' + json.dumps(cell.get('value'), ensure_ascii=False, default=str))
         lines.append('\n工作表：' + sheet_name + '；原表区：' + name + '；范围：' + span)
+        linked = [{key: item[key] for key in ('table_id', 'range_name', 'title', 'link_error') if item.get(key) is not None}
+                  for item in snapshot.get('context', [])
+                  if name and isinstance(item, dict) and item.get('range_name') == name and item.get('sheet') == sheet_name]
+        if linked:
+            lines.append('原表号及标题：' + json.dumps(linked, ensure_ascii=False))
         lines.append(grid_text(range(top, bottom + 1),
                                {c: get_column_letter(c) for c in range(left, right + 1)}, values, merges,
                                lambda r, c: get_column_letter(c) + str(r)))

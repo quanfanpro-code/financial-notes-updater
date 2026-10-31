@@ -8,9 +8,9 @@ import re
 from .A语义阅读 import (addresses, metric_catalog, scope_material, recognize_a,
                       direct_reference)
 from .A合集 import (combine_direct_collections, direct_digest, save_direct_answer, direct_recognition_status,
-                   source_relation, _declared_list_tables, _list_relation_conflicts, _records, append_declared_relation)
+                   _records, append_declared_relation)
 from .表格 import read_workbook, materialize_candidate_blanks
-from .统一语义 import definition_hash
+from .统一语义 import definition_hash, json_date, json_dates
 
 
 def read_scope_answer(reply, snapshot, standard, target=None):
@@ -167,117 +167,8 @@ def scope_key(tables):
 
 
 def answer_relations(target, part, source_ranges, dimensions, standard, required_ranges, *, targets=None):
-    """接入已识别的标签和版式安排；A/B金额对应只由身份证产生。"""
-    reply=part.get('答复接入来源',{}).get('本次原答复',part['识别答复'])
-    reference=direct_reference(target,compact=True,ranges=required_ranges)
-    requested=targets
-    targets=targets if targets is not None else list(dict.fromkeys([row['location'] for row in reference['需要']]+
-        [row['source_reference']['location'] for row in reference.get('source_identities',[])]+
-        [row['sheet']+'!'+row['cell'] for row in reference.get('unresolved',[]) if row.get('sheet') and row.get('cell')]))
-    relation=source_relation(target,part,reply,targets)
-    from .A合集 import declared_named_row_relations
-    named,arrangements=declared_named_row_relations(target,part,reply)
-    for row in named:
-        if row.get('label'):
-            label={'action':'copy','target':row['target'],'source':row['source']}
-            if label not in relation['label_actions']:relation['label_actions'].append(label)
-    relation['bindings']=[]
-    relations=[relation] if relation['bindings'] or relation['label_actions'] or relation['caption_updates'] or relation.get('retained_targets') else []
-    if arrangements:
-        relations.append({'kind':'名单编排','dimension':None,'content':reply,'answer_hash':definition_hash(reply),
-            'source_a_hash':target['source_hash'],'source_b_hash':part['source_hash'],'gold_hash':part['gold_hash'],
-            'source_ranges':source_ranges,'tables':arrangements,'conflicts':[],'未采用的引用说明':[]})
-    listed=re.findall(r'名单维度(?:编号)?\s*(?:为|是|[:：=])\s*([a-z_]+)',reply.replace('`','').replace('**',''))
-    if re.search(r'按\s*A\s*原表样式',reply) and re.search(r'更新为上述[^。；;]*明细后接合计',reply):
-        listed.extend(re.findall(r'(\w+)\s*[、，,]\s*mode\s*=\s*members',reply.replace('`','')))
-    dimensions=list(dict.fromkeys([*dimensions,*[key for key in listed if key in standard['dimension']]]))
-    declarations=[(dimension,reply) for dimension in dimensions]
-    for block in re.split(r'\n(?=#{1,6}\s)',reply):
-        if not re.search(r'名单[^。\n]*更新',block) and not ('排布' in block and ('名单' in block or '成员' in block)) and not ('新增' in block and '名单维度' in block) and not ('A沿用原样式' in block and '明细' in block and '合计' in block):continue
-        keys=[key for key,row in standard['dimension'].items() if row.get('value_type')=='selection'
-              and re.search(r'(?<![\w.])'+re.escape(key)+r'(?![\w.])',block)]
-        if not keys and re.search(r'沿用\s*A\s*的名单维度',block):
-            keys=list({item['id'] for table in target.get('outline',{}).get('subtables',[])
-                if table['sheet']+'!'+table['range'] in block.replace('`','')
-                for item in table.get('dimensions',[]) if standard['dimension'].get(item['id'],{}).get('value_type')=='selection'})
-        if not keys:
-            # 当前段落明说的指标已有维度引用，不借另一段的比例分母充当名单维度。
-            metrics={key for key in standard.get('metric',{}) if re.search(r'(?<![A-Za-z0-9_.])'+re.escape(key)+r'(?![A-Za-z0-9_.])',block)}
-            own_keys={ref['id'] for metric in metrics for ref in standard.get('metric',{}).get(metric,{}).get('dimension_refs',[])
-                      if standard['dimension'].get(ref['id'],{}).get('value_type')=='selection'}
-            stated=[key for key,row in standard['dimension'].items() if row.get('value_type')=='selection'
-                    and re.search(r'(?<![\w.])'+re.escape(key)+r'(?![\w.])',reply)]
-            if len(own_keys)==1:
-                key=next(iter(own_keys))
-                if key not in dimensions:declarations.append((key,reply if stated==[key] else block));dimensions.append(key)
-                continue
-            if len(stated)==1:keys=stated
-            # 名单段落沿用同一答复表头已明示的维度；完整答复保留列角色与来源引用。
-            headers='\n'.join(line for line in reply.splitlines() if line.strip().startswith('|'))
-            declared=[key for key,row in standard['dimension'].items() if row.get('value_type')=='selection'
-                      and re.search(r'\|\s*`?'+re.escape(key)+r'`?\s*\|',headers)]
-            if len(declared)==1 and declared[0] not in dimensions:
-                declarations.append((declared[0],reply));dimensions.append(declared[0]);continue
-            title=block.splitlines()[0].strip(' #`')
-            selected=re.findall(re.escape(title)+r'使用\s*`?(metric\.[\w.]+)',reply) if title else []
-            if len(set(selected))==1:
-                keys=[r['id'] for r in standard['metric'].get(selected[0],{}).get('dimension_refs',[])
-                      if standard['dimension'][r['id']].get('value_type')=='selection']
-        if len(keys)==1 and keys[0] not in dimensions:
-            all_keys=[key for key,row in standard['dimension'].items() if row.get('value_type')=='selection'
-                and re.search(r'(?<![\w.])'+re.escape(key)+r'(?![\w.])',reply)]
-            declarations.append((keys[0],reply if len(all_keys)==1 or 'A沿用原样式' in block else block))
-    for dimension,content in declarations:
-        relation={'kind':'名单编排','dimension':dimension,'content':content,
-            'answer_hash':definition_hash(content),'source_a_hash':target['source_hash'],
-            'source_b_hash':part['source_hash'],'gold_hash':part['gold_hash'],'source_ranges':source_ranges,
-            'tables':_declared_list_tables(target,content,dimension,source_ranges,part)}
-        relation['conflicts'],relation['未采用的引用说明']=_list_relation_conflicts(part,content,source_ranges)
-        relations.append(relation)
-    allowed={r['sheet']+'!'+cell for r in required_ranges or [] for cell in addresses(r['range'])} if required_ranges else None
-    label_scope=allowed
-    if requested is not None:allowed=set(requested) if allowed is None else allowed&set(requested)
-    if allowed is not None:
-        from openpyxl.utils.cell import range_boundaries
-        for relation in relations:
-            for key in ('bindings','label_actions'):
-                selected=label_scope if key=='label_actions' else allowed
-                if key in relation and selected is not None:relation[key]=[row for row in relation[key] if row['target'] in selected]
-            if 'retained_targets' in relation:relation['retained_targets']=[loc for loc in relation['retained_targets'] if loc in allowed]
-            owned={name for name,areas in target.get('机械记录',{}).get('names',{}).items()
-                if any(any(area['sheet']+'!'+cell in allowed for cell in addresses(area['range'])) for area in areas)}
-            if 'caption_updates' in relation:relation['caption_updates']=[row for row in relation['caption_updates'] if row['range_name'] in owned]
-            scoped=[]
-            for table in relation.get('tables',[]):
-                if table['range_name'] not in owned:continue
-                table=deepcopy(table);area=target['机械记录']['names'][table['range_name']][0]
-                top=range_boundaries(area['range'])[1];first=top+table['first_row_offset'];sheet=area['sheet']
-                rows=[(row,first+min(i,table['old_detail_count'])) for i,row in enumerate(table['source_rows'])]
-                rows.extend((row['source_row'],row['target_row']) for row in table.get('totals',[]))
-                table['row_columns']={str(row):{col:value for col,value in table.get('row_columns',{}).get(str(row),table['columns']).items()
-                    if sheet+'!'+col+str(original) in allowed} for row,original in rows}
-                table['labels']={col:value for col,value in table.get('labels',{}).items()
-                    if all(sheet+'!'+col+str(original) in allowed for _,original in rows)}
-                if not any(table['row_columns'].values()) and not table['labels']:continue
-                scoped.append(table)
-            if 'tables' in relation:relation['tables']=scoped
-    from openpyxl.utils.cell import range_boundaries
-    for table in [t for relation in relations for t in relation.get('tables',[])]:
-        area=target['机械记录']['names'][table['range_name']][0]
-        top=range_boundaries(area['range'])[1]
-        for index,source_row in enumerate(table['source_rows']):
-            if index<table['old_detail_count']:continue
-            row=top+(table['target_row_offsets'][index] if table.get('target_row_offsets') else table['first_row_offset']+index)
-            for relation in relations:
-                for binding in relation.get('bindings',[]):
-                    sheet,cell=binding['target'].rsplit('!',1)
-                    if sheet!=area['sheet'] or not re.fullmatch(r'[A-Z]+'+str(row),cell):continue
-                    col=re.match(r'[A-Z]+',cell)[0]
-                    source_col={**table.get('labels',{}),**table.get('row_columns',{}).get(str(source_row),table['columns'])}.get(col)
-                    if binding['source']!=table['source_sheet']+'!'+str(source_col)+str(source_row):continue
-                    binding['target_member']={key:deepcopy(table[key]) for key in ('range_name','first_row_offset','source_sheet')}
-                    binding['target_member'].update(source_row=source_row,column=col)
-    return relations
+    """旧位置或名单安排不建立语义对应，保留函数名供旧入口明确拒绝。"""
+    return []
 
 
 def recognize_document(engine, source, context, metadata, target, destination, log, progress=None, previous_result=None, scope_answers=None):
@@ -288,7 +179,7 @@ def recognize_document(engine, source, context, metadata, target, destination, l
     snapshot.update(semantic_identity_version=2,semantic_formula_sources=5)
     previous=None
     if previous_result:
-        stored=json.loads(Path(previous_result).read_text(encoding='utf-8-sig'))
+        stored=json.loads(Path(previous_result).read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
         if (stored.get('source_hash')==snapshot['sha256'] and stored.get('gold_hash')==engine.gold_hash
                 and stored.get('carrier')==carrier and stored.get('source_context')==context
                 and all(stored.get(key)==metadata.get(key) for key in ('update_purpose','comparison_requirements'))):
@@ -351,11 +242,11 @@ def recognize_document(engine, source, context, metadata, target, destination, l
         source=correction.get('原合集')
         if source in seen:break
         corrections.append(correction);seen.add(source)
-        previous=json.loads(Path(source).read_text(encoding='utf-8-sig')) if source and Path(source).is_file() else None
+        previous=json.loads(Path(source).read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates) if source and Path(source).is_file() else None
     parts=[];saved={}
     indexed=[Path(part['mapping_path']) for part in carried.get('合集来源',[])] if carried else []
     for path in indexed or engine.work_dir.glob('直接识别_*/'+carrier+'识别结果.json'):
-        previous=json.loads(path.read_text(encoding='utf-8-sig'))
+        previous=json.loads(path.read_text(encoding='utf-8-sig'),object_pairs_hook=json_dates)
         if (previous.get('source_hash')==snapshot['sha256'] and previous.get('gold_hash')==engine.gold_hash
                 and previous.get('source_context')==context
                 and (target is None or previous.get('A需要',{}).get('source_hash')==target['source_hash'])
@@ -415,10 +306,15 @@ def recognize_document(engine, source, context, metadata, target, destination, l
         result['本次逐格接入']['complete']=False
     if carrier=='B':
         from .统一勾稽 import calculate_mapping_formulas
-        calculate_mapping_formulas(result,destination/'来源取值副本')
+        from .语义 import SemanticCancelled
+        try:calculate_mapping_formulas(result,destination/'来源取值副本')
+        except SemanticCancelled:raise
+        except Exception as error:
+            result['公式取值问题']=str(error)
+            log('识别结果继续保存；公式取值未完成：'+str(error))
     result['封存校验']=direct_digest(result)
     path=destination/(carrier+'识别结果.json');result['mapping_path']=str(path.resolve())
-    with path.open('x',encoding='utf-8') as f:json.dump(result,f,ensure_ascii=False,indent=2)
+    with path.open('x',encoding='utf-8') as f:json.dump(result,f,ensure_ascii=False,indent=2,default=json_date)
     from .统一勾稽 import load_fact_mapping
     load_fact_mapping(path,{})
     files={carrier.lower()+'_mapping':str(path),'recognition_answer':str(destination/(carrier+'范围认识原答复.txt'))}
@@ -426,9 +322,10 @@ def recognize_document(engine, source, context, metadata, target, destination, l
         a={**target,'已确认关系':deepcopy(target.get('已确认关系',[]))}
         for relation in result['已确认关系']:append_declared_relation(a['已确认关系'],relation)
         a['封存校验']=direct_digest(a);a_path=destination/'A识别结果.json';a['mapping_path']=str(a_path.resolve())
-        with a_path.open('x',encoding='utf-8') as f:json.dump(a,f,ensure_ascii=False,indent=2)
+        with a_path.open('x',encoding='utf-8') as f:json.dump(a,f,ensure_ascii=False,indent=2,default=json_date)
         load_fact_mapping(a_path,{})
         files['a_mapping']=str(a_path)
     status=direct_recognition_status(result)
-    return {'status':status,'message':carrier+('各范围识别字段已完整接入并保存。' if status=='complete' else '各范围原答复和已接入字段已保存；识别尚未完整接入，缺原文和未接入内容保留，未重答。'),
+    return {'status':status,'message':carrier+('各范围识别字段已完整接入并保存。' if status=='complete' else '各范围原答复和已接入字段已保存；识别尚未完整接入，缺原文和未接入内容保留，未重答。')+
+            ('公式取值未完成，相关原值暂不搬运。' if result.get('公式取值问题') else ''),
             'files':files,'usage':dict(engine.usage)}

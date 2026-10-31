@@ -7,12 +7,10 @@ import copy
 import hashlib
 import json
 import re
-import uuid
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 
 from openpyxl import load_workbook
-from .语义 import SemanticEngine, SemanticCancelled, _source_text_rows, _address, _layout_packets
+from .语义 import SemanticEngine, SemanticError, _source_text_rows, _address
 from .表格 import read_workbook, materialize_candidate_blanks, file_hash
 from .统一证据 import context_catalog, applicable_context, resolve_context
 from .原版金标准衔接 import recognition_expressions
@@ -461,7 +459,7 @@ def verify_identity_review_mapping(mapping, standard):
 
 
 class UnifiedSemanticEngine(SemanticEngine):
-    """两种标准共用实际HTTP、取消、重试及回执保存机制；不加载旧编号候选。"""
+    """共用一次HTTP调用、取消及原答复保存；不加载旧编号候选。"""
     def __init__(self, settings, gold_path, work_dir, log=None, cancel=None):
         self.settings = dict(settings)
         self.log, self.cancel = log or (lambda message: None), cancel
@@ -491,139 +489,10 @@ class UnifiedSemanticEngine(SemanticEngine):
         finally:
             workbook.close()
 
-    def _classification_round(self, payload, packet):
-        self._reuse_classification_cache=True
-        try:
-            checked=self._request(PROMPT,payload,
-                lambda response:validate_response(response,packet,self.standard,isolate_errors=True))
-        finally:
-            self._reuse_classification_cache=False
-        invalid={address:row['reason'] for address,row in checked.items() if row['kind']=='invalid_response'}
-        if not invalid:return checked,None
-        subset={**packet,'candidate_cells':list(invalid)}
-        retry={**payload,'candidate_cells':list(invalid),'format_correction':{
-            'errors':invalid,'instruction':'仅补正这些候选格的回执。依据当前原文重新返回完整字段，不猜缺失值；不要返回其他格。'}}
-        repair={'round':payload['round'],'cells':list(invalid),'errors':invalid}
-        try:
-            fixed=self._request(PROMPT,retry,
-                lambda response:validate_response(response,subset,self.standard,isolate_errors=True))
-        except SemanticCancelled:
-            raise
-        except Exception as error:
-            repair['failure']=self._redact(str(error))
-            self.log('格式补正未完成，保留原未决：'+repair['failure'])
-        else:
-            checked.update(fixed)
-        repair['remaining_invalid']=[address for address in invalid if checked[address]['kind']=='invalid_response']
-        return checked,repair
 
     def classify_packet(self, packet, allowed_metrics=None):
-        if packet.get('recognition_method')=='first_then_review':
-            return self._classify_reviewed_packet(packet,allowed_metrics)
-        self._verify_packet(packet)
-        self.source_hash = packet["source_hash"]
-        payload = build_payload(packet, self.standard, allowed_metrics=allowed_metrics)
-        # 带适用范围的证据目录已含完整说明；构造器仍保留旧格式供历史请求回读。
-        payload.pop('document_context')
-        payload['response_contract']='unified_structure_v1'
-        started = len(self._review_receipts)
-        workers, completed = [], []
-        # 两轮不互看答案；请求状态各自保存，全部结束后才合并意见。按用户要求串行调用，一次只发一个请求。
-        first_error = None
-        for number in (1, 2):
-            worker = copy.copy(self)
-            worker.usage = collections.Counter()
-            worker._review_receipts = []
-            workers.append(worker)
-            self.log(f"统一标准识别第{number}轮，共{len(packet['candidate_cells'])}格")
-            try:
-                completed.append(worker._classification_round({**payload, "round": number}, packet))
-            except SemanticCancelled:
-                self.usage.update(worker.usage)
-                self._review_receipts.extend(worker._review_receipts)
-                raise
-            except Exception as error:
-                if first_error is None:
-                    first_error = error
-            finally:
-                # 一轮失败时也保留另一轮的真实回执和用量；不形成单轮确认结果。
-                self.usage.update(worker.usage)
-                self._review_receipts.extend(worker._review_receipts)
-        if first_error is not None:
-            raise first_error
-        rounds = [item[0] for item in completed]
-        self._verify_packet(packet)
-        _require(hashlib.sha256(Path(self.gold_path).read_bytes()).hexdigest() == self.gold_hash, "识别期间标准已变化")
-        result = agree_rounds(*rounds, self.standard)
-        from .同义复核 import reviewable, review_pairs, partial_review_fact
-        pairs=[]
-        for row in result['unresolved']:
-            left,right=row['rounds']
-            if left['kind']==right['kind']=='metric_fact':first_fact,last_fact=left['fact'],right['fact']
-            elif left['kind']==right['kind']=='partial_metric_fact':
-                reference={'file_hash':packet['source_hash'],'location':packet['sheet']+'!'+row['cell']}
-                first_fact=partial_review_fact(left['partial_semantics'],reference);last_fact=partial_review_fact(right['partial_semantics'],reference)
-            else:continue
-            if reviewable(first_fact,last_fact,self.standard,same_cell=True):
-                pairs.append({'left':first_fact,'right':last_fact,'left_path':packet['source_path'],'right_path':packet['source_path'],
-                              'left_context':packet.get('document_context',[]),'right_context':packet.get('document_context',[])})
-        proofs=[]; review_failure=None
-        for start in range(0,len(pairs),12):
-            try:proofs.append(review_pairs(self,pairs[start:start+12],same_cell=True))
-            except SemanticCancelled:raise
-            except Exception as error:
-                review_failure=self._redact(str(error))
-                self.log('追加同义复核未完成；保留双轮已一致的结果，分歧仍未决：'+review_failure)
-                break
-        if proofs:
-            result=agree_rounds(*rounds,self.standard,equivalence_proofs=proofs)
-            result.update(classification_rounds=rounds,equivalence_proofs=proofs)
-        if review_failure:result['equivalence_review_error']=review_failure
-        repairs=[item[1] for item in completed if item[1] is not None]
-        if repairs:result['format_repairs']=repairs
-        self._verify_packet(packet)
-        _require(file_hash(self.gold_path)==self.gold_hash,'同义复核期间标准已变化')
-        receipts = [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-                    for path in self._review_receipts[started:]]
-        if result["unresolved"]:
-            self._retry_receipts(started)
-            receipts = [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-                        for path in self._review_receipts[started:]]
-        result.update(schema_version=2, gold_path=self.gold_path, gold_hash=self.gold_hash,
-                      source_path=packet["source_path"], source_hash=packet["source_hash"], sheet=packet["sheet"],
-                      source_context=copy.deepcopy(packet.get('document_context',[])),request_receipts=receipts, usage=dict(self.usage))
-        self._save(self.work_dir / ("逐格语义映射_" + definition_hash(packet) + ".json"), result)
-        return result
+        raise SemanticError("旧双轮识别入口已停用，请使用A/B直接识别。")
 
-    def _classify_reviewed_packet(self,packet,allowed_metrics):
-        from .表格编排 import stage_proofs
-        self._verify_packet(packet);self.source_hash=packet['source_hash']
-        payload=build_payload(packet,self.standard,allowed_metrics=allowed_metrics)
-        payload.pop('document_context');payload['response_contract']='unified_structure_v1'
-        started=len(self._review_receipts)
-        self.log('A第一轮：依据原文分层识别')
-        self._classification_round({**payload,'round':1},packet)
-        first_proofs=stage_proofs(self,started)
-        material,first=identity_review_material(payload,packet,self.standard,first_proofs)
-        self.log('A第二轮：核查第一轮结果，不重新生成身份')
-        review_start=len(self._review_receipts);error=None
-        try:review=self._request(IDENTITY_REVIEW_PROMPT,material,lambda x:validate_identity_review(x,packet))
-        except SemanticCancelled:raise
-        except Exception as failure:
-            error=self._redact(str(failure));review={'checked_cells':[],'issues':[]}
-            self.log('A结果核查未完成，保留第一轮认识及未决：'+error)
-        review_proofs=stage_proofs(self,review_start)
-        result=apply_identity_review(first,review,self.standard)
-        self._verify_packet(packet)
-        _require(file_hash(self.gold_path)==self.gold_hash,'核查期间金标准已变化')
-        result.update(schema_version=2,gold_path=self.gold_path,gold_hash=self.gold_hash,
-                      source_path=packet['source_path'],source_hash=packet['source_hash'],sheet=packet['sheet'],
-                      source_context=copy.deepcopy(packet.get('document_context',[])),usage=dict(self.usage),
-                      identity_review={'packet':copy.deepcopy(packet),'allowed_metrics':allowed_metrics,
-                                       'first_receipts':first_proofs,'review_receipts':review_proofs,'error':error},
-                      request_receipts=first_proofs+review_proofs)
-        self._save(self.work_dir/('逐格语义映射_'+definition_hash(packet)+'.json'),result)
-        return result
 
     def recognize_workbook(self, source, context=None, progress=None, previous_result=None, artifact_metadata=None, sheets=None, allowed_metrics=None, target_mapping=None, target_table=None):
         from .A语义阅读 import recognize_a

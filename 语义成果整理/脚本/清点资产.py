@@ -252,7 +252,7 @@ def main():
             "说明": "只读清点，未修改任何来源；配置仅记录路径，未读取密钥字段。",
             "资产": 资产, "统计口径": 口径, "固定输入": 固定输入}
     os.makedirs(os.path.dirname(输出), exist_ok=True)
-    with open(输出, "w", encoding="utf-8-sig", newline="\n") as f:
+    with open(输出, "x", encoding="utf-8-sig", newline="\n") as f:
         json.dump(结果, f, ensure_ascii=False, indent=1, sort_keys=True)
     print(f"资产清单：{len(资产)} 项")
     print(json.dumps(口径, ensure_ascii=False, indent=1))

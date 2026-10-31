@@ -7,12 +7,13 @@ import shutil
 import subprocess
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from openpyxl import Workbook
 from .语义 import SemanticEngine, SemanticCancelled
 from .表格 import read_workbook,file_hash,build_update_plan,write_updated_workbook,recalculate_copy
 from .设置 import validate_settings
+from .统一语义 import json_date
 
 ROOT=Path(__file__).resolve().parents[1]
 BRIDGE=ROOT/"Word桥接"/"发布"/"WordBridge.exe"
@@ -20,7 +21,7 @@ BRIDGE=ROOT/"Word桥接"/"发布"/"WordBridge.exe"
 def save_json(path,value):
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     with path.open("x",encoding="utf-8-sig") as f:
-        json.dump(value,f,ensure_ascii=False,indent=2,default=str)
+        json.dump(value,f,ensure_ascii=False,indent=2,default=lambda item:json_date(item) if isinstance(item,date) else str(item))
     return str(path)
 
 def check_cancel(cancel):

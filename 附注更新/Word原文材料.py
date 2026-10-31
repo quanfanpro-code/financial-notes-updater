@@ -109,6 +109,76 @@ def word_source_material(link_path, positions=None):
     return result
 
 
+def word_table_context(material, areas):
+    """按原生提纲保留本节、祖先共用说明及明确读取的表，不判断业务适用性。"""
+    from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
+    blocks = material['blocks']; tables = {}
+    for index, block in enumerate(blocks):
+        if block['kind'] != 'table':
+            continue
+        cells = [cell for row in block['rows'] for cell in row['cells'] if cell.get('source_excel')]
+        if not cells:
+            continue
+        points = [(*coordinate_to_tuple(cell['source_excel'].rsplit('!', 1)[1]), cell) for cell in cells]
+        top = min(r for r, c, cell in points); left = min(c for r, c, cell in points)
+        bottom = max(r + cell['row_span'] - 1 for r, c, cell in points)
+        right = max(c + cell['column_span'] - 1 for r, c, cell in points)
+        tables[index] = {'table_id': block['table_id'], 'sheet': block['sheet'],
+                         'range': f'{get_column_letter(left)}{top}:{get_column_letter(right)}{bottom}'}
+    targets = []
+    for index, table in tables.items():
+        l, t, r, b = range_boundaries(table['range'])
+        for area in areas:
+            al, at, ar, ab = range_boundaries(area['range'])
+            if table['sheet'] == area['sheet'] and al <= r and ar >= l and at <= b and ab >= t:
+                targets.append(index); break
+    headings = [(i, block['word_outline_level']) for i, block in enumerate(blocks)
+                if block['kind'] == 'paragraph' and isinstance(block.get('word_outline_level'), int)
+                and 0 <= block['word_outline_level'] < 9]
+    # shortcut: 没有原生提纲或明确关联表时保留全文，取得可靠范围后再缩。
+    if not targets or not headings:
+        return None
+    keep = set(range(headings[0][0] + 1))
+    report_level = min(level for index, level in headings)
+    for index, level in headings:
+        if level == report_level:
+            stop = next((i for i, depth in headings if i > index), len(blocks))
+            keep.update(range(index, stop))
+    for target in targets:
+        ancestors = []
+        for index, level in headings:
+            if index >= target:
+                break
+            while ancestors and ancestors[-1][1] >= level:
+                ancestors.pop()
+            ancestors.append((index, level))
+        if not ancestors:
+            return None
+        for index, level in ancestors:
+            stop = next((i for i, depth in headings if i > index), len(blocks))
+            keep.update(range(index, stop))
+        index, level = ancestors[-1]
+        stop = next((i for i, depth in headings if i > index and depth <= level), len(blocks))
+        keep.update(range(index, stop))
+    lines = []; ranges = []
+    for index in sorted(keep):
+        block = blocks[index]
+        if block['kind'] == 'paragraph':
+            lines.append('原段落 ' + block['word_position'] +
+                         ('；原提纲级别=' + str(block['word_outline_level'])
+                          if 'word_outline_level' in block else '') + '\n' + block['text'])
+        elif index in tables:
+            table = tables[index]; ranges.append(table)
+            lines.append('[原Word表' + str(block['table_number']) + '：' + block['table_id'] +
+                         '；原表区=' + table['sheet'] + '!' + table['range'] + ']')
+        else:
+            lines.append(word_text_material({**material, 'blocks': [block]}))
+    return ({'title': '原Word正文顺序（表格引用指向实际表区，各段适用范围由模型判断）',
+             'text': '\n'.join(lines), 'source_path': material['word_source']['path'],
+             'source_hash': material['word_source']['sha256'],
+             'reading_basis': '按原文件提纲保留本节全部原文、报告层及祖先开头说明、明确读取的表；是否适用由模型判断。'}, ranges)
+
+
 def word_request_material(material):
     """只将重复字段名和段落位置前缀共享，原文、合并和坐标值不变。"""
     from copy import deepcopy
